@@ -45,7 +45,7 @@ func NewNodeSpecer(params localNodeStoreSpecerParams) (nodeSpecer, error) {
 	}
 
 	switch params.Config.IPAM {
-	case ipamOption.IPAMClusterPoolV2, ipamOption.IPAMClusterPool:
+	case ipamOption.IPAMClusterPoolV2, ipamOption.IPAMClusterPool, ipamOption.IPAMDelegatedPlugin:
 		cns := &ciliumNodeSpecer{
 			nodeResource: params.CiliumNodeResource,
 			signaler:     params.Signaler,
