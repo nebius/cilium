@@ -22,7 +22,10 @@ var bpfRecorderListCmd = &cobra.Command{
 	Short:   "List PCAP recorder entries",
 	Run: func(_ *cobra.Command, _ []string) {
 		common.RequireRootPrivilege("cilium bpf recorder list")
-		maps := []recorder.CaptureMap{recorder.CaptureMap4()}
+		maps := make([]recorder.CaptureMap, 0)
+		if getIpv4EnableStatus() {
+			maps = append(maps, recorder.CaptureMap4())
+		}
 		if getIpv6EnableStatus() {
 			maps = append(maps, recorder.CaptureMap6())
 		}

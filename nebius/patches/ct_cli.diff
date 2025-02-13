@@ -1,0 +1,91 @@
+diff --git a/cilium-dbg/cmd/bpf_ct_flush.go b/cilium-dbg/cmd/bpf_ct_flush.go
+index 4de66bf064..d203722173 100644
+--- a/cilium-dbg/cmd/bpf_ct_flush.go
++++ b/cilium-dbg/cmd/bpf_ct_flush.go
+@@ -40,10 +40,10 @@ func (d dummyEndpoint) GetID() uint64 {
+ func flushCt(eID string) {
+ 	var maps []*ctmap.Map
+ 	if eID == "global" {
+-		maps = ctmap.GlobalMaps(true, getIpv6EnableStatus())
++		maps = ctmap.GlobalMaps(getIpv4EnableStatus(), getIpv6EnableStatus())
+ 	} else {
+ 		id, _ := strconv.Atoi(eID)
+-		maps = ctmap.LocalMaps(&dummyEndpoint{ID: id}, true, true)
++		maps = ctmap.LocalMaps(&dummyEndpoint{ID: id}, getIpv4EnableStatus(), getIpv6EnableStatus())
+ 	}
+ 	for _, m := range maps {
+ 		path, err := ctmap.OpenCTMap(m)
+diff --git a/cilium-dbg/cmd/bpf_ct_list.go b/cilium-dbg/cmd/bpf_ct_list.go
+index 55c2312f9e..030c07b37d 100644
+--- a/cilium-dbg/cmd/bpf_ct_list.go
++++ b/cilium-dbg/cmd/bpf_ct_list.go
+@@ -90,14 +90,14 @@ func getMaps(t string, id uint32) []ctmap.CtMap {
+ 	var m []*ctmap.Map
+ 	var r []ctmap.CtMap
+ 	if t == "global" {
+-		m = ctmap.GlobalMaps(true, getIpv6EnableStatus())
++		m = ctmap.GlobalMaps(getIpv4EnableStatus(), getIpv6EnableStatus())
+ 	}
+ 	if t == "endpoint" {
+-		m = ctmap.LocalMaps(&dummyEndpoint{ID: int(id)}, true, true)
++		m = ctmap.LocalMaps(&dummyEndpoint{ID: int(id)}, getIpv4EnableStatus(), getIpv6EnableStatus())
+ 	}
+ 	if t == "cluster" {
+ 		// Ignoring the error, as we already validated the cluster ID.
+-		m, _ = ctmap.GetClusterCTMaps(id, true, getIpv6EnableStatus())
++		m, _ = ctmap.GetClusterCTMaps(id, getIpv4EnableStatus(), getIpv6EnableStatus())
+ 	}
+ 	for _, v := range m {
+ 		r = append(r, v)
+diff --git a/cilium-dbg/cmd/bpf_recorder_list.go b/cilium-dbg/cmd/bpf_recorder_list.go
+index 0e028fa3fe..af73ee67db 100644
+--- a/cilium-dbg/cmd/bpf_recorder_list.go
++++ b/cilium-dbg/cmd/bpf_recorder_list.go
+@@ -22,7 +22,10 @@ var bpfRecorderListCmd = &cobra.Command{
+ 	Short:   "List PCAP recorder entries",
+ 	Run: func(_ *cobra.Command, _ []string) {
+ 		common.RequireRootPrivilege("cilium bpf recorder list")
+-		maps := []recorder.CaptureMap{recorder.CaptureMap4()}
++		maps := make([]recorder.CaptureMap, 0)
++		if getIpv4EnableStatus() {
++			maps = append(maps, recorder.CaptureMap4())
++		}
+ 		if getIpv6EnableStatus() {
+ 			maps = append(maps, recorder.CaptureMap6())
+ 		}
+diff --git a/cilium-dbg/cmd/helpers.go b/cilium-dbg/cmd/helpers.go
+index 340ee64dbc..1c7e51bd18 100644
+--- a/cilium-dbg/cmd/helpers.go
++++ b/cilium-dbg/cmd/helpers.go
+@@ -428,6 +428,31 @@ func getIpv6EnableStatus() bool {
+ 	return defaults.EnableIPv6
+ }
+ 
++func getIpv4EnableStatus() bool {
++	params := daemon.NewGetHealthzParamsWithTimeout(5 * time.Second)
++	brief := true
++	params.SetBrief(&brief)
++	// If cilium-agent is running get the ipv4 enable status
++	if _, err := client.Daemon.GetHealthz(params); err == nil {
++		if resp, err := client.ConfigGet(); err == nil {
++			if resp.Status != nil {
++				return resp.Status.Addressing.IPV4 != nil && resp.Status.Addressing.IPV4.Enabled
++			}
++		}
++	} else { // else read the EnableIPv4 status from the file-system
++		agentConfigFile := filepath.Join(defaults.RuntimePath, defaults.StateDir,
++			"agent-runtime-config.json")
++
++		if byteValue, err := os.ReadFile(agentConfigFile); err == nil {
++			if err = json.Unmarshal(byteValue, &option.Config); err == nil {
++				return option.Config.EnableIPv4
++			}
++		}
++	}
++	// returning the EnableIPv6 default status
++	return defaults.EnableIPv4
++}
++
+ func mergeMaps(m1, m2 map[string]interface{}) map[string]interface{} {
+ 	m3 := make(map[string]interface{})
+ 	for k, v := range m1 {
