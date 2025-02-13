@@ -90,14 +90,14 @@ func getMaps(t string, id uint32) []ctmap.CtMap {
 	var m []*ctmap.Map
 	var r []ctmap.CtMap
 	if t == "global" {
-		m = ctmap.GlobalMaps(true, getIpv6EnableStatus())
+		m = ctmap.GlobalMaps(getIpv4EnableStatus(), getIpv6EnableStatus())
 	}
 	if t == "endpoint" {
-		m = ctmap.LocalMaps(&dummyEndpoint{ID: int(id)}, true, true)
+		m = ctmap.LocalMaps(&dummyEndpoint{ID: int(id)}, getIpv4EnableStatus(), getIpv6EnableStatus())
 	}
 	if t == "cluster" {
 		// Ignoring the error, as we already validated the cluster ID.
-		m, _ = ctmap.GetClusterCTMaps(id, true, getIpv6EnableStatus())
+		m, _ = ctmap.GetClusterCTMaps(id, getIpv4EnableStatus(), getIpv6EnableStatus())
 	}
 	for _, v := range m {
 		r = append(r, v)
