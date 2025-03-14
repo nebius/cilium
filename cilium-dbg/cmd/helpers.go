@@ -430,6 +430,31 @@ func getIpv6EnableStatus() bool {
 	return defaults.EnableIPv6
 }
 
+func getIpv4EnableStatus() bool {
+	params := daemon.NewGetHealthzParamsWithTimeout(5 * time.Second)
+	brief := true
+	params.SetBrief(&brief)
+	// If cilium-agent is running get the ipv4 enable status
+	if _, err := client.Daemon.GetHealthz(params); err == nil {
+		if resp, err := client.ConfigGet(); err == nil {
+			if resp.Status != nil {
+				return resp.Status.Addressing.IPV4 != nil && resp.Status.Addressing.IPV4.Enabled
+			}
+		}
+	} else { // else read the EnableIPv4 status from the file-system
+		agentConfigFile := filepath.Join(defaults.RuntimePath, defaults.StateDir,
+			"agent-runtime-config.json")
+
+		if byteValue, err := os.ReadFile(agentConfigFile); err == nil {
+			if err = json.Unmarshal(byteValue, &option.Config); err == nil {
+				return option.Config.EnableIPv4
+			}
+		}
+	}
+	// returning the EnableIPv6 default status
+	return defaults.EnableIPv4
+}
+
 func mergeMaps(m1, m2 map[string]interface{}) map[string]interface{} {
 	m3 := make(map[string]interface{})
 	for k, v := range m1 {

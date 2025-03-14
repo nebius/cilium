@@ -42,10 +42,10 @@ func (d dummyEndpoint) GetID() uint64 {
 func flushCt(eID string) {
 	var maps []*ctmap.Map
 	if eID == "global" {
-		maps = ctmap.GlobalMaps(true, getIpv6EnableStatus())
+		maps = ctmap.GlobalMaps(getIpv4EnableStatus(), getIpv6EnableStatus())
 	} else {
 		id, _ := strconv.Atoi(eID)
-		maps = ctmap.LocalMaps(&dummyEndpoint{ID: id}, true, true)
+		maps = ctmap.LocalMaps(&dummyEndpoint{ID: id}, getIpv4EnableStatus(), getIpv6EnableStatus())
 	}
 
 	observable4, next4, complete4 := stream.Multicast[ctmap.GCEvent]()
