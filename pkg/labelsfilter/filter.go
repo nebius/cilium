@@ -128,6 +128,7 @@ func ParseLabelPrefixCfg(prefixes, nodePrefixes []string, file string) error {
 		fromCustomFile = true
 	}
 
+	//exhaustruct:ignore // Reading clean configuration, no need to initialize
 	nodeCfg = &labelPrefixCfg{}
 	log.Infof("Parsing node label prefixes from user inputs: %v", nodePrefixes)
 	for _, label := range nodePrefixes {
@@ -202,7 +203,7 @@ type labelPrefixCfg struct {
 	LabelPrefixes []*LabelPrefix `json:"valid-prefixes"`
 	// whitelist if true, indicates that an inclusive rule has to match
 	// in order for the label to be considered
-	whitelist bool
+	whitelist bool `exhaustruct:"optional"`
 }
 
 // defaultLabelPrefixCfg returns a default LabelPrefixCfg using the latest
@@ -224,11 +225,13 @@ func defaultLabelPrefixCfg() *labelPrefixCfg {
 		"!" + regexp.QuoteMeta(k8sConst.StatefulSetPodNameLabel),        // ignore statefulset.kubernetes.io/pod-name label
 		"!" + regexp.QuoteMeta(k8sConst.StatefulSetPodIndexLabel),       // ignore apps.kubernetes.io/pod-index label
 		"!" + regexp.QuoteMeta(k8sConst.IndexedJobCompletionIndexLabel), // ignore batch.kubernetes.io/job-completion-index label
+		"!" + regexp.QuoteMeta(k8sConst.BatchJobControllerUID),          // ignore batch.kubernetes.io/controller-uid
 		`!.*beta\.kubernetes\.io`,                                       // ignore all beta.kubernetes.io labels
 		`!k8s\.io`,                                                      // ignore all k8s.io labels
 		`!pod-template-generation`,                                      // ignore pod-template-generation
 		`!pod-template-hash`,                                            // ignore pod-template-hash
 		`!controller-revision-hash`,                                     // ignore controller-revision-hash
+		`!controller-uid`,                                               // ignore controller-uid
 		`!annotation.*`,                                                 // ignore all annotation labels
 		`!etcd_node`,                                                    // ignore etcd_node label
 	}
@@ -257,6 +260,7 @@ func readLabelPrefixCfgFrom(fileName string) (*labelPrefixCfg, error) {
 		return nil, err
 	}
 	defer f.Close()
+	//exhaustruct:ignore // Reading clean configuration, no need to initialize
 	lpc := labelPrefixCfg{}
 	err = json.NewDecoder(f).Decode(&lpc)
 	if err != nil {

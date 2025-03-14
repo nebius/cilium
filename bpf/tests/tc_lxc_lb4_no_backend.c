@@ -6,9 +6,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #undef ENABLE_PER_PACKET_LB
@@ -78,7 +75,7 @@ int lxc_no_backend_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
 
-	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, 1, revnat_id);
+	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 
 	ipcache_v4_add_entry(BACKEND_IP, 0, 112233, 0, 0);
 
@@ -129,6 +126,9 @@ int lxc_no_backend_check(__maybe_unused const struct __ctx_buff *ctx)
 	assert(l3->ttl == 64);
 	assert(l3->protocol == IPPROTO_ICMP);
 
+	if (l3->check != bpf_htons(0x4b8e))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	l4 = data + sizeof(__u32) + sizeof(struct ethhdr) + sizeof(struct iphdr);
 	if ((void *) l4 + sizeof(struct icmphdr) > data_end)
 		test_fatal("l4 header out of bounds");
@@ -140,7 +140,7 @@ int lxc_no_backend_check(__maybe_unused const struct __ctx_buff *ctx)
 	 * context with the runner option and importing the packet into
 	 * wireshark
 	 */
-	assert(l4->checksum == bpf_htons(0x7990));
+	assert(l4->checksum == bpf_htons(0x2c3f));
 
 	test_finish();
 }

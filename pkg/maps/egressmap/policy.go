@@ -9,12 +9,12 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 	"go4.org/netipx"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/types"
 )
@@ -81,7 +81,6 @@ func createPolicyMapFromDaemonConfig(in struct {
 	defines.NodeOut
 }) {
 	out.NodeDefines = map[string]string{
-		"EGRESS_POLICY_MAP":      PolicyMapName,
 		"EGRESS_POLICY_MAP_SIZE": fmt.Sprint(in.EgressGatewayPolicyMapMax),
 	}
 

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_ENCRYPT_H_
-#define __LIB_ENCRYPT_H_
+#pragma once
 
 #include <bpf/ctx/skb.h>
 #include <bpf/api.h>
@@ -12,7 +11,22 @@
 #include "lib/common.h"
 #include "lib/drop.h"
 #include "lib/eps.h"
+#include "lib/ipv4.h"
 #include "lib/vxlan.h"
+#include "lib/node.h"
+
+/* We cap key index at 4 bits because mark value is used to map ctx to key */
+#define MAX_KEY_INDEX 15
+
+#ifdef ENABLE_IPSEC
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct encrypt_config);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__uint(max_entries, 1);
+} cilium_encrypt_state __section_maps_btf;
+#endif
 
 static __always_inline __u8 get_min_encrypt_key(__u8 peer_key __maybe_unused)
 {
@@ -21,7 +35,7 @@ static __always_inline __u8 get_min_encrypt_key(__u8 peer_key __maybe_unused)
 	__u32 encrypt_key = 0;
 	struct encrypt_config *cfg;
 
-	cfg = map_lookup_elem(&ENCRYPT_MAP, &encrypt_key);
+	cfg = map_lookup_elem(&cilium_encrypt_state, &encrypt_key);
 	/* Having no key info for a context is the same as no encryption */
 	if (cfg)
 		local_key = cfg->encrypt_key;
@@ -54,7 +68,7 @@ lookup_ip4_node_id(__u32 ip4)
 
 	node_ip.family = ENDPOINT_KEY_IPV4;
 	node_ip.ip4 = ip4;
-	node_value = map_lookup_elem(&NODE_MAP_V2, &node_ip);
+	node_value = map_lookup_elem(&cilium_node_map_v2, &node_ip);
 	if (!node_value)
 		return 0;
 	if (!node_value->id)
@@ -72,7 +86,7 @@ lookup_ip6_node_id(const union v6addr *ip6)
 
 	node_ip.family = ENDPOINT_KEY_IPV6;
 	node_ip.ip6 = *ip6;
-	node_value = map_lookup_elem(&NODE_MAP_V2, &node_ip);
+	node_value = map_lookup_elem(&cilium_node_map_v2, &node_ip);
 	if (!node_value)
 		return 0;
 	if (!node_value->id)
@@ -105,7 +119,7 @@ set_ipsec_encrypt(struct __ctx_buff *ctx, __u8 spi, __u32 tunnel_endpoint,
 
 	node_ip.family = ENDPOINT_KEY_IPV4;
 	node_ip.ip4 = tunnel_endpoint;
-	node_value = map_lookup_elem(&NODE_MAP_V2, &node_ip);
+	node_value = map_lookup_elem(&cilium_node_map_v2, &node_ip);
 	if (!node_value || !node_value->id)
 		return DROP_NO_NODE_ID;
 
@@ -115,8 +129,8 @@ set_ipsec_encrypt(struct __ctx_buff *ctx, __u8 spi, __u32 tunnel_endpoint,
 	set_identity_meta(ctx, seclabel);
 	if (use_meta)
 		set_encrypt_key_meta(ctx, spi, node_value->id);
-	else
-		set_encrypt_key_mark(ctx, spi, node_value->id);
+	set_encrypt_key_mark(ctx, spi, node_value->id);
+
 	return CTX_ACT_OK;
 }
 
@@ -171,8 +185,7 @@ do_decrypt(struct __ctx_buff *ctx, __u16 proto)
 			return CTX_ACT_OK;
 
 		if (!node_id)
-			return send_drop_notify_error(ctx, 0, DROP_NO_NODE_ID,
-						      CTX_ACT_DROP,
+			return send_drop_notify_error(ctx, UNKNOWN_ID, DROP_NO_NODE_ID,
 						      METRIC_INGRESS);
 		set_ipsec_decrypt_mark(ctx, node_id);
 
@@ -188,8 +201,8 @@ do_decrypt(struct __ctx_buff *ctx, __u16 proto)
 #ifdef ENABLE_ENDPOINT_ROUTES
 	return CTX_ACT_OK;
 #else
-	return ctx_redirect(ctx, CILIUM_IFINDEX, 0);
-#endif /* ENABLE_ROUTING */
+	return ctx_redirect(ctx, CILIUM_HOST_IFINDEX, 0);
+#endif /* ENABLE_ENDPOINT_ROUTES */
 }
 
 #if defined(ENABLE_ENCRYPTED_OVERLAY)
@@ -215,15 +228,21 @@ do_decrypt(struct __ctx_buff *ctx, __u16 proto)
  *   - net.ipv4.conf.default.accept_local = 1
  */
 static __always_inline int
-encrypt_overlay_and_redirect(struct __ctx_buff *ctx, void *data,
-			     void *data_end, struct iphdr *ip4)
+encrypt_overlay_and_redirect(struct __ctx_buff *ctx)
 {
+	struct iphdr *ip4, *inner_ipv4 = NULL;
 	struct endpoint_info *ep_info = NULL;
-	struct iphdr *inner_ipv4 = NULL;
+	void *data, *data_end;
 	__u8 dst_mac = 0;
+	__u32 l4_off;
 	int ret = 0;
 
-	ret = vxlan_get_inner_ipv4(data, data_end, ip4, &inner_ipv4);
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
+
+	l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
+
+	ret = vxlan_get_inner_ipv4(data, data_end, l4_off, &inner_ipv4);
 	if (!ret)
 		return DROP_INVALID;
 
@@ -248,15 +267,13 @@ encrypt_overlay_and_redirect(struct __ctx_buff *ctx, void *data,
 	if (eth_store_daddr(ctx, &dst_mac, 0) != 0)
 		return DROP_WRITE_ERROR;
 
-	/* need to revalidate data since we just re-wrote mac addresses */
-	if (!revalidate_data(ctx, &data, &data_end, &ip4))
-		return DROP_INVALID;
+	data = ctx_data(ctx);
+	data_end = ctx_data_end(ctx);
 
 	/* right now, the VNI of this packet is ENCRYPTED_OVERLAY_ID, we need
 	 * to rewrite this VNI to the source's sec id before we transmit it
 	 */
-	if (!vxlan_rewrite_vni(ctx, data, data_end, ip4,
-			       ep_info->sec_id))
+	if (!vxlan_rewrite_vni(ctx, data, data_end, l4_off, ep_info->sec_id))
 		return DROP_INVALID;
 
 	/* redirect to ingress side of ifindex so the packet has xfrm applied */
@@ -275,5 +292,3 @@ do_decrypt(struct __ctx_buff __maybe_unused *ctx, __u16 __maybe_unused proto)
 	return CTX_ACT_OK;
 }
 #endif /* ENABLE_IPSEC */
-#endif /* __LIB_ENCRYPT_H_ */
-

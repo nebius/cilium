@@ -6,9 +6,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV4		1
 #define ENABLE_IPV6		1
@@ -74,9 +71,9 @@ int mock_skb_set_tunnel_key(__maybe_unused struct __sk_buff *skb,
 	return 0;
 }
 
-#define SECCTX_FROM_IPCACHE 1
-
 #include "bpf_host.c"
+
+ASSIGN_CONFIG(__u32, host_secctx_from_ipcache, 1)
 
 #define TO_NETDEV	0
 
@@ -129,7 +126,7 @@ int l4lb_health_check_host_setup(struct __ctx_buff *ctx)
 		}
 	};
 
-	map_update_elem(&LB4_HEALTH_MAP, &key, &value, 0);
+	map_update_elem(&cilium_lb4_health, &key, &value, 0);
 
 	/* Jump into the entrypoint */
 	tail_call_static(ctx, entry_call_map, TO_NETDEV);
@@ -181,11 +178,17 @@ int l4lb_health_check_host_check(const struct __ctx_buff *ctx)
 	if (l3->daddr != FRONTEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x402))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != FRONTEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0xba00))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }

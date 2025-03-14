@@ -227,6 +227,27 @@ func handler(wg *sync.WaitGroup, client *Client, conn *Conn, requests chan reque
 				return
 			}
 			start := time.Now()
+
+			// Check if we already have a request with the same id
+			// Due to birthday paradox and the fact that ID is uint16
+			// it's likely to happen with small number (~200) of concurrent requests
+			// which would result in goroutine leak as we would never close req.ch
+			if _, duplicate := waitingResponses[req.msg.Id]; duplicate {
+				for n := 0; n < 5; n++ {
+					// Try a new ID
+					id := Id()
+					if _, duplicate = waitingResponses[id]; !duplicate {
+						req.msg.Id = id
+						break
+					}
+				}
+				if duplicate {
+					req.ch <- sharedClientResponse{nil, 0, fmt.Errorf("duplicate request id %d", req.msg.Id)}
+					close(req.ch)
+					continue
+				}
+			}
+
 			err := client.SendContext(req.ctx, req.msg, conn, start)
 			if err != nil {
 				req.ch <- sharedClientResponse{nil, 0, err}
@@ -280,7 +301,7 @@ func (c *SharedClient) ExchangeSharedContext(ctx context.Context, m *Msg) (r *Ms
 
 	// This request keeps 'c.requests' open; sending a request may hang indefinitely if
 	// the handler happens to quit at the same time. Use ctx.Done to avoid this.
-	timeout := c.Client.writeTimeout()
+	timeout := c.getTimeoutForRequest(c.Client.writeTimeout())
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	respCh := make(chan sharedClientResponse)
@@ -291,8 +312,13 @@ func (c *SharedClient) ExchangeSharedContext(ctx context.Context, m *Msg) (r *Ms
 	}
 
 	// Since c.requests is unbuffered, the handler is guaranteed to eventually close 'respCh'
-	resp := <-respCh
-	return resp.msg, resp.rtt, resp.err
+	select {
+	case resp := <-respCh:
+		return resp.msg, resp.rtt, resp.err
+	// This is just fail-safe mechanism in case there is another similar issue
+	case <-time.After(time.Minute):
+		return nil, 0, fmt.Errorf("timeout waiting for response")
+	}
 }
 
 // close closes and waits for the close to finish.

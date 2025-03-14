@@ -8,8 +8,9 @@ import (
 	"testing"
 
 	fuzz "github.com/AdaLogics/go-fuzz-headers"
+	"github.com/cilium/hive/hivetest"
 
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 )
 
@@ -22,8 +23,8 @@ func FuzzNodeHandler(f *testing.F) {
 			t.Skip()
 		}
 		dpConfig := DatapathConfiguration{HostDevice: "veth0"}
-		fakeNodeAddressing := fakeTypes.NewNodeAddressing()
-		linuxNodeHandler := NewNodeHandler(dpConfig, fakeNodeAddressing, nil, &fakeTypes.MTU{}, new(mockEnqueuer))
+		log := hivetest.Logger(f)
+		linuxNodeHandler := newNodeHandler(log, dpConfig, nil, new(mockEnqueuer))
 		if linuxNodeHandler == nil {
 			panic("Should not be nil")
 		}
@@ -31,9 +32,9 @@ func FuzzNodeHandler(f *testing.F) {
 		if err != nil {
 			t.Skip()
 		}
-		linuxNodeHandler.NodeNeighborRefresh(context.Background(), nodev1, true)
+		linuxNodeHandler.NodeNeighborRefresh(context.Background(), nodev1)
 		linuxNodeHandler.NodeDelete(nodev1)
-		linuxNodeHandler.NodeNeighborRefresh(context.Background(), nodev1, true)
+		linuxNodeHandler.NodeNeighborRefresh(context.Background(), nodev1)
 	})
 }
 
@@ -41,10 +42,10 @@ type mockEnqueuer struct {
 	nh *linuxNodeHandler
 }
 
-func (q *mockEnqueuer) Enqueue(n *nodeTypes.Node, refresh bool) {
+func (q *mockEnqueuer) Enqueue(n *nodeTypes.Node) {
 	if q.nh != nil {
-		if err := q.nh.insertNeighbor(context.Background(), n, refresh); err != nil {
-			log.Errorf("MockQ NodeNeighborRefresh failed: %s", err)
+		if err := q.nh.insertNeighbor(context.Background(), n); err != nil {
+			q.nh.log.Error("MockQ NodeNeighborRefresh failed", logfields.Error, err)
 		}
 	}
 }

@@ -7,10 +7,9 @@ import (
 	"context"
 	"fmt"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
-
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func GetBackendServiceName(k8sclient client.Client, namespace string, backendObjectReference gatewayv1.BackendObjectReference) (string, error) {
@@ -35,7 +34,7 @@ func GetBackendServiceName(k8sclient client.Client, namespace string, backendObj
 		}
 
 	default:
-		return "", fmt.Errorf("Unsupported backend kind %s", *backendObjectReference.Kind)
+		return "", fmt.Errorf("unsupported backend kind %s", *backendObjectReference.Kind)
 	}
 
 	return backendServiceName, nil

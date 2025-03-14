@@ -32,8 +32,8 @@ all the Pods selected by the Service (via their EndpointSlices) as candidates.
 
     As a result, you **cannot** set ``.spec.externalTrafficPolicy`` to ``Local``
     with the Cilium implementations for GatewayAPI or Ingress, because Cilium
-    currently uses a dummy Endpoints for the Service LoadBalancer (see
-    <https://github.com/cilium/cilium/blob/495f228ad8791c89f0851e0abbad90f09b136f80/install/kubernetes/cilium/templates/cilium-ingress-service.yaml#L58>`_).
+    currently uses a dummy Endpoints for the Service LoadBalancer (`see here
+    <https://github.com/cilium/cilium/blob/495f228ad8791c89f0851e0abbad90f09b136f80/install/kubernetes/cilium/templates/cilium-ingress-service.yaml#L58>`__).
     Only the Cilium implementation is known to be affected by this limitation.
     Most other implementations are expected to work with this configuration.
     If they don't, check if the matching EndpointSlices look correct and/or
@@ -47,9 +47,10 @@ annotation is a
 Enable and use Node IPAM
 ------------------------
 
-To use this feature your service must be of type ``LoadBalancer`` and have the
+To use this feature your Service must be of type ``LoadBalancer`` and have the
 `loadBalancerClass <https://kubernetes.io/docs/concepts/services-networking/service/#load-balancer-class>`__
-set to ``io.cilium/node``.
+set to ``io.cilium/node``. You can also allow set ``defaultLBServiceIPAM``
+to ``nodeipam`` to use this feature on a Service that doesn't specify a loadBalancerClass.
 
 Cilium's node IPAM is disabled by default.
 To install Cilium with the node IPAM, run:

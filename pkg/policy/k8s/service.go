@@ -4,44 +4,37 @@
 package k8s
 
 import (
+	"context"
 	"errors"
+	"maps"
+	"slices"
+	"sync"
 
-	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/labels"
+	"github.com/cilium/stream"
+	k8sLabels "k8s.io/apimachinery/pkg/labels"
 
 	"github.com/cilium/cilium/pkg/k8s"
+	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/k8s/types"
+	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/time"
 )
 
-// isSelectableService returns true if the service svc can be selected by a ToServices rule.
-// Normally, only services without a label selector (i.e. empty services)
-// are allowed as targets of a toServices rule.
-// This is to minimize the chances of a pod IP being selected by this rule, which might
-// cause conflicting entries in the ipcache.
-//
-// This requirement, however, is dropped for HighScale IPCache mode, because pod IPs are
-// normally excluded from the ipcache regardless. Therefore, in HighScale IPCache mode,
-// all services can be selected by ToServices.
-func (p *PolicyWatcher) isSelectableService(svc *k8s.Service) bool {
-	if svc == nil {
-		return false
-	}
-	return p.config.EnableHighScaleIPcache || svc.IsExternal()
-}
-
 // onServiceEvent processes a ServiceNotification and (if necessary)
 // recalculates all policies affected by this change.
-func (p *PolicyWatcher) onServiceEvent(event k8s.ServiceNotification) {
-	err := p.updateToServicesPolicies(event.ID, event.Service, event.OldService)
+func (p *policyWatcher) onServiceEvent(event k8s.ServiceNotification) {
+	err := p.updateToServicesPolicies(event.ID, event.Service, event.OldService, event.Endpoints, event.OldEndpoints)
 	if err != nil {
-		p.log.WithError(err).WithFields(logrus.Fields{
-			logfields.Event:     event.Action,
-			logfields.ServiceID: event.ID,
-		}).Warning("Failed to recalculate CiliumNetworkPolicy rules after service event")
+		p.log.Warn(
+			"Failed to recalculate CiliumNetworkPolicy rules after service event",
+			logfields.Error, err,
+			logfields.Event, event.Action,
+			logfields.ServiceID, event.ID,
+		)
 	}
 }
 
@@ -49,18 +42,13 @@ func (p *PolicyWatcher) onServiceEvent(event k8s.ServiceNotification) {
 // added, removed, its endpoints have changed, or its labels have changed).
 // This function then checks if any of the known CNP/CCNPs are affected by this
 // change, and recomputes them by calling resolveCiliumNetworkPolicyRefs.
-func (p *PolicyWatcher) updateToServicesPolicies(svcID k8s.ServiceID, newSVC, oldSVC *k8s.Service) error {
+func (p *policyWatcher) updateToServicesPolicies(svcID k8s.ServiceID, newSVC, oldSVC *k8s.MinimalService, newEps, oldEps *k8s.MinimalEndpoints) error {
 	var errs []error
-
-	// Bail out early if updated service is not selectable
-	if !(p.isSelectableService(newSVC) || p.isSelectableService(oldSVC)) {
-		return nil
-	}
-
+	endpointsChanged := !newEps.DeepEqual(oldEps)
 	// newService is true if this is the first time we observe this service
 	newService := oldSVC == nil
-	// changedService is true if the service label or selector has changed
-	changedService := !newSVC.DeepEqual(oldSVC)
+	// changedService is true if the service label, selector or endpoints has changed
+	changedService := !newSVC.DeepEqual(oldSVC) || endpointsChanged
 
 	// candidatePolicyKeys contains the set of policy names we need to process
 	// for this service update. By default, we consider all policies with
@@ -78,10 +66,11 @@ func (p *PolicyWatcher) updateToServicesPolicies(svcID k8s.ServiceID, newSVC, ol
 	for key := range candidatePolicyKeys {
 		cnp, ok := p.cnpCache[key]
 		if !ok {
-			p.log.WithFields(logrus.Fields{
-				logfields.Key:       key,
-				logfields.ServiceID: svcID,
-			}).Error("BUG: Candidate policy for service update not found. Please report this bug to Cilium developers.")
+			p.log.Error(
+				"BUG: Candidate policy for service update not found. Please report this bug to Cilium developers.",
+				logfields.Key, key,
+				logfields.ServiceID, svcID,
+			)
 			continue
 		}
 
@@ -92,36 +81,32 @@ func (p *PolicyWatcher) updateToServicesPolicies(svcID k8s.ServiceID, newSVC, ol
 		}
 
 		if p.config.Debug {
-			p.log.WithFields(logrus.Fields{
-				logfields.CiliumNetworkPolicyName: cnp.Name,
-				logfields.K8sAPIVersion:           cnp.APIVersion,
-				logfields.K8sNamespace:            cnp.Namespace,
-				logfields.ServiceID:               svcID,
-			}).Debug("Service updated or deleted, recalculating CiliumNetworkPolicy rules")
+			p.log.Debug(
+				"Service updated or deleted, recalculating CiliumNetworkPolicy rules",
+				logfields.CiliumNetworkPolicyName, cnp.Name,
+				logfields.K8sAPIVersion, cnp.APIVersion,
+				logfields.K8sNamespace, cnp.Namespace,
+				logfields.ServiceID, svcID,
+			)
 		}
 		initialRecvTime := time.Now()
 
 		resourceID := resourceIDForCiliumNetworkPolicy(key, cnp)
 
-		errs = append(errs, p.resolveCiliumNetworkPolicyRefs(cnp, key, initialRecvTime, resourceID))
+		errs = append(errs, p.resolveCiliumNetworkPolicyRefs(cnp, key, initialRecvTime, resourceID, nil))
 	}
 	return errors.Join(errs...)
 }
 
 // resolveToServices translates all ToServices rules found in the provided CNP
 // and to corresponding ToCIDRSet rules. Mutates the passed in cnp in place.
-func (p *PolicyWatcher) resolveToServices(key resource.Key, cnp *types.SlimCNP) {
+func (p *policyWatcher) resolveToServices(key resource.Key, cnp *types.SlimCNP) {
 	// We consult the service cache to obtain the service endpoints
 	// which are selected by the ToServices selectors found in the CNP.
-	p.svcCache.ForEachService(func(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.Endpoints) bool {
-		if !p.isSelectableService(svc) {
-			return true // continue
-		}
-
+	p.svcCache.ForEachService(func(svcID k8s.ServiceID, svc *k8s.MinimalService, eps *k8s.MinimalEndpoints) bool {
 		// svcEndpoints caches the selected endpoints in case they are
 		// referenced more than once by this CNP
 		svcEndpoints := newServiceEndpoints(svcID, svc, eps)
-
 		// This extracts the selected service endpoints from the rule
 		// and translates it to a ToCIDRSet
 		numMatches := svcEndpoints.processRule(cnp.Spec)
@@ -143,8 +128,8 @@ func (p *PolicyWatcher) resolveToServices(key resource.Key, cnp *types.SlimCNP) 
 
 // cnpMatchesService returns true if the cnp contains a ToServices rule which
 // matches the provided service svcID/svc
-func (p *PolicyWatcher) cnpMatchesService(cnp *types.SlimCNP, svcID k8s.ServiceID, svc *k8s.Service) bool {
-	if !p.isSelectableService(svc) {
+func (p *policyWatcher) cnpMatchesService(cnp *types.SlimCNP, svcID k8s.ServiceID, svc *k8s.MinimalService) bool {
+	if svc == nil {
 		return false
 	}
 
@@ -163,7 +148,7 @@ func (p *PolicyWatcher) cnpMatchesService(cnp *types.SlimCNP, svcID k8s.ServiceI
 
 // markCNPForService marks that a policy (referred to by 'key') contains a
 // ToServices selector selecting the service svcID
-func (p *PolicyWatcher) markCNPForService(key resource.Key, svcID k8s.ServiceID) {
+func (p *policyWatcher) markCNPForService(key resource.Key, svcID k8s.ServiceID) {
 	svcMap, ok := p.cnpByServiceID[svcID]
 	if !ok {
 		svcMap = make(map[resource.Key]struct{}, 1)
@@ -175,7 +160,7 @@ func (p *PolicyWatcher) markCNPForService(key resource.Key, svcID k8s.ServiceID)
 
 // clearCNPForService indicates that a policy (referred to by 'key') no longer
 // selects the service svcID via a ToServices rule
-func (p *PolicyWatcher) clearCNPForService(key resource.Key, svcID k8s.ServiceID) {
+func (p *policyWatcher) clearCNPForService(key resource.Key, svcID k8s.ServiceID) {
 	delete(p.cnpByServiceID[svcID], key)
 	if len(p.cnpByServiceID[svcID]) == 0 {
 		delete(p.cnpByServiceID, svcID)
@@ -184,7 +169,7 @@ func (p *PolicyWatcher) clearCNPForService(key resource.Key, svcID k8s.ServiceID
 
 // specHasMatchingToServices returns true if the rule contains a ToServices rule which
 // matches the provided service svcID/svc
-func hasMatchingToServices(spec *api.Rule, svcID k8s.ServiceID, svc *k8s.Service) bool {
+func hasMatchingToServices(spec *api.Rule, svcID k8s.ServiceID, svc *k8s.MinimalService) bool {
 	if spec == nil {
 		return false
 	}
@@ -210,12 +195,7 @@ func hasToServices(cnp *types.SlimCNP) bool {
 	if specHasToServices(cnp.Spec) {
 		return true
 	}
-	for _, spec := range cnp.Specs {
-		if specHasToServices(spec) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(cnp.Specs, specHasToServices)
 }
 
 // specHasToServices returns true if the rule contains a ToServices rule
@@ -234,14 +214,14 @@ func specHasToServices(spec *api.Rule) bool {
 
 // serviceSelectorMatches returns true if the ToServices k8sServiceSelector
 // matches the labels of the provided service svc
-func serviceSelectorMatches(sel *api.K8sServiceSelectorNamespace, svcID k8s.ServiceID, svc *k8s.Service) bool {
+func serviceSelectorMatches(sel *api.K8sServiceSelectorNamespace, svcID k8s.ServiceID, svc *k8s.MinimalService) bool {
 	if !(sel.Namespace == svcID.Namespace || sel.Namespace == "") {
 		return false
 	}
 
 	es := api.EndpointSelector(sel.Selector)
 	es.SyncRequirementsWithLabelSelector()
-	return es.Matches(labels.Set(svc.Labels))
+	return es.Matches(k8sLabels.Set(svc.Labels))
 }
 
 // serviceRefMatches returns true if the ToServices k8sService reference
@@ -254,15 +234,16 @@ func serviceRefMatches(ref *api.K8sServiceNamespace, svcID k8s.ServiceID) bool {
 // serviceEndpoints stores the endpoints associated with a service
 type serviceEndpoints struct {
 	svcID k8s.ServiceID
-	svc   *k8s.Service
-	eps   *k8s.Endpoints
+	svc   *k8s.MinimalService
+	eps   *k8s.MinimalEndpoints
 
-	valid  bool
-	cached []api.CIDR
+	valid                  bool
+	enableHighScaleIPcache bool
+	cached                 []api.CIDR
 }
 
 // newServiceEndpoints returns an initialized serviceEndpoints struct
-func newServiceEndpoints(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.Endpoints) *serviceEndpoints {
+func newServiceEndpoints(svcID k8s.ServiceID, svc *k8s.MinimalService, eps *k8s.MinimalEndpoints) *serviceEndpoints {
 	return &serviceEndpoints{
 		svcID: svcID,
 		svc:   svc,
@@ -297,6 +278,16 @@ func appendEndpoints(toCIDRSet *api.CIDRRuleSlice, endpoints []api.CIDR) {
 	}
 }
 
+// appendSelector appends the service selector as a generated EndpointSelector
+func appendSelector(toEndpoints *[]api.EndpointSelector, svcSelector map[string]string, namespace string) {
+	selector := maps.Clone(svcSelector)
+	selector[labels.LabelSourceK8sKeyPrefix+k8sConst.PodNamespaceLabel] = namespace
+	endpointSelector := api.NewESFromMatchRequirements(selector, nil)
+	endpointSelector.Generated = true
+
+	*toEndpoints = append(*toEndpoints, endpointSelector)
+}
+
 // processRule parses the ToServices selectors in the provided rule and translates
 // it to ToCIDRSet entries
 func (s *serviceEndpoints) processRule(rule *api.Rule) (numMatches int) {
@@ -307,16 +298,118 @@ func (s *serviceEndpoints) processRule(rule *api.Rule) (numMatches int) {
 		for _, toService := range egress.ToServices {
 			if sel := toService.K8sServiceSelector; sel != nil {
 				if serviceSelectorMatches(sel, s.svcID, s.svc) {
-					appendEndpoints(&rule.Egress[i].ToCIDRSet, s.endpoints())
+					if s.svc.IsExternal() || s.enableHighScaleIPcache {
+						appendEndpoints(&rule.Egress[i].ToCIDRSet, s.endpoints())
+					} else {
+						appendSelector(&rule.Egress[i].ToEndpoints, s.svc.Selector, s.svcID.Namespace)
+					}
 					numMatches++
 				}
 			} else if ref := toService.K8sService; ref != nil {
 				if serviceRefMatches(ref, s.svcID) {
-					appendEndpoints(&rule.Egress[i].ToCIDRSet, s.endpoints())
+					if s.svc.IsExternal() || s.enableHighScaleIPcache {
+						appendEndpoints(&rule.Egress[i].ToCIDRSet, s.endpoints())
+					} else {
+						appendSelector(&rule.Egress[i].ToEndpoints, s.svc.Selector, s.svcID.Namespace)
+					}
 					numMatches++
 				}
 			}
 		}
 	}
 	return numMatches
+}
+
+type serviceQueue struct {
+	mu    *lock.Mutex
+	cond  *sync.Cond
+	queue []k8s.ServiceNotification
+}
+
+func newServiceQueue() *serviceQueue {
+	mu := new(lock.Mutex)
+	return &serviceQueue{
+		mu:    mu,
+		cond:  sync.NewCond(mu),
+		queue: []k8s.ServiceNotification{},
+	}
+}
+
+func (q *serviceQueue) enqueue(item k8s.ServiceNotification) {
+	q.mu.Lock()
+	q.queue = append(q.queue, item)
+	q.cond.Signal()
+	q.mu.Unlock()
+}
+
+func (q *serviceQueue) signal() {
+	q.mu.Lock()
+	q.cond.Signal()
+	q.mu.Unlock()
+}
+
+func (q *serviceQueue) dequeue(ctx context.Context) (item k8s.ServiceNotification, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for len(q.queue) == 0 && ctx.Err() == nil {
+		q.cond.Wait()
+	}
+
+	// If ctx is cancelled, we return immediately
+	if ctx.Err() != nil {
+		return item, false
+	}
+
+	item = q.queue[0]
+	q.queue = q.queue[1:]
+
+	return item, true
+}
+
+// serviceNotificationsQueue converts the observable src into a channel.
+// When the provided context is cancelled the underlying subscription is
+// cancelled and the channel is closed.
+// In contrast to stream.ToChannel, this function has an unbounded buffer,
+// meaning the consumer must always consume the channel (or cancel ctx)
+func serviceNotificationsQueue(ctx context.Context, src stream.Observable[k8s.ServiceNotification]) <-chan k8s.ServiceNotification {
+	ctx, cancel := context.WithCancel(ctx)
+	ch := make(chan k8s.ServiceNotification)
+	q := newServiceQueue()
+
+	// This go routine is woken up whenever there a new item has been added to
+	// queue and forwards it to ch. It exits when context ctx is cancelled.
+	go func() {
+		// Close downstream channel on exit
+		defer close(ch)
+
+		// Exit the for-loop below if the context is cancelled.
+		// See https://pkg.go.dev/context#AfterFunc for a more detailed
+		// explanation of this pattern
+		cleanupCancellation := context.AfterFunc(ctx, q.signal)
+		defer cleanupCancellation()
+
+		for {
+			item, ok := q.dequeue(ctx)
+			if !ok {
+				return
+			}
+
+			select {
+			case ch <- item:
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	src.Observe(ctx,
+		q.enqueue,
+		func(err error) {
+			cancel() // stops above go routine
+		},
+	)
+
+	return ch
 }

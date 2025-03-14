@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/cilium/cilium/operator/pkg/model"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -147,7 +148,8 @@ func TestSharedIngressTranslator_getBackendServices(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			i := &cecTranslator{}
-			res := i.getBackendServices(tt.args.m)
+			res, err := i.desiredBackendServices(tt.args.m)
+			require.NoError(t, err)
 			require.Equal(t, tt.want, res)
 		})
 	}
@@ -161,6 +163,7 @@ func TestSharedIngressTranslator_getServices(t *testing.T) {
 	tests := []struct {
 		name   string
 		fields fields
+		model  *model.Model
 		want   []*ciliumv2.ServiceListener
 	}{
 		{
@@ -169,29 +172,101 @@ func TestSharedIngressTranslator_getServices(t *testing.T) {
 				name:      "cilium-ingress",
 				namespace: "kube-system",
 			},
+			model: &model.Model{
+				HTTP: []model.HTTPListener{
+					{
+						Port: 80,
+					},
+					{
+						Port: 443,
+					},
+				},
+			},
 			want: []*ciliumv2.ServiceListener{
 				{
 					Name:      "cilium-ingress",
 					Namespace: "kube-system",
+					Ports: []uint16{
+						80,
+						443,
+					},
+				},
+			},
+		},
+		{
+			name: "only http port",
+			fields: fields{
+				name:      "someotherservice",
+				namespace: "default",
+			},
+			model: &model.Model{
+				HTTP: []model.HTTPListener{
+					{
+						Port: 80,
+					},
+				},
+			},
+			want: []*ciliumv2.ServiceListener{
+				{
+					Name:      "someotherservice",
+					Namespace: "default",
+					Ports: []uint16{
+						80,
+					},
+				},
+			},
+		},
+		{
+			name: "cleartext HTTP and TLS passthrough",
+			fields: fields{
+				name:      "cilium-ingress",
+				namespace: "kube-system",
+			},
+			model: &model.Model{
+				HTTP: []model.HTTPListener{
+					{
+						Port: 80,
+					},
+				},
+				TLSPassthrough: []model.TLSPassthroughListener{
+					{
+						Port: 443,
+					},
+				},
+			},
+			want: []*ciliumv2.ServiceListener{
+				{
+					Name:      "cilium-ingress",
+					Namespace: "kube-system",
+					Ports: []uint16{
+						80,
+						443,
+					},
 				},
 			},
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			i := &cecTranslator{}
-			got := i.getServices(tt.fields.namespace, tt.fields.name)
+			got, err := i.desiredServicesWithPorts(tt.fields.namespace, tt.fields.name, tt.model)
+			require.NoError(t, err)
 			require.Equal(t, tt.want, got)
 		})
 	}
 }
 
-func TestSharedIngressTranslator_getHTTPRouteListenerProxy(t *testing.T) {
+func TestSharedIngressTranslator_getListenerProxy(t *testing.T) {
 	i := &cecTranslator{
-		secretsNamespace: "cilium-secrets",
-		useProxyProtocol: true,
+		Config: Config{
+			SecretsNamespace: "cilium-secrets",
+			ListenerConfig: ListenerConfig{
+				UseProxyProtocol: true,
+			},
+		},
 	}
-	res := i.getHTTPRouteListener(&model.Model{
+	res, err := i.desiredEnvoyListener(&model.Model{
 		HTTP: []model.HTTPListener{
 			{
 				TLS: []model.TLSSecret{
@@ -203,9 +278,11 @@ func TestSharedIngressTranslator_getHTTPRouteListenerProxy(t *testing.T) {
 			},
 		},
 	})
+	require.NoError(t, err)
 	require.Len(t, res, 1)
+
 	listener := &envoy_config_listener.Listener{}
-	err := proto.Unmarshal(res[0].GetValue(), listener)
+	err = proto.Unmarshal(res[0].GetValue(), listener)
 	require.NoError(t, err)
 
 	listenerNames := []string{}
@@ -216,12 +293,14 @@ func TestSharedIngressTranslator_getHTTPRouteListenerProxy(t *testing.T) {
 	require.Equal(t, []string{proxyProtocolType, tlsInspectorType}, listenerNames)
 }
 
-func TestSharedIngressTranslator_getHTTPRouteListener(t *testing.T) {
+func TestSharedIngressTranslator_getListener(t *testing.T) {
 	i := &cecTranslator{
-		secretsNamespace: "cilium-secrets",
+		Config: Config{
+			SecretsNamespace: "cilium-secrets",
+		},
 	}
 
-	res := i.getHTTPRouteListener(&model.Model{
+	res, err := i.desiredEnvoyListener(&model.Model{
 		HTTP: []model.HTTPListener{
 			{
 				TLS: []model.TLSSecret{
@@ -233,10 +312,11 @@ func TestSharedIngressTranslator_getHTTPRouteListener(t *testing.T) {
 			},
 		},
 	})
+	require.NoError(t, err)
 	require.Len(t, res, 1)
 
 	listener := &envoy_config_listener.Listener{}
-	err := proto.Unmarshal(res[0].GetValue(), listener)
+	err = proto.Unmarshal(res[0].GetValue(), listener)
 	require.NoError(t, err)
 
 	require.Len(t, listener.ListenerFilters, 1)
@@ -269,7 +349,7 @@ func TestSharedIngressTranslator_getHTTPRouteListener(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, downStreamTLS.CommonTlsContext.TlsCertificateSdsSecretConfigs, 1)
-	require.Equal(t, downStreamTLS.CommonTlsContext.TlsCertificateSdsSecretConfigs[0].GetName(), "cilium-secrets/dummy-namespace-dummy-secret")
+	require.Equal(t, "cilium-secrets/dummy-namespace-dummy-secret", downStreamTLS.CommonTlsContext.TlsCertificateSdsSecretConfigs[0].GetName())
 	require.Nil(t, downStreamTLS.CommonTlsContext.TlsCertificateSdsSecretConfigs[0].GetSdsConfig())
 }
 
@@ -332,7 +412,8 @@ func TestSharedIngressTranslator_getClusters(t *testing.T) {
 		i := &cecTranslator{}
 
 		t.Run(tt.name, func(t *testing.T) {
-			res := i.getClusters(tt.args.m)
+			res, err := i.desiredEnvoyCluster(tt.args.m)
+			require.NoError(t, err)
 			require.Len(t, res, len(tt.expected))
 
 			for i := 0; i < len(tt.expected); i++ {
@@ -392,8 +473,10 @@ func TestGetEnvoyHTTPRouteConfiguration_VirtualHostSorted(t *testing.T) {
 		},
 	}
 
-	res1 := defT.getEnvoyHTTPRouteConfiguration(&model.Model{HTTP: l1})
-	res2 := defT.getEnvoyHTTPRouteConfiguration(&model.Model{HTTP: l2})
+	res1, err1 := defT.desiredEnvoyHTTPRouteConfiguration(&model.Model{HTTP: l1})
+	res2, err2 := defT.desiredEnvoyHTTPRouteConfiguration(&model.Model{HTTP: l2})
+	require.NoError(t, err1)
+	require.NoError(t, err2)
 
 	diffOutput := cmp.Diff(res1, res2, protocmp.Transform())
 	if len(diffOutput) != 0 {
@@ -475,7 +558,8 @@ func TestSharedIngressTranslator_getEnvoyHTTPRouteConfiguration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			res := defT.getEnvoyHTTPRouteConfiguration(tt.args.m)
+			res, err := defT.desiredEnvoyHTTPRouteConfiguration(tt.args.m)
+			require.NoError(t, err)
 			require.Len(t, res, len(tt.expectedRouteConfigs), "Number of Listeners did not match")
 
 			for i, rawRoute := range res {
@@ -574,6 +658,9 @@ func envoyRouteAction(namespace, backend, port string) *envoy_config_route_v3.Ro
 			ClusterSpecifier: &envoy_config_route_v3.RouteAction_Cluster{
 				Cluster: fmt.Sprintf("%s:%s:%s", namespace, backend, port),
 			},
+			MaxStreamDuration: &envoy_config_route_v3.RouteAction_MaxStreamDuration{
+				MaxStreamDuration: &durationpb.Duration{Seconds: 0},
+			},
 		},
 	}
 }
@@ -656,7 +743,8 @@ func TestSharedIngressTranslator_getResources(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			i := &cecTranslator{}
-			got := i.getResources(tt.args.m)
+			got, err := i.desiredResources(tt.args.m)
+			require.NoError(t, err)
 			require.Lenf(t, got, tt.expected, "expected %d resources, got %d", tt.expected, len(got))
 
 			// Log for debugging purpose

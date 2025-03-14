@@ -26,6 +26,8 @@ var errors = map[uint8]string{
 	9:   "Fragmented packet",
 	10:  "Fragmented packet entry update failed",
 	11:  "Missed tail call to custom program",
+	12:  "Interface Decrypting",
+	13:  "Interface Encrypting",
 	130: "Invalid source mac",      // Unused
 	131: "Invalid destination mac", // Unused
 	132: "Invalid source ip",
@@ -98,6 +100,9 @@ var errors = map[uint8]string{
 	200: "IGMP subscribed",
 	201: "Multicast handled",
 	202: "Host datapath not ready",
+	203: "Endpoint policy program not available",
+	204: "No Egress IP configured",
+	205: "Punt to proxy",
 }
 
 func extendedReason(extError int8) string {

@@ -10,19 +10,22 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	"github.com/cilium/cilium/pkg/cmdref"
 	"github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/version"
 )
 
-func NewAgentCmd(h *hive.Hive) *cobra.Command {
+func NewAgentCmd(hfn func() *hive.Hive) *cobra.Command {
+	bootstrapStats.overall.Start()
+	h := hfn()
+
 	rootCmd := &cobra.Command{
 		Use:   "cilium-agent",
 		Short: "Run the cilium agent",
 		Run: func(cobraCmd *cobra.Command, args []string) {
-			bootstrapStats.overall.Start()
-
 			if v, _ := cobraCmd.Flags().GetBool("version"); v {
 				fmt.Printf("%s %s\n", cobraCmd.Name(), version.Version)
 				os.Exit(0)
@@ -36,7 +39,7 @@ func NewAgentCmd(h *hive.Hive) *cobra.Command {
 				log.Fatalf("invalid daemon configuration: %s", err)
 			}
 
-			if err := h.Run(); err != nil {
+			if err := h.Run(logging.DefaultSlogLogger); err != nil {
 				log.Fatal(err)
 			}
 		},
@@ -46,17 +49,8 @@ func NewAgentCmd(h *hive.Hive) *cobra.Command {
 
 	h.RegisterFlags(rootCmd.Flags())
 
-	cmdrefCmd := &cobra.Command{
-		Use:    "cmdref [output directory]",
-		Short:  "Generate command reference for cilium-agent to given output directory",
-		Args:   cobra.ExactArgs(1),
-		Hidden: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			genMarkdown(rootCmd, args[0])
-		},
-	}
 	rootCmd.AddCommand(
-		cmdrefCmd,
+		cmdref.NewCmd(rootCmd),
 		h.Command(),
 	)
 
@@ -68,9 +62,8 @@ func NewAgentCmd(h *hive.Hive) *cobra.Command {
 		// Populate the config and initialize the logger early as these
 		// are shared by all commands.
 		func() {
-			initDaemonConfig(h.Viper())
+			initDaemonConfigAndLogging(h.Viper())
 		},
-		initLogging,
 	)
 
 	return rootCmd

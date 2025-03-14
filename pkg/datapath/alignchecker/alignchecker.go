@@ -18,6 +18,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/metricsmap"
 	"github.com/cilium/cilium/pkg/maps/neighborsmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmap"
 	"github.com/cilium/cilium/pkg/maps/recorder"
 	"github.com/cilium/cilium/pkg/maps/signalmap"
 	"github.com/cilium/cilium/pkg/maps/srv6map"
@@ -59,6 +60,13 @@ func CheckStructAlignments(path string) error {
 	return check.CheckStructAlignments(path, toCheckSizes, false)
 }
 
+func RegisterLbStructsToCheck(isPerSvcLb bool) {
+	registerToCheck(map[string][]any{
+		"lb4_service": {lbmap.Service4Value{}},
+		"lb6_service": {lbmap.Service6Value{}},
+	})
+}
+
 func init() {
 	registerToCheck(map[string][]any{
 		"ipv4_ct_tuple":        {ctmap.CtKey4{}, ctmap.CtKey4Global{}},
@@ -67,10 +75,8 @@ func init() {
 		"ipcache_key":          {ipcachemap.Key{}},
 		"remote_endpoint_info": {ipcachemap.RemoteEndpointInfo{}},
 		"lb4_key":              {lbmap.Service4Key{}},
-		"lb4_service":          {lbmap.Service4Value{}},
 		"lb4_backend":          {lbmap.Backend4ValueV3{}},
 		"lb6_key":              {lbmap.Service6Key{}},
-		"lb6_service":          {lbmap.Service6Value{}},
 		"lb6_backend":          {lbmap.Backend6ValueV3{}},
 		"endpoint_info":        {lxcmap.EndpointInfo{}},
 		"metrics_key":          {metricsmap.Key{}},
@@ -96,27 +102,33 @@ func init() {
 		// "capture_rule":      {recorder.CaptureRule6{}},
 		// "ipv4_nat_entry":    {nat.NatEntry4{}},
 		// "ipv6_nat_entry":    {nat.NatEntry6{}},
-		"endpoint_key":           {bpf.EndpointKey{}},
-		"lb4_affinity_key":       {lbmap.Affinity4Key{}},
-		"lb6_affinity_key":       {lbmap.Affinity6Key{}},
-		"lb_affinity_match":      {lbmap.AffinityMatchKey{}},
-		"lb_affinity_val":        {lbmap.AffinityValue{}},
-		"lb4_src_range_key":      {lbmap.SourceRangeKey4{}},
-		"lb6_src_range_key":      {lbmap.SourceRangeKey6{}},
-		"edt_id":                 {bwmap.EdtId{}},
-		"edt_info":               {bwmap.EdtInfo{}},
-		"egress_gw_policy_key":   {egressmap.EgressPolicyKey4{}},
-		"egress_gw_policy_entry": {egressmap.EgressPolicyVal4{}},
-		"srv6_vrf_key4":          {srv6map.VRFKey4{}},
-		"srv6_vrf_key6":          {srv6map.VRFKey6{}},
-		"srv6_policy_key4":       {srv6map.PolicyKey4{}},
-		"srv6_policy_key6":       {srv6map.PolicyKey6{}},
-		"tunnel_key":             {tunnel.TunnelKey{}},
-		"tunnel_value":           {tunnel.TunnelValue{}},
-		"vtep_key":               {vtep.Key{}},
-		"vtep_value":             {vtep.VtepEndpointInfo{}},
-		"auth_key":               {authmap.AuthKey{}},
-		"auth_info":              {authmap.AuthInfo{}},
+		"endpoint_key":            {bpf.EndpointKey{}},
+		"lb4_affinity_key":        {lbmap.Affinity4Key{}},
+		"lb6_affinity_key":        {lbmap.Affinity6Key{}},
+		"lb_affinity_match":       {lbmap.AffinityMatchKey{}},
+		"lb_affinity_val":         {lbmap.AffinityValue{}},
+		"lb4_src_range_key":       {lbmap.SourceRangeKey4{}},
+		"lb6_src_range_key":       {lbmap.SourceRangeKey6{}},
+		"edt_id":                  {bwmap.EdtId{}},
+		"edt_info":                {bwmap.EdtInfo{}},
+		"egress_gw_policy_key":    {egressmap.EgressPolicyKey4{}},
+		"egress_gw_policy_entry":  {egressmap.EgressPolicyVal4{}},
+		"srv6_vrf_key4":           {srv6map.VRFKey4{}},
+		"srv6_vrf_key6":           {srv6map.VRFKey6{}},
+		"srv6_policy_key4":        {srv6map.PolicyKey4{}},
+		"srv6_policy_key6":        {srv6map.PolicyKey6{}},
+		"tunnel_key":              {tunnel.TunnelKey{}},
+		"tunnel_value":            {tunnel.TunnelValue{}},
+		"vtep_key":                {vtep.Key{}},
+		"vtep_value":              {vtep.VtepEndpointInfo{}},
+		"auth_key":                {authmap.AuthKey{}},
+		"auth_info":               {authmap.AuthInfo{}},
+		"skip_lb4_key":            {lbmap.SkipLB4Key{}},
+		"skip_lb6_key":            {lbmap.SkipLB6Key{}},
+		"ratelimit_key":           {ratelimitmap.Key{}},
+		"ratelimit_value":         {ratelimitmap.Value{}},
+		"ratelimit_metrics_key":   {ratelimitmap.MetricsKey{}},
+		"ratelimit_metrics_value": {ratelimitmap.MetricsValue{}},
 	})
 
 	registerToCheckSizes(map[string][]any{

@@ -5,8 +5,9 @@ package ingress
 
 import (
 	"context"
+	"log/slog"
+	"time"
 
-	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 const (
@@ -29,7 +31,7 @@ const (
 
 // ingressReconciler reconciles a Ingress object
 type ingressReconciler struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
 	client client.Client
 
 	lbAnnotationPrefixes    []string
@@ -39,17 +41,17 @@ type ingressReconciler struct {
 	defaultSecretNamespace  string
 	defaultSecretName       string
 	enforcedHTTPS           bool
+	defaultRequestTimeout   time.Duration
 
-	hostNetworkEnabled                  bool
-	hostNetworkSharedHTTPPort           uint32
-	hostNetworkSharedTLSPassthroughPort uint32
+	hostNetworkEnabled    bool
+	hostNetworkSharedPort uint32
 
 	cecTranslator       translation.CECTranslator
 	dedicatedTranslator translation.Translator
 }
 
 func newIngressReconciler(
-	logger logrus.FieldLogger,
+	logger *slog.Logger,
 	c client.Client,
 	cecTranslator translation.CECTranslator,
 	dedicatedIngressTranslator translation.Translator,
@@ -60,9 +62,9 @@ func newIngressReconciler(
 	defaultSecretNamespace string,
 	defaultSecretName string,
 	enforcedHTTPS bool,
+	defaultRequestTimeout time.Duration,
 	hostNetworkEnabled bool,
-	hostNetworkSharedHTTPPort uint32,
-	hostNetworkSharedTLSPassthroughPort uint32,
+	hostNetworkSharedPort uint32,
 ) *ingressReconciler {
 	return &ingressReconciler{
 		logger: logger,
@@ -78,10 +80,10 @@ func newIngressReconciler(
 		defaultSecretNamespace:  defaultSecretNamespace,
 		defaultSecretName:       defaultSecretName,
 		enforcedHTTPS:           enforcedHTTPS,
+		defaultRequestTimeout:   defaultRequestTimeout,
 
-		hostNetworkEnabled:                  hostNetworkEnabled,
-		hostNetworkSharedHTTPPort:           hostNetworkSharedHTTPPort,
-		hostNetworkSharedTLSPassthroughPort: hostNetworkSharedTLSPassthroughPort,
+		hostNetworkEnabled:    hostNetworkEnabled,
+		hostNetworkSharedPort: hostNetworkSharedPort,
 	}
 }
 
@@ -122,7 +124,7 @@ func (r *ingressReconciler) enqueueSharedCiliumIngresses() handler.EventHandler 
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 		ingressList := networkingv1.IngressList{}
 		if err := r.client.List(ctx, &ingressList); err != nil {
-			r.logger.WithError(err).Warn("Failed to list Ingresses")
+			r.logger.Warn("Failed to list Ingresses", logfields.Error, err)
 			return nil
 		}
 
@@ -155,7 +157,7 @@ func (r *ingressReconciler) enqueueIngressesWithoutExplicitClass() handler.Event
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 		ingressList := networkingv1.IngressList{}
 		if err := r.client.List(ctx, &ingressList); err != nil {
-			r.logger.WithError(err).Warn("Failed to list Ingresses")
+			r.logger.Warn("Failed to list Ingresses", logfields.Error, err)
 			return nil
 		}
 
@@ -276,7 +278,7 @@ var _ predicate.Predicate = &matchesCiliumRelevantIngressPredicate{}
 
 type matchesCiliumRelevantIngressPredicate struct {
 	client client.Client
-	logger logrus.FieldLogger
+	logger *slog.Logger
 }
 
 func (r *matchesCiliumRelevantIngressPredicate) Create(event event.CreateEvent) bool {

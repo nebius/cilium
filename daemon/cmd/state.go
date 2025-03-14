@@ -9,14 +9,15 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sync"
 
 	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/ipam"
 	"github.com/cilium/cilium/pkg/k8s"
@@ -33,15 +34,31 @@ import (
 
 var syncLBMapsControllerGroup = controller.NewGroup("sync-lb-maps-with-k8s-services")
 
-func (d *Daemon) WaitForEndpointRestore(ctx context.Context) {
+func (d *Daemon) WaitForEndpointRestore(ctx context.Context) error {
 	if !option.Config.RestoreState {
-		return
+		return nil
 	}
 
 	select {
 	case <-ctx.Done():
+		return ctx.Err()
 	case <-d.endpointRestoreComplete:
 	}
+	return nil
+}
+
+func (d *Daemon) WaitForInitialPolicy(ctx context.Context) error {
+	if !option.Config.RestoreState {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-d.endpointRestoreComplete:
+	case <-d.endpointInitialPolicyComplete:
+	}
+	return nil
 }
 
 type endpointRestoreState struct {
@@ -52,7 +69,7 @@ type endpointRestoreState struct {
 
 // checkLink returns an error if a link with linkName does not exist.
 func checkLink(linkName string) error {
-	_, err := netlink.LinkByName(linkName)
+	_, err := safenetlink.LinkByName(linkName)
 	return err
 }
 
@@ -117,12 +134,8 @@ func (d *Daemon) getPodForEndpoint(ep *endpoint.Endpoint) error {
 		pod *slim_corev1.Pod
 		err error
 	)
-	if option.Config.EnableHighScaleIPcache {
-		pod, _, _, _, _, err = d.fetchK8sMetadataForEndpoint(ep.K8sNamespace, ep.K8sPodName)
-	} else {
-		d.k8sWatcher.WaitForCacheSync(resources.K8sAPIGroupPodV1Core)
-		pod, err = d.k8sWatcher.GetCachedPod(ep.K8sNamespace, ep.K8sPodName)
-	}
+	d.k8sWatcher.WaitForCacheSync(resources.K8sAPIGroupPodV1Core)
+	pod, err = d.k8sWatcher.GetCachedPod(ep.K8sNamespace, ep.K8sPodName)
 	if err != nil && k8serrors.IsNotFound(err) {
 		return fmt.Errorf("Kubernetes pod %s/%s does not exist", ep.K8sNamespace, ep.K8sPodName)
 	} else if err == nil && pod.Spec.NodeName != nodeTypes.GetName() {
@@ -168,7 +181,7 @@ func (d *Daemon) fetchOldEndpoints(dir string) (*endpointRestoreState, error) {
 	}
 	eptsID := endpoint.FilterEPDir(dirFiles)
 
-	state.possible = endpoint.ReadEPsFromDirNames(d.ctx, d, d, d.ipcache, dir, eptsID)
+	state.possible = endpoint.ReadEPsFromDirNames(d.ctx, d, d.policyMapFactory, d, d.ipcache, dir, eptsID)
 
 	if len(state.possible) == 0 {
 		log.Info("No old endpoints found.")
@@ -180,10 +193,8 @@ func (d *Daemon) fetchOldEndpoints(dir string) (*endpointRestoreState, error) {
 // allocating their existing IPs out of the CIDR block and then inserting the
 // endpoints into the endpoints list. It needs to be followed by a call to
 // regenerateRestoredEndpoints() once the endpoint builder is ready.
-//
-// If clean is true, endpoints which cannot be associated with a container
-// workloads are deleted.
-func (d *Daemon) restoreOldEndpoints(state *endpointRestoreState, clean bool) error {
+// Endpoints which cannot be associated with a container workload are deleted.
+func (d *Daemon) restoreOldEndpoints(state *endpointRestoreState) {
 	failed := 0
 	defer func() {
 		state.possible = nil
@@ -191,15 +202,10 @@ func (d *Daemon) restoreOldEndpoints(state *endpointRestoreState, clean bool) er
 
 	if !option.Config.RestoreState {
 		log.Info("Endpoint restore is disabled, skipping restore step")
-		return nil
+		return
 	}
 
-	var emf endpointMetadataFetcher
-	if option.Config.EnableHighScaleIPcache {
-		emf = &uncachedEndpointMetadataFetcher{slimcli: d.clientset.Slim()}
-	} else {
-		emf = &cachedEndpointMetadataFetcher{k8sWatcher: d.k8sWatcher}
-	}
+	emf := &cachedEndpointMetadataFetcher{k8sWatcher: d.k8sWatcher}
 	d.endpointMetadataFetcher = emf
 
 	log.Info("Restoring endpoints...")
@@ -232,6 +238,7 @@ func (d *Daemon) restoreOldEndpoints(state *endpointRestoreState, clean bool) er
 		// kvstore because the local node's IP is used as a suffix for the key
 		// in the key-value store.
 		ep.SetAllocator(d.identityAllocator)
+		ep.SetCtMapGC(d.ctMapGC)
 
 		restore, err := d.validateEndpoint(ep)
 		if err != nil {
@@ -243,16 +250,14 @@ func (d *Daemon) restoreOldEndpoints(state *endpointRestoreState, clean bool) er
 			}
 		}
 		if !restore {
-			if clean {
-				state.toClean = append(state.toClean, ep)
-			}
+			state.toClean = append(state.toClean, ep)
 			continue
 		}
 
 		scopedLog.Debug("Restoring endpoint")
 		ep.LogStatusOK(endpoint.Other, "Restoring endpoint from previous cilium instance")
 
-		ep.SetDefaultConfiguration(true)
+		ep.SetDefaultConfiguration()
 		ep.SetProxy(d.l7Proxy)
 		ep.SkipStateClean()
 
@@ -278,13 +283,9 @@ func (d *Daemon) restoreOldEndpoints(state *endpointRestoreState, clean bool) er
 			}
 		}
 	}
-
-	return nil
 }
 
 func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState, endpointsRegenerator *endpoint.Regenerator) {
-	d.endpointRestoreComplete = make(chan struct{})
-
 	log.WithField("numRestored", len(state.restored)).Info("Regenerating restored endpoints")
 
 	// Before regenerating, check whether the CT map has properties that
@@ -318,46 +319,11 @@ func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState, endpoi
 		if err := d.endpointManager.RestoreEndpoint(ep); err != nil {
 			log.WithError(err).Warning("Unable to restore endpoint")
 			// remove endpoint from slice of endpoints to restore
-			state.restored = append(state.restored[:i], state.restored[i+1:]...)
-		}
-	}
-
-	if option.Config.EnableIPSec {
-		// If IPsec is enabled we need to restore the host endpoint before any
-		// other endpoint, to ensure a dropless upgrade.
-		// This code can be removed in v1.15.
-		// This is necessary because we changed how the IPsec encapsulation is
-		// done. In older version, bpf_lxc would pass the outer destination IP
-		// via skb->cb to bpf_host which would write it to the outer header.
-		// In newer versions, the header is written by the kernel XFRM
-		// subsystem and bpf_host must therefore not write it. To allow for a
-		// smooth upgrade, bpf_host has been updated to handle both cases. But
-		// for that to succeed, it must be reloaded first, before the bpf_lxc
-		// programs stop writing the IP into skb->cb.
-		for _, ep := range state.restored {
-			// Cap the timeout used to wait for remote cluster synchronization
-			// to avoid blocking the agent startup, as this regeneration is
-			// performed synchronously.
-			endpointsRegenerator.CapTimeoutForSynchronousRegeneration()
-
-			if ep.IsHost() {
-				log.WithField(logfields.EndpointID, ep.ID).Info("Successfully restored endpoint. Scheduling regeneration")
-				if err := ep.RegenerateAfterRestore(endpointsRegenerator, d.bwManager, d.fetchK8sMetadataForEndpoint); err != nil {
-					log.WithField(logfields.EndpointID, ep.ID).WithError(err).Debug("error regenerating restored host endpoint")
-					epRegenerated <- false
-				} else {
-					epRegenerated <- true
-				}
-				break
-			}
+			state.restored = slices.Delete(state.restored, i, i+1)
 		}
 	}
 
 	for _, ep := range state.restored {
-		if ep.IsHost() && option.Config.EnableIPSec {
-			// The host endpoint was handled above.
-			continue
-		}
 		log.WithField(logfields.EndpointID, ep.ID).Info("Successfully restored endpoint. Scheduling regeneration")
 		go func(ep *endpoint.Endpoint, epRegenerated chan<- bool) {
 			if err := ep.RegenerateAfterRestore(endpointsRegenerator, d.bwManager, d.fetchK8sMetadataForEndpoint); err != nil {
@@ -386,6 +352,13 @@ func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState, endpoi
 		}(ep)
 	}
 	endpointCleanupCompleted.Wait()
+
+	go func() {
+		for _, ep := range state.restored {
+			<-ep.InitialEnvoyPolicyComputed
+		}
+		close(d.endpointInitialPolicyComplete)
+	}()
 
 	go func() {
 		regenerated, total := 0, 0
@@ -482,7 +455,7 @@ func (d *Daemon) initRestore(restoredEndpoints *endpointRestoreState, endpointsR
 							DoFunc: func(ctx context.Context) error {
 								var localServices sets.Set[k8s.ServiceID]
 								if localOnly {
-									localServices = d.k8sWatcher.K8sSvcCache.LocalServices()
+									localServices = d.k8sSvcCache.LocalServices()
 								}
 
 								stale, err := d.svc.SyncWithK8sFinished(localOnly, localServices)
@@ -491,7 +464,10 @@ func (d *Daemon) initRestore(restoredEndpoints *endpointRestoreState, endpointsR
 								// of whether an error was returned.
 								swg := lock.NewStoppableWaitGroup()
 								for _, svc := range stale {
-									d.k8sWatcher.K8sSvcCache.EnsureService(svc, swg)
+									d.k8sSvcCache.EnsureService(svc, swg)
+									if option.Config.EnableLocalRedirectPolicy {
+										d.lrpManager.EnsureService(svc)
+									}
 								}
 
 								swg.Stop()
@@ -514,7 +490,7 @@ func (d *Daemon) initRestore(restoredEndpoints *endpointRestoreState, endpointsR
 
 					err := d.clustermesh.ServicesSynced(d.ctx)
 					if err != nil {
-						log.WithError(err).Fatal("timeout while waiting for all clusters to be locally synchronized")
+						return // The parent context expired, and we are already terminating
 					}
 					log.Debug("all clusters have been correctly synchronized locally")
 				}

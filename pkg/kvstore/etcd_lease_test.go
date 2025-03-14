@@ -5,14 +5,21 @@ package kvstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	v3rpcErrors "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	client "go.etcd.io/etcd/client/v3"
+)
+
+var (
+	// ErrNotImplemented is the error which is returned when a functionality is not implemented.
+	ErrNotImplemented = errors.New("not implemented")
 )
 
 type fakeEtcdLeaseClient struct {
@@ -81,7 +88,7 @@ func (f *fakeEtcdLeaseClient) Close() error { return ErrNotImplemented }
 func TestLeaseManager(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := newFakeEtcdLeaseClient(ctx, 10)
-	mgr := newEtcdLeaseManager(newFakeEtcdClient(&cl), 10*time.Second, 5, nil, log)
+	mgr := newEtcdLeaseManager(hivetest.Logger(t), newFakeEtcdClient(&cl), 10*time.Second, 5, nil)
 
 	t.Cleanup(func() {
 		cancel()
@@ -140,7 +147,7 @@ func TestLeaseManager(t *testing.T) {
 func TestLeaseManagerParallel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := newFakeEtcdLeaseClient(ctx, 10)
-	mgr := newEtcdLeaseManager(newFakeEtcdClient(&cl), 10*time.Second, 5, nil, log)
+	mgr := newEtcdLeaseManager(hivetest.Logger(t), newFakeEtcdClient(&cl), 10*time.Second, 5, nil)
 
 	t.Cleanup(func() {
 		cancel()
@@ -175,7 +182,7 @@ func TestLeaseManagerParallel(t *testing.T) {
 func TestLeaseManagerReleasePrefix(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := newFakeEtcdLeaseClient(ctx, 10)
-	mgr := newEtcdLeaseManager(newFakeEtcdClient(&cl), 10*time.Second, 5, nil, log)
+	mgr := newEtcdLeaseManager(hivetest.Logger(t), newFakeEtcdClient(&cl), 10*time.Second, 5, nil)
 
 	t.Cleanup(func() {
 		cancel()
@@ -206,7 +213,7 @@ func TestLeaseManagerCancelIfExpired(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := newFakeEtcdLeaseClient(ctx, 10)
-	mgr := newEtcdLeaseManager(newFakeEtcdClient(&cl), 10*time.Second, 5, observer, log)
+	mgr := newEtcdLeaseManager(hivetest.Logger(t), newFakeEtcdClient(&cl), 10*time.Second, 5, observer)
 
 	t.Cleanup(func() {
 		close(expiredCH)
@@ -241,7 +248,7 @@ func TestLeaseManagerCancelIfExpired(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		expired = append(expired, <-expiredCH)
 	}
-	sort.Strings(expired)
+	slices.Sort(expired)
 	require.ElementsMatch(t, expired, []string{"key5", "key6", "key7", "key8", "key9"})
 
 	// Get the lease for one of the expired keys, and check that it is a different one.
@@ -253,7 +260,7 @@ func TestLeaseManagerCancelIfExpired(t *testing.T) {
 func TestLeaseManagerKeyHasLease(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := newFakeEtcdLeaseClient(ctx, 10)
-	mgr := newEtcdLeaseManager(newFakeEtcdClient(&cl), 10*time.Second, 5, nil, log)
+	mgr := newEtcdLeaseManager(hivetest.Logger(t), newFakeEtcdClient(&cl), 10*time.Second, 5, nil)
 
 	t.Cleanup(func() {
 		cancel()

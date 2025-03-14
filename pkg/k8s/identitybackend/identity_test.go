@@ -4,18 +4,19 @@
 package identitybackend
 
 import (
+	"context"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	. "github.com/cilium/checkmate"
-	"golang.org/x/net/context"
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	"github.com/cilium/cilium/pkg/allocator"
-	"github.com/cilium/cilium/pkg/checker"
 	"github.com/cilium/cilium/pkg/identity/key"
 	"github.com/cilium/cilium/pkg/idpool"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -24,16 +25,7 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 )
 
-// Hook up gocheck into the "go test" runner.
-func Test(t *testing.T) {
-	TestingT(t)
-}
-
-type K8sIdentityBackendSuite struct{}
-
-var _ = Suite(&K8sIdentityBackendSuite{})
-
-func (s *K8sIdentityBackendSuite) TestSanitizeK8sLabels(c *C) {
+func TestSanitizeK8sLabels(t *testing.T) {
 	path := field.NewPath("test", "labels")
 	testCases := []struct {
 		input            map[string]string
@@ -87,27 +79,23 @@ func (s *K8sIdentityBackendSuite) TestSanitizeK8sLabels(c *C) {
 	}
 
 	for _, test := range testCases {
-		selected, skipped := sanitizeK8sLabels(test.input)
-		c.Assert(selected, checker.DeepEquals, test.selected)
-		c.Assert(skipped, checker.DeepEquals, test.skipped)
-		c.Assert(validation.ValidateLabels(selected, path), checker.DeepEquals, test.validationErrors)
+		selected, skipped := SanitizeK8sLabels(test.input)
+		require.EqualValues(t, test.selected, selected)
+		require.EqualValues(t, test.skipped, skipped)
+		require.EqualValues(t, test.validationErrors, validation.ValidateLabels(selected, path))
 	}
 }
 
 type FakeHandler struct {
-	onAddFunc func()
+	onUpsertFunc func()
+	onListDone   func()
 }
 
-func (f FakeHandler) OnListDone() {}
-
-func (f FakeHandler) OnAdd(id idpool.ID, key allocator.AllocatorKey) {
-	if f.onAddFunc != nil {
-		f.onAddFunc()
-	}
+func (f FakeHandler) OnListDone() {
+	f.onListDone()
 }
 
-func (f FakeHandler) OnModify(id idpool.ID, key allocator.AllocatorKey) {}
-
+func (f FakeHandler) OnUpsert(id idpool.ID, key allocator.AllocatorKey) { f.onUpsertFunc() }
 func (f FakeHandler) OnDelete(id idpool.ID, key allocator.AllocatorKey) {}
 
 func getLabelsKey(rawMap map[string]string) allocator.AllocatorKey {
@@ -197,21 +185,19 @@ func TestGetIdentity(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
-			_, client := k8sClient.NewFakeClientset()
+			_, client := k8sClient.NewFakeClientset(hivetest.Logger(t))
 			backend, err := NewCRDBackend(CRDBackendConfiguration{
-				Store:   nil,
-				Client:  client,
-				KeyFunc: (&key.GlobalIdentity{}).PutKeyFromMap,
+				Store:    nil,
+				StoreSet: &atomic.Bool{},
+				Client:   client,
+				KeyFunc:  (&key.GlobalIdentity{}).PutKeyFromMap,
 			})
 			if err != nil {
 				t.Fatalf("Can't create CRD Backend: %s", err)
 			}
 
-			ctx := context.Background()
-			stopChan := make(chan struct{})
-			defer func() {
-				close(stopChan)
-			}()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
 			addWaitGroup := sync.WaitGroup{}
 			addWaitGroup.Add(len(tc.identities))
@@ -230,10 +216,16 @@ func TestGetIdentity(t *testing.T) {
 				}
 			}
 
-			go backend.ListAndWatch(ctx, FakeHandler{onAddFunc: func() { addWaitGroup.Done() }}, stopChan)
+			var listSynced sync.WaitGroup
+			listSynced.Add(1)
+			go backend.ListAndWatch(ctx, FakeHandler{
+				onListDone:   func() { listSynced.Done() },
+				onUpsertFunc: func() { addWaitGroup.Done() },
+			})
 
 			// Wait for watcher to process the identities in the background
 			addWaitGroup.Wait()
+			listSynced.Wait()
 
 			id, err := backend.Get(ctx, tc.requestedKey)
 			if err != nil {

@@ -6,8 +6,9 @@ package syncstate
 import (
 	"context"
 
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/pkg/clustermesh/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/metrics/metric"
@@ -18,7 +19,7 @@ var Cell = cell.Module(
 	"sync",
 	"ClusterMesh Sync",
 
-	cell.Metric(MetricsProvider),
+	metrics.Metric(MetricsProvider),
 	cell.Provide(new),
 )
 
@@ -52,9 +53,9 @@ func (ss SyncState) Complete() bool {
 // WaitForResource adds a resource to the SyncState and returns a callback function that should be
 // called when the resource has been synchronized.
 func (ss SyncState) WaitForResource() func(context.Context) {
-	ss.Add()
+	done := ss.Add()
 	return func(_ context.Context) {
-		ss.Done()
+		done()
 	}
 }
 

@@ -5,8 +5,10 @@ package identity
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/option"
@@ -67,6 +69,8 @@ type IPIdentityPair struct {
 	NamedPorts   []NamedPort     `json:"NamedPorts,omitempty"`
 }
 
+type IdentityMap map[NumericIdentity]labels.LabelArray
+
 // GetKeyName returns the kvstore key to be used for the IPIdentityPair
 func (pair *IPIdentityPair) GetKeyName() string { return pair.PrefixString() }
 
@@ -74,10 +78,14 @@ func (pair *IPIdentityPair) GetKeyName() string { return pair.PrefixString() }
 func (pair *IPIdentityPair) Marshal() ([]byte, error) { return json.Marshal(pair) }
 
 // Unmarshal parses the JSON byte slice and updates the IPIdentityPair receiver
-func (pair *IPIdentityPair) Unmarshal(_ string, data []byte) error {
+func (pair *IPIdentityPair) Unmarshal(key string, data []byte) error {
 	newPair := IPIdentityPair{}
 	if err := json.Unmarshal(data, &newPair); err != nil {
 		return err
+	}
+
+	if got := newPair.GetKeyName(); got != key {
+		return fmt.Errorf("IP address does not match key: expected %s, got %s", key, got)
 	}
 
 	*pair = newPair
@@ -131,12 +139,6 @@ func (id *Identity) IsFixed() bool {
 // (true), or not (false).
 func (id *Identity) IsWellKnown() bool {
 	return WellKnown.lookupByNumericIdentity(id.ID) != nil
-}
-
-// IsWellKnownIdentity returns true if the identity represents a well-known
-// identity, false otherwise.
-func IsWellKnownIdentity(id NumericIdentity) bool {
-	return WellKnown.lookupByNumericIdentity(id) != nil
 }
 
 // NewIdentityFromLabelArray creates a new identity
@@ -196,13 +198,13 @@ func ScopeForLabels(lbls labels.Labels) NumericIdentity {
 	// Note that this is not reachable when policy-cidr-selects-nodes is false or
 	// when enable-node-selector-labels is false, since
 	// callers will already have gotten a value from LookupReservedIdentityByLabels.
-	if lbls.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode]) {
+	if lbls.HasRemoteNodeLabel() {
 		return IdentityScopeRemoteNode
 	}
 
 	for _, label := range lbls {
 		switch label.Source {
-		case labels.LabelSourceCIDR, labels.LabelSourceReserved:
+		case labels.LabelSourceCIDR, labels.LabelSourceFQDN, labels.LabelSourceReserved, labels.LabelSourceCIDRGroup:
 			scope = IdentityScopeLocal
 		default:
 			return IdentityScopeGlobal
@@ -261,9 +263,9 @@ func LookupReservedIdentityByLabels(lbls labels.Labels) *Identity {
 	}
 
 	var nid NumericIdentity
-	if lbls.Has(labels.LabelHost[labels.IDNameHost]) {
+	if lbls.HasHostLabel() {
 		nid = ReservedIdentityHost
-	} else if lbls.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode]) {
+	} else if lbls.HasRemoteNodeLabel() {
 		// If selecting remote-nodes via CIDR policies is allowed, then
 		// they no longer have a reserved identity.
 		if option.Config.PolicyCIDRMatchesNodes() {
@@ -276,7 +278,7 @@ func LookupReservedIdentityByLabels(lbls labels.Labels) *Identity {
 			return nil
 		}
 		nid = ReservedIdentityRemoteNode
-		if lbls.Has(labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer]) {
+		if lbls.HasKubeAPIServerLabel() {
 			// If there's a kube-apiserver label, then we know this is
 			// kube-apiserver reserved ID, so change it as such.
 			// Only traffic from non-kube-apiserver nodes should be
@@ -314,4 +316,9 @@ func IdentityAllocationIsLocal(lbls labels.Labels) bool {
 	// If there is only one label with the "reserved" source and a well-known
 	// key, the well-known identity for it can be allocated locally.
 	return LookupReservedIdentityByLabels(lbls) != nil
+}
+
+// UpdateIdentities is an interface to be called when identities change
+type UpdateIdentities interface {
+	UpdateIdentities(added, deleted IdentityMap, wg *sync.WaitGroup) (mutated bool)
 }

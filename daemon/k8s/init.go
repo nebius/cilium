@@ -6,6 +6,7 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/sirupsen/logrus"
@@ -36,6 +37,10 @@ func retrieveNodeInformation(ctx context.Context, log logrus.FieldLogger, localN
 
 	if option.Config.IPAM == ipamOption.IPAMClusterPool {
 		for event := range localCiliumNodeResource.Events(ctx) {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				log.WithField(logfields.NodeName, nodeTypes.GetName()).Error("Timeout while waiting for CiliumNode resource: API server connection issue")
+				break
+			}
 			if event.Kind == resource.Upsert {
 				no := nodeTypes.ParseCiliumNode(event.Object)
 				n = &no
@@ -51,6 +56,10 @@ func retrieveNodeInformation(ctx context.Context, log logrus.FieldLogger, localN
 		}
 	} else {
 		for event := range localNodeResource.Events(ctx) {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				log.WithField(logfields.NodeName, nodeTypes.GetName()).Error("Timeout while waiting for Node resource: API server connection issue")
+				break
+			}
 			if event.Kind == resource.Upsert {
 				n = k8s.ParseNode(event.Object, source.Unspec)
 				log.WithField(logfields.NodeName, n.Name).Info("Retrieved node information from kubernetes node")
@@ -90,9 +99,7 @@ func WaitForNodeInformation(ctx context.Context, log logrus.FieldLogger, localNo
 		if option.Config.K8sRequireIPv4PodCIDR || option.Config.K8sRequireIPv6PodCIDR {
 			return fmt.Errorf("node name must be specified via environment variable '%s' to retrieve Kubernetes PodCIDR range", k8sConst.EnvNodeNameSpec)
 		}
-		if option.MightAutoDetectDevices() {
-			log.Info("K8s node name is empty. BPF NodePort might not be able to auto detect all devices")
-		}
+		log.Info("K8s node name is empty. BPF NodePort might not be able to auto detect all devices")
 		return nil
 	}
 
@@ -104,7 +111,7 @@ func WaitForNodeInformation(ctx context.Context, log logrus.FieldLogger, localNo
 	// happen, as initKubeProxyReplacementOptions() might disable BPF NodePort.
 	// Anyway, to be on the safe side, don't give up waiting for a (Cilium)Node
 	// self object.
-	isNodeInformationOptional := (!requireIPv4CIDR && !requireIPv6CIDR && !option.MightAutoDetectDevices())
+	isNodeInformationOptional := (!requireIPv4CIDR && !requireIPv6CIDR)
 	// If node information is optional, let's wait 10 seconds only.
 	// It node information is required, wait indefinitely.
 	if isNodeInformationOptional {

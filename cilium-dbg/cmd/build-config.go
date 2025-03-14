@@ -8,14 +8,15 @@ import (
 	"os"
 	"strings"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	k8sConsts "github.com/cilium/cilium/pkg/k8s/constants"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/option/resolver"
 )
 
@@ -37,8 +38,8 @@ var buildConfigCmd = &cobra.Command{
 	Use:   "build-config --node-name $K8S_NODE_NAME",
 	Short: "Resolve all of the configuration sources that apply to this node",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Running")
-		if err := buildConfigHive.Run(); err != nil {
+		log.Info("Running")
+		if err := buildConfigHive.Run(logging.DefaultSlogLogger); err != nil {
 			Fatalf("Build config failed: %v\n", err)
 		}
 	},
@@ -78,6 +79,8 @@ var defaultBuildConfigCfg = buildConfigCfg{
 		resolver.KindConfigMap + ":cilium-config",
 		resolver.KindNodeConfig + ":" + os.Getenv("CILIUM_K8S_NAMESPACE"),
 	},
+	AllowConfigKeys: []string{},
+	DenyConfigKeys:  []string{},
 }
 
 type buildConfig struct {

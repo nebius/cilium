@@ -26,9 +26,6 @@
 /* Set dummy ifindex for tunnel device */
 #define ENCAP_IFINDEX 1
 
-/* Set the LXC source address to be the address of pod one */
-#define LXC_IPV4 BACKEND_IP
-
 /* Overlapping PodCIDR is only supported for IPv4 for now */
 #define ENABLE_IPV4
 
@@ -42,7 +39,6 @@
 #define ENABLE_CLUSTER_AWARE_ADDRESSING
 
 /* Import some default values */
-#include "config_replacement.h"
 
 /* Import map definitions and some default values */
 #include "node_config.h"
@@ -58,6 +54,9 @@
 
 /* Include an actual datapath code */
 #include <bpf_lxc.c>
+
+/* Set the LXC source address to be the address of the backend pod */
+ASSIGN_CONFIG(__u32, endpoint_ipv4, BACKEND_IP)
 
 #include "lib/ipcache.h"
 #include "lib/policy.h"
@@ -156,7 +155,7 @@ int overlay_to_lxc_syn_setup(struct __ctx_buff *ctx)
 
 	/* Emulate metadata filled by ipv4_local_delivery on bpf_overlay */
 	ctx_store_meta(ctx, CB_SRC_LABEL, CLIENT_IDENTITY);
-	ctx_store_meta(ctx, CB_IFINDEX, 1);
+	ctx_store_meta(ctx, CB_DELIVERY_REDIRECT, 1);
 	ctx_store_meta(ctx, CB_CLUSTER_ID_INGRESS, 0);
 	ctx_store_meta(ctx, CB_FROM_HOST, 0);
 	ctx_store_meta(ctx, CB_FROM_TUNNEL, 1);
@@ -214,11 +213,17 @@ int overlay_to_lxc_syn_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x1df4))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	/* Check ingress conntrack state is in the default CT */
 	tuple.daddr   = CLIENT_NODE_IP;
@@ -228,7 +233,7 @@ int overlay_to_lxc_syn_check(struct __ctx_buff *ctx)
 	tuple.nexthdr = IPPROTO_TCP;
 	tuple.flags   = TUPLE_F_IN;
 
-	entry = map_lookup_elem(&CT_MAP_TCP4, &tuple);
+	entry = map_lookup_elem(&cilium_ct4_global, &tuple);
 	if (!entry)
 		test_fatal("couldn't find ingress conntrack entry");
 
@@ -305,11 +310,17 @@ int lxc_to_overlay_ack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != CLIENT_NODE_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != BACKEND_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x1de4))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	/* Make sure we hit the conntrack entry */
 	tuple.saddr   = BACKEND_IP;
@@ -319,7 +330,7 @@ int lxc_to_overlay_ack_check(struct __ctx_buff *ctx)
 	tuple.nexthdr = IPPROTO_TCP;
 	tuple.flags   = TUPLE_F_IN;
 
-	entry = map_lookup_elem(&CT_MAP_TCP4, &tuple);
+	entry = map_lookup_elem(&cilium_ct4_global, &tuple);
 	if (!entry)
 		test_fatal("couldn't find egress conntrack entry");
 
@@ -340,7 +351,7 @@ int overlay_to_lxc_ack_setup(struct __ctx_buff *ctx)
 {
 	/* Emulate metadata filled by ipv4_local_delivery on bpf_overlay */
 	ctx_store_meta(ctx, CB_SRC_LABEL, CLIENT_IDENTITY);
-	ctx_store_meta(ctx, CB_IFINDEX, 1);
+	ctx_store_meta(ctx, CB_DELIVERY_REDIRECT, 1);
 	ctx_store_meta(ctx, CB_CLUSTER_ID_INGRESS, 0);
 	ctx_store_meta(ctx, CB_FROM_HOST, 0);
 	ctx_store_meta(ctx, CB_FROM_TUNNEL, 1);
@@ -398,11 +409,17 @@ int overlay_to_lxc_ack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x1de6))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	/* Make sure we hit the conntrack entry */
 	tuple.daddr   = CLIENT_NODE_IP;
@@ -412,7 +429,7 @@ int overlay_to_lxc_ack_check(struct __ctx_buff *ctx)
 	tuple.nexthdr = IPPROTO_TCP;
 	tuple.flags   = TUPLE_F_IN;
 
-	entry = map_lookup_elem(&CT_MAP_TCP4, &tuple);
+	entry = map_lookup_elem(&cilium_ct4_global, &tuple);
 	if (!entry)
 		test_fatal("couldn't find ingress conntrack entry");
 

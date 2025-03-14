@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/hivetest"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -86,13 +87,13 @@ func podCIDRAllocatorOverlapTestRun(t *testing.T) {
 	}
 
 	// Create a new pod manager with only our IPv4 allocator and fake client set.
-	podCidrManager := podcidr.NewNodesPodCIDRManager([]cidralloc.CIDRAllocator{
+	podCidrManager := podcidr.NewNodesPodCIDRManager(hivetest.Logger(t), []cidralloc.CIDRAllocator{
 		set,
 	}, nil, &ciliumNodeUpdateImplementation{clientset: fakeSet}, nil)
 
 	// start synchronization.
 	cns := newCiliumNodeSynchronizer(fakeSet, podCidrManager, false)
-	if err := cns.Start(ctx, &wg); err != nil {
+	if err := cns.Start(ctx, &wg, nil); err != nil {
 		t.Fatal(err)
 	}
 

@@ -17,7 +17,7 @@ import (
 	"os"
 	"path"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +45,7 @@ var (
 	noTestCoverage         = flag.String("no-test-coverage", "", "Don't collect coverages for the file matches to the given regex")
 	testInstrumentationLog = flag.String("instrumentation-log", "", "Path to a log file containing details about"+
 		" code coverage instrumentation, needed if code coverage breaks the verifier")
+	testFilePrefix = flag.String("test", "", "Single test file to run (without file extension)")
 
 	dumpCtx = flag.Bool("dump-ctx", false, "If set, the program context will be dumped after a CHECK and SETUP run.")
 )
@@ -84,6 +85,10 @@ func TestBPF(t *testing.T) {
 		}
 
 		if !strings.HasSuffix(entry.Name(), ".o") {
+			continue
+		}
+
+		if *testFilePrefix != "" && !strings.HasPrefix(entry.Name(), *testFilePrefix) {
 			continue
 		}
 
@@ -151,21 +156,13 @@ func loadAndRunSpec(t *testing.T, entry fs.DirEntry, instrLog io.Writer) []*cove
 	}
 
 	if !collectCoverage {
-		coll, err = bpf.LoadCollection(spec, ebpf.CollectionOptions{})
+		coll, _, err = bpf.LoadCollection(spec, nil)
 	} else {
-		coll, cfg, err = coverbee.InstrumentAndLoadCollection(spec, ebpf.CollectionOptions{
-			Programs: ebpf.ProgramOptions{
-				// 64 MiB, not needed in most cases, except when running instrumented code.
-				LogSize: 64 << 20,
-			},
-		}, instrLog)
+		coll, cfg, err = coverbee.InstrumentAndLoadCollection(spec, ebpf.CollectionOptions{}, instrLog)
 	}
 
 	var ve *ebpf.VerifierError
 	if errors.As(err, &ve) {
-		if ve.Truncated {
-			t.Fatal("Verifier log exceeds 64MiB, increase LogSize passed to coverbee.InstrumentAndLoadCollection")
-		}
 		t.Fatalf("verifier error: %+v", ve)
 	}
 	if err != nil {
@@ -239,7 +236,7 @@ func loadAndRunSpec(t *testing.T, entry fs.DirEntry, instrLog io.Writer) []*cove
 	for name := range testNameToPrograms {
 		testNames = append(testNames, name)
 	}
-	sort.Strings(testNames)
+	slices.Sort(testNames)
 
 	// Get maps used for common mocking facilities
 	skbMdMap := coll.Maps[mockSkbMetaMap]
@@ -521,7 +518,7 @@ func (l *Log) FmtString() string {
 			fmt.Fprint(&sb, int16(l.Args[argNum]))
 		case "x":
 			hb := make([]byte, 2)
-			nl.NativeEndian().PutUint16(hb, uint16(l.Args[argNum]))
+			binary.BigEndian.PutUint16(hb, uint16(l.Args[argNum]))
 			fmt.Fprint(&sb, hex.EncodeToString(hb))
 
 		case "lu":
@@ -530,7 +527,7 @@ func (l *Log) FmtString() string {
 			fmt.Fprint(&sb, int32(l.Args[argNum]))
 		case "lx":
 			hb := make([]byte, 4)
-			nl.NativeEndian().PutUint32(hb, uint32(l.Args[argNum]))
+			binary.BigEndian.PutUint32(hb, uint32(l.Args[argNum]))
 			fmt.Fprint(&sb, hex.EncodeToString(hb))
 
 		case "llu":
@@ -539,7 +536,7 @@ func (l *Log) FmtString() string {
 			fmt.Fprint(&sb, int64(l.Args[argNum]))
 		case "llx":
 			hb := make([]byte, 8)
-			nl.NativeEndian().PutUint64(hb, uint64(l.Args[argNum]))
+			binary.BigEndian.PutUint64(hb, uint64(l.Args[argNum]))
 			fmt.Fprint(&sb, hex.EncodeToString(hb))
 
 		default:

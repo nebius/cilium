@@ -16,7 +16,6 @@
  * Now include testing defaults
  */
 #define ROUTER_IP
-#include "config_replacement.h"
 #undef ROUTER_IP
 #include "node_config.h"
 
@@ -42,14 +41,14 @@
 #define TUNNEL_IPV4 v4_node_two
 #define TUNNEL_IPV6 v6_node_two
 
-#include "lib/eth.h"
-static volatile const union macaddr __cilium_net_mac = CILIUM_NET_MAC;
-#define DST_MAC __cilium_net_mac.addr
-
 /*
  * Include entrypoint into host stack.
  */
 #include "bpf_host.c"
+
+#include "lib/eth.h"
+static volatile const union macaddr __cilium_net_mac = CILIUM_NET_MAC;
+#define DST_MAC __cilium_net_mac.addr
 
 /*
  * Include test helpers
@@ -114,7 +113,7 @@ setup(struct __ctx_buff *ctx, bool flag_skip_tunnel, bool v4)
 	key.reason = REASON_FORWARDED;
 	key.dir = METRIC_EGRESS;
 
-	map_delete_elem(&METRICS_MAP, &key);
+	map_delete_elem(&cilium_metrics, &key);
 
 	policy_add_egress_allow_all_entry();
 
@@ -170,7 +169,7 @@ check_ctx(const struct __ctx_buff *ctx, __u32 expected_result, bool v4)
 		key.reason = REASON_FORWARDED;
 		key.dir = METRIC_EGRESS;
 
-		entry = map_lookup_elem(&METRICS_MAP, &key);
+		entry = map_lookup_elem(&cilium_metrics, &key);
 		if (!entry)
 			test_fatal("metrics entry not found")
 
@@ -210,6 +209,9 @@ check_ctx(const struct __ctx_buff *ctx, __u32 expected_result, bool v4)
 
 		if (l3->daddr != DST_IPV4)
 			test_fatal("dest IP was changed");
+
+		if (l3->check != bpf_htons(0xa611))
+			test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
 		l4 = (void *)l3 + sizeof(struct iphdr);
 	} else {

@@ -16,20 +16,20 @@ type PolicyPlumbingMap struct {
 }
 
 type PlumbingKey struct {
-	key uint32
+	Key uint32
 }
 
 type PlumbingValue struct {
-	fd uint32
+	Fd uint32
 }
 
 func (k *PlumbingKey) String() string {
-	return fmt.Sprintf("Endpoint: %d", k.key)
+	return fmt.Sprintf("Endpoint: %d", k.Key)
 }
 func (k *PlumbingKey) New() bpf.MapKey { return &PlumbingKey{} }
 
 func (v *PlumbingValue) String() string {
-	return fmt.Sprintf("fd: %d", v.fd)
+	return fmt.Sprintf("fd: %d", v.Fd)
 }
 
 func (k *PlumbingValue) New() bpf.MapValue { return &PlumbingValue{} }
@@ -40,7 +40,7 @@ func RemoveGlobalMapping(id uint32, haveEgressCallMap bool) error {
 	gpm, err := OpenCallMap(PolicyCallMapName)
 	if err == nil {
 		k := PlumbingKey{
-			key: id,
+			Key: id,
 		}
 		err = gpm.Map.Delete(&k)
 		gpm.Close()
@@ -49,7 +49,7 @@ func RemoveGlobalMapping(id uint32, haveEgressCallMap bool) error {
 		gpm, err2 := OpenCallMap(PolicyEgressCallMapName)
 		if err2 == nil {
 			k := PlumbingKey{
-				key: id,
+				Key: id,
 			}
 			err2 = gpm.Map.Delete(&k)
 			gpm.Close()
@@ -71,20 +71,4 @@ func OpenCallMap(name string) (*PolicyPlumbingMap, error) {
 		return nil, err
 	}
 	return &PolicyPlumbingMap{Map: m}, nil
-}
-
-// CallString returns the string which indicates the calls map by index in the
-// ELF, and index into that call map for a specific endpoint.
-//
-// Derived from __section_tail(CILIUM_MAP_POLICY, NAME) per bpf/lib/tailcall.h.
-func CallString(id uint16) string {
-	return fmt.Sprintf("1/%#04x", id)
-}
-
-// EgressCallString returns the string which indicates the calls map by index in the
-// ELF, and index into that call map for a specific endpoint.
-//
-// Derived from __section_tail(CILIUM_MAP_EGRESSPOLICY, NAME) per bpf/lib/tailcall.h.
-func EgressCallString(id uint16) string {
-	return fmt.Sprintf("4/%#04x", id)
 }

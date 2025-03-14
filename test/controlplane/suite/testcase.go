@@ -10,13 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	corev1 "k8s.io/api/core/v1"
-	discov1 "k8s.io/api/discovery/v1"
-	discov1beta1 "k8s.io/api/discovery/v1beta1"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
@@ -30,15 +30,17 @@ import (
 	operatorCmd "github.com/cilium/cilium/operator/cmd"
 	operatorOption "github.com/cilium/cilium/operator/option"
 	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/k8s/apis"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	k8stestutils "github.com/cilium/cilium/pkg/k8s/testutils"
 	"github.com/cilium/cilium/pkg/k8s/version"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/node/types"
 	agentOption "github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/testutils/mockmaps"
 )
 
 type trackerAndDecoder struct {
@@ -56,12 +58,17 @@ type ControlPlaneTest struct {
 	trackers            []trackerAndDecoder
 	agentHandle         *agentHandle
 	operatorHandle      *operatorHandle
-	Datapath            *fakeTypes.FakeDatapath
+	FakeNodeHandler     *fakeTypes.FakeNodeHandler
+	FakeLbMap           *mockmaps.LBMockMap
 	establishedWatchers *lock.Map[string, struct{}]
 }
 
+func (cpt *ControlPlaneTest) AgentDB() (*statedb.DB, statedb.Table[datapathTables.NodeAddress]) {
+	return cpt.agentHandle.db, cpt.agentHandle.nodeAddrs
+}
+
 func NewControlPlaneTest(t *testing.T, nodeName string, k8sVersion string) *ControlPlaneTest {
-	clients, _ := k8sClient.NewFakeClientset()
+	clients, _ := k8sClient.NewFakeClientset(hivetest.Logger(t))
 	var w lock.Map[string, struct{}]
 	clients.KubernetesFakeClientset = augmentTracker(clients.KubernetesFakeClientset, t, &w)
 	clients.SlimFakeClientset = augmentTracker(clients.SlimFakeClientset, t, &w)
@@ -70,9 +77,9 @@ func NewControlPlaneTest(t *testing.T, nodeName string, k8sVersion string) *Cont
 	fd := clients.KubernetesFakeClientset.Discovery().(*fakediscovery.FakeDiscovery)
 	fd.FakedServerVersion = toVersionInfo(k8sVersion)
 
-	resources, ok := apiResources[k8sVersion]
+	resources, ok := k8stestutils.APIResources[k8sVersion]
 	if !ok {
-		panic(fmt.Sprintf("k8s version %s not found in apiResources", k8sVersion))
+		panic(fmt.Sprintf("k8s version %s not found in APIResources", k8sVersion))
 	}
 	clients.KubernetesFakeClientset.Resources = resources
 	clients.SlimFakeClientset.Resources = resources
@@ -129,12 +136,14 @@ func (cpt *ControlPlaneTest) StartAgent(modConfig func(*agentOption.DaemonConfig
 
 	cpt.agentHandle.populateCiliumAgentOptions(cpt.tempDir, modConfig)
 
+	cpt.agentHandle.log = hivetest.Logger(cpt.t)
 	daemon, err := cpt.agentHandle.startCiliumAgent()
 	if err != nil {
 		cpt.t.Fatalf("Failed to start cilium agent: %s", err)
 	}
 	cpt.agentHandle.d = daemon
-	cpt.Datapath = cpt.agentHandle.dp
+	cpt.FakeNodeHandler = cpt.agentHandle.fnh
+	cpt.FakeLbMap = cpt.agentHandle.flbMap
 
 	return cpt
 }
@@ -142,7 +151,8 @@ func (cpt *ControlPlaneTest) StartAgent(modConfig func(*agentOption.DaemonConfig
 func (cpt *ControlPlaneTest) StopAgent() *ControlPlaneTest {
 	cpt.agentHandle.tearDown()
 	cpt.agentHandle = nil
-	cpt.Datapath = nil
+	cpt.FakeNodeHandler = nil
+	cpt.FakeLbMap = nil
 
 	return cpt
 }
@@ -170,7 +180,8 @@ func (cpt *ControlPlaneTest) StartOperator(
 	// election machinery in the controlplane tests.
 	version.DisableLeasesResourceLock()
 
-	err := startCiliumOperator(h)
+	log := hivetest.Logger(cpt.t)
+	err := startCiliumOperator(h, log)
 	if err != nil {
 		cpt.t.Fatalf("Failed to start operator: %s", err)
 	}
@@ -178,6 +189,7 @@ func (cpt *ControlPlaneTest) StartOperator(
 	cpt.operatorHandle = &operatorHandle{
 		t:    cpt.t,
 		hive: h,
+		log:  log,
 	}
 
 	return cpt
@@ -367,72 +379,6 @@ func gvrAndName(obj k8sRuntime.Object) (gvr schema.GroupVersionResource, ns stri
 	return
 }
 
-var (
-	corev1APIResources = &metav1.APIResourceList{
-		GroupVersion: corev1.SchemeGroupVersion.String(),
-		APIResources: []metav1.APIResource{
-			{Name: "nodes", Kind: "Node"},
-			{Name: "pods", Namespaced: true, Kind: "Pod"},
-			{Name: "services", Namespaced: true, Kind: "Service"},
-			{Name: "endpoints", Namespaced: true, Kind: "Endpoint"},
-		},
-	}
-
-	ciliumv2APIResources = &metav1.APIResourceList{
-		TypeMeta:     metav1.TypeMeta{},
-		GroupVersion: cilium_v2.SchemeGroupVersion.String(),
-		APIResources: []metav1.APIResource{
-			{Name: cilium_v2.CNPluralName, Kind: cilium_v2.CNKindDefinition},
-			{Name: cilium_v2.CEPPluralName, Namespaced: true, Kind: cilium_v2.CEPKindDefinition},
-			{Name: cilium_v2.CIDPluralName, Namespaced: true, Kind: cilium_v2.CIDKindDefinition},
-			{Name: cilium_v2.CEGPPluralName, Namespaced: true, Kind: cilium_v2.CEGPKindDefinition},
-			{Name: cilium_v2.CNPPluralName, Namespaced: true, Kind: cilium_v2.CNPKindDefinition},
-			{Name: cilium_v2.CCNPPluralName, Namespaced: true, Kind: cilium_v2.CCNPKindDefinition},
-			{Name: cilium_v2.CLRPPluralName, Namespaced: true, Kind: cilium_v2.CLRPKindDefinition},
-			{Name: cilium_v2.CEWPluralName, Namespaced: true, Kind: cilium_v2.CEWKindDefinition},
-			{Name: cilium_v2.CCECPluralName, Namespaced: true, Kind: cilium_v2.CCECKindDefinition},
-			{Name: cilium_v2.CECPluralName, Namespaced: true, Kind: cilium_v2.CECKindDefinition},
-		},
-	}
-
-	discoveryV1APIResources = &metav1.APIResourceList{
-		TypeMeta:     metav1.TypeMeta{},
-		GroupVersion: discov1.SchemeGroupVersion.String(),
-		APIResources: []metav1.APIResource{
-			{Name: "endpointslices", Namespaced: true, Kind: "EndpointSlice"},
-		},
-	}
-
-	discoveryV1beta1APIResources = &metav1.APIResourceList{
-		GroupVersion: discov1beta1.SchemeGroupVersion.String(),
-		APIResources: []metav1.APIResource{
-			{Name: "endpointslices", Namespaced: true, Kind: "EndpointSlice"},
-		},
-	}
-
-	// apiResources is the list of API resources for the k8s version that we're mocking.
-	// This is mostly relevant for the feature detection at pkg/k8s/version/version.go.
-	// The lists here are currently not exhaustive and expanded on need-by-need basis.
-	apiResources = map[string][]*metav1.APIResourceList{
-		"1.24": {
-			corev1APIResources,
-			discoveryV1APIResources,
-			discoveryV1beta1APIResources,
-			ciliumv2APIResources,
-		},
-		"1.25": {
-			corev1APIResources,
-			discoveryV1APIResources,
-			ciliumv2APIResources,
-		},
-		"1.26": {
-			corev1APIResources,
-			discoveryV1APIResources,
-			ciliumv2APIResources,
-		},
-	}
-)
-
 func matchFieldSelector(obj k8sRuntime.Object, selector fields.Selector) bool {
 	if selector == nil {
 		return true
@@ -523,6 +469,14 @@ func filterList(obj k8sRuntime.Object, restrictions k8sTesting.ListRestrictions)
 			}
 		}
 		obj.Items = items
+	case *corev1.ConfigMapList:
+		items := make([]corev1.ConfigMap, 0, len(obj.Items))
+		for i := range obj.Items {
+			if matchFieldSelector(&obj.Items[i], selector) {
+				items = append(items, obj.Items[i])
+			}
+		}
+		obj.Items = items
 	case *slim_corev1.NodeList:
 		items := make([]slim_corev1.Node, 0, len(obj.Items))
 		for i := range obj.Items {
@@ -588,7 +542,6 @@ func augmentTracker[T fakeWithTracker](f T, t *testing.T, watchers *lock.Map[str
 			filterList(ret, action.GetListRestrictions())
 		}
 		return
-
 	})
 
 	f.PrependWatchReactor(
@@ -611,7 +564,6 @@ func augmentTracker[T fakeWithTracker](f T, t *testing.T, watchers *lock.Map[str
 				restrictions: w.GetWatchRestrictions(),
 			}
 			return true, fw, nil
-
 		})
 
 	return f

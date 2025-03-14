@@ -16,6 +16,7 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/client"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/mac"
@@ -44,7 +45,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 	defer func() {
 		if err != nil {
 			pluginCtx.Logger.WithError(err).
-				WithFields(logrus.Fields{"cni-pre-result": pluginCtx.NetConf.PrevResult}).
+				WithField("previousResult", pluginCtx.NetConf.PrevResult).
 				Errorf("Unable to create endpoint")
 		}
 	}()
@@ -61,14 +62,14 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 	defer ns.Close()
 
 	if err = ns.Do(func() error {
-		links, err := netlink.LinkList()
+		links, err := safenetlink.LinkList()
 		if err != nil {
 			return err
 		}
 
 		linkFound := false
 		for _, link := range links {
-			pluginCtx.Logger.Debugf("Found interface in container %+v", link.Attrs())
+			pluginCtx.Logger.Debugf("Found interface in container %s", logfields.Repr(link.Attrs()))
 
 			if link.Type() != "veth" {
 				continue
@@ -87,20 +88,27 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 				return fmt.Errorf("unable to retrieve index of veth peer %s: %w", vethHostName, err)
 			}
 
-			addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+			addrs, err := safenetlink.AddrList(link, netlink.FAMILY_V4)
 			if err == nil && len(addrs) > 0 {
 				vethIP = addrs[0].IPNet.IP.String()
 			} else if err != nil {
-				pluginCtx.Logger.WithError(err).WithFields(logrus.Fields{
-					logfields.Interface: link.Attrs().Name}).Warn("No valid IPv4 address found")
+				pluginCtx.Logger.WithError(err).WithField(logfields.Interface, link.Attrs().Name).Warn("No valid IPv4 address found")
 			}
 
-			addrsv6, err := netlink.AddrList(link, netlink.FAMILY_V6)
+			addrsv6, err := safenetlink.AddrList(link, netlink.FAMILY_V6)
 			if err == nil && len(addrsv6) > 0 {
-				vethIPv6 = addrsv6[0].IPNet.IP.String()
+				if len(addrsv6) == 1 {
+					vethIPv6 = addrsv6[0].IPNet.IP.String()
+				} else {
+					for _, addrv6 := range addrsv6 {
+						if addrv6.IP.IsGlobalUnicast() {
+							vethIPv6 = addrv6.IPNet.IP.String()
+							break
+						}
+					}
+				}
 			} else if err != nil {
-				pluginCtx.Logger.WithError(err).WithFields(logrus.Fields{
-					logfields.Interface: link.Attrs().Name}).Warn("No valid IPv6 address found")
+				pluginCtx.Logger.WithError(err).WithField(logfields.Interface, link.Attrs().Name).Warn("No valid IPv6 address found")
 			}
 
 			linkFound = true
@@ -111,8 +119,8 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 			return errors.New("no link found inside container")
 		}
 
-		if pluginCtx.NetConf.EnableRouteMTU {
-			routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+		if pluginCtx.NetConf.EnableRouteMTU || pluginCtx.CiliumConf.EnableRouteMTUForCNIChaining {
+			routes, err := safenetlink.RouteList(nil, netlink.FAMILY_V4)
 			if err != nil {
 				err = fmt.Errorf("unable to list the IPv4 routes: %w", err)
 				return err
@@ -128,7 +136,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 				}
 			}
 
-			routes, err = netlink.RouteList(nil, netlink.FAMILY_V6)
+			routes, err = safenetlink.RouteList(nil, netlink.FAMILY_V6)
 			if err != nil {
 				err = fmt.Errorf("unable to list the IPv6 routes: %w", err)
 				return err
@@ -190,6 +198,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		ContainerInterfaceName: vethLXCName,
 		K8sPodName:             string(pluginCtx.CniArgs.K8S_POD_NAME),
 		K8sNamespace:           string(pluginCtx.CniArgs.K8S_POD_NAMESPACE),
+		K8sUID:                 string(pluginCtx.CniArgs.K8S_POD_UID),
 		SyncBuildEndpoint:      true,
 		DatapathConfiguration: &models.EndpointDatapathConfiguration{
 			// aws-cni requires ARP passthrough between Linux and
@@ -255,7 +264,7 @@ func (f *GenericVethChainer) Delete(ctx context.Context, pluginCtx chainingapi.P
 func (f *GenericVethChainer) Check(ctx context.Context, pluginCtx chainingapi.PluginContext, cli *client.Client) error {
 	// Just confirm that the endpoint is healthy
 	eID := endpointid.NewCNIAttachmentID(pluginCtx.Args.ContainerID, pluginCtx.Args.IfName)
-	pluginCtx.Logger.Debugf("Asking agent for healthz for %s", eID)
+	pluginCtx.Logger.WithField(logfields.EndpointID, eID).Debugf("Asking agent for healthz for %s", eID)
 	epHealth, err := cli.EndpointHealthGet(eID)
 	if err != nil {
 		return cniTypes.NewError(types.CniErrHealthzGet, "HealthzFailed",
@@ -267,6 +276,14 @@ func (f *GenericVethChainer) Check(ctx context.Context, pluginCtx chainingapi.Pl
 			"container is unhealthy in agent")
 	}
 	pluginCtx.Logger.Debugf("Container %s:%s has a healthy agent endpoint", pluginCtx.Args.ContainerID, pluginCtx.Args.IfName)
+	return nil
+}
+
+func (f *GenericVethChainer) Status(ctx context.Context, pluginCtx chainingapi.PluginContext, cli *client.Client) error {
+	if _, err := cli.Daemon.GetHealthz(nil); err != nil {
+		return cniTypes.NewError(types.CniErrPluginNotAvailable, "DaemonHealthzFailed",
+			fmt.Sprintf("Cilium agent healthz check failed: %s", client.Hint(err)))
+	}
 	return nil
 }
 

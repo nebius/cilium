@@ -242,14 +242,14 @@ In this example, services with port ``31940`` were created (one for each of devi
     $ kubectl -n kube-system exec ds/cilium -- cilium-dbg service list
     ID   Frontend               Service Type   Backend
     [...]
-    4    10.104.239.135:80      ClusterIP      1 => 10.217.0.107:80
-                                               2 => 10.217.0.149:80
-    5    0.0.0.0:31940          NodePort       1 => 10.217.0.107:80
-                                               2 => 10.217.0.149:80
-    6    192.168.178.29:31940   NodePort       1 => 10.217.0.107:80
-                                               2 => 10.217.0.149:80
-    7    172.16.0.29:31940      NodePort       1 => 10.217.0.107:80
-                                               2 => 10.217.0.149:80
+    4    10.104.239.135:80/TCP      ClusterIP      1 => 10.217.0.107:80/TCP
+                                                   2 => 10.217.0.149:80/TCP
+    5    0.0.0.0:31940/TCP          NodePort       1 => 10.217.0.107:80/TCP
+                                                   2 => 10.217.0.149:80/TCP
+    6    192.168.178.29:31940/TCP   NodePort       1 => 10.217.0.107:80/TCP
+                                                   2 => 10.217.0.149:80/TCP
+    7    172.16.0.29:31940/TCP      NodePort       1 => 10.217.0.107:80/TCP
+                                                   2 => 10.217.0.149:80/TCP
 
 Create a variable with the node port for testing:
 
@@ -360,13 +360,133 @@ depending on the external and internal traffic policies:
 | Local    | Local    | Node-local only         | Node-local only       |
 +----------+----------+-------------------------+-----------------------+
 
+Selective Service Type Exposure
+*******************************
+
+By default, for a ``LoadBalancer`` service Cilium exposes corresponding
+``NodePort`` and ``ClusterIP`` services. Likewise, for a new ``NodePort``
+service, Cilium exposes the corresponding ``ClusterIP`` service.
+
+If this behavior is not desired, then the ``service.cilium.io/type``
+annotation can be used to pin the service creation only to a specific
+service type:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/type: LoadBalancer
+  spec:
+    ports:
+      - port: 80
+        targetPort: 80
+    type: LoadBalancer
+    allocateLoadBalancerNodePorts: false
+
+In the above example only the ``LoadBalancer`` service is created without
+corresponding ``NodePort`` and ``ClusterIP`` services. If the annotation
+would be set to e.g. ``service.cilium.io/type: NodePort``, then only the
+``NodePort`` service would be installed.
+
+Host Proxy Delegation
+*********************
+
+If the selected service backend IP for a given service matches the local
+node IP, the annotation ``service.cilium.io/proxy-delegation: delegate-if-local``
+will pass the received packet unmodified to the upper stack, so that a
+L7 proxy such as Envoy (if present) can handle the request in the host
+namespace.
+
+If the selected service backend is a remote IP, then the received packet
+is not pushed to the upper stack and instead the BPF code forwards the
+packet natively with the configured forwarding method to the remote IP.
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/proxy-delegation: delegate-if-local
+  spec:
+    ports:
+      - port: 80
+        targetPort: 80
+    type: LoadBalancer
+
+In combination with ``externalTrafficPolicy=Local`` this mechanism also allows
+for pushing all traffic to the upper proxy.
+
+Non-presence of the ``service.cilium.io/proxy-delegation`` annotation leaves
+all forwarding to BPF natively which is also the default for the kube-proxy
+replacement case.
+
+Selective Service Node Exposure
+*******************************
+
+By default, Cilium exposes Kubernetes services on all nodes in the cluster. To expose a
+service only on a subset of the nodes instead, use the ``service.cilium.io/node`` label for
+the relevant nodes. For example, label a node as follows:
+
+.. code-block:: shell-session
+
+  $ kubectl label node node_name service.cilium.io/node=beefy
+
+To add a new service that should only be exposed to nodes with label ``service.cilium.io/node=beefy``, install the service as follows:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/node: beefy
+  spec:
+    selector:
+      app: example
+    ports:
+      - port: 8765
+        targetPort: 9376
+    type: LoadBalancer
+
+It's also possible to control the service node exposure via the annotation ``service.cilium.io/node-selector`` - where
+the annotation value contains the label selector. This way, the service is only exposed on nodes that match the
+node label selector. The annotation ``service.cilium.io/node-selector`` always has priority over 
+``service.cilium.io/node`` if both exist on the same service.
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/node-selector: "service.cilium.io/node in ( beefy , slow )"
+  spec:
+    selector:
+      app: example
+    ports:
+      - port: 8765
+        targetPort: 9376
+    type: LoadBalancer
+
+Note that changing a node label after a service has been exposed matching that label does not
+automatically update the list of nodes where the service is exposed. To update exposure of the
+service after changing node labels, restart the Cilium agent. Generally it is advised to fixate the
+node label upon joining the Kubernetes cluster and retain it throughout the node's lifetime.
+
 .. _maglev:
 
 Maglev Consistent Hashing
 *************************
 
 Cilium's eBPF kube-proxy replacement supports consistent hashing by implementing a variant
-of `The Maglev hashing <https://storage.googleapis.com/pub-tools-public-publication-data/pdf/44824.pdf>`_
+of `The Maglev hashing <https://static.googleusercontent.com/media/research.google.com/ko//pubs/archive/44824.pdf>`_
 in its load balancer for backend selection. This improves resiliency in case of
 failures. As well, it provides better load balancing properties since Nodes added to the cluster will
 make consistent backend selection throughout the cluster for a given 5-tuple without
@@ -395,7 +515,7 @@ There are two more Maglev-specific configuration settings: ``maglev.tableSize``
 and ``maglev.hashSeed``.
 
 ``maglev.tableSize`` specifies the size of the Maglev lookup table for each single service.
-`Maglev <https://storage.googleapis.com/pub-tools-public-publication-data/pdf/44824.pdf>`__
+`Maglev <https://static.googleusercontent.com/media/research.google.com/ko//pubs/archive/44824.pdf>`__
 recommends the table size (``M``) to be significantly larger than the number of maximum expected
 backends (``N``). In practice that means that ``M`` should be larger than ``100 * N`` in
 order to guarantee the property of at most 1% difference in the reassignments on backend
@@ -428,7 +548,9 @@ The following sizes for ``M`` are supported as ``maglev.tableSize`` Helm option:
 
 For example, a ``maglev.tableSize`` of ``16381`` is suitable for a maximum of ``~160`` backends
 per service. If a higher number of backends are provisioned under this setting, then the
-difference in reassignments on backend changes will increase.
+difference in reassignments on backend changes will increase. Note that changing the table
+size (``M``) triggers a recalculation of the lookup table and can temporarily lead to inconsistent
+backend selection for new traffic until all nodes have converged and completed their agent restart.
 
 The ``maglev.hashSeed`` option is recommended to be set in order for Cilium to not rely on the
 fixed built-in seed. The seed is a base64-encoded 12 byte-random number, and can be
@@ -489,6 +611,10 @@ needed MTU reduction.
 In some public cloud provider environments that implement source /
 destination IP address checking (e.g. AWS), the checking has to be disabled in
 order for the DSR mode to work.
+
+By default Cilium uses special ExternalIP mitigation for CVE-2020-8554 MITM vulnerability.
+This may affect connectivity targeted to ExternalIP on the same cluster.
+This mitigation can be disabled by setting ``bpf.disableExternalIPMitigation`` to ``true``.
 
 .. _DSR mode with Option:
 
@@ -578,16 +704,17 @@ Hybrid DSR and SNAT Mode
 
 Cilium also supports a hybrid DSR and SNAT mode, that is, DSR is performed for TCP
 and SNAT for UDP connections.
-This removes the need for manual MTU changes in the network while still benefiting from the latency improvements
-through the removed extra hop for replies, in particular, when TCP is the main transport
-for workloads.
+
+This removes the need for manual MTU changes in the network while still benefiting
+from the latency improvements through the removed extra hop for replies, in particular,
+when TCP is the main transport for workloads.
 
 The mode setting ``loadBalancer.mode`` allows to control the behavior through the
-options ``dsr``, ``snat`` and ``hybrid``. By default the ``snat`` mode is used in the
-agent.
+options ``dsr``, ``snat``, ``annotation``, and ``hybrid``. By default the ``snat``
+mode is used in the agent.
 
-A Helm example configuration in a kube-proxy-free environment with DSR enabled in hybrid
-mode would look as follows:
+A Helm example configuration in a kube-proxy-free environment with DSR enabled in
+hybrid mode would look as follows:
 
 .. parsed-literal::
 
@@ -599,6 +726,115 @@ mode would look as follows:
         --set k8sServiceHost=${API_SERVER_IP} \\
         --set k8sServicePort=${API_SERVER_PORT}
 
+Annotation-based DSR and SNAT Mode
+**********************************
+
+Cilium also supports an annotation-based DSR and SNAT mode, that is, services
+can be exposed by default via SNAT and on-demand as DSR (or vice versa):
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/type: LoadBalancer
+      service.cilium.io/forwarding-mode: dsr
+  spec:
+    ports:
+      - port: 80
+        targetPort: 80
+    type: LoadBalancer
+
+Note that the ``forwarding-mode`` annotation must be set at service creation time
+and should not be changed during the lifetime of that service. Changing the value
+of the annotation or removing the annotation while the service is installed breaks
+connections.
+
+The above example installs the Kubernetes service only as type ``LoadBalancer``,
+that is, without the corresponding ``NodePort`` and ``ClusterIP`` services, and
+uses the configured DSR method to forward the packets instead of default SNAT.
+The Helm setting ``loadBalancer.mode=snat`` defines the default as SNAT in this
+example. A ``loadBalancer.mode=dsr`` would have switched the default to DSR instead
+and then ``service.cilium.io/forwarding-mode: snat`` annotation can be used to
+switch to SNAT instead.
+
+A Helm example configuration in a kube-proxy-free environment with DSR enabled in
+annotation mode with SNAT default would look as follows:
+
+.. parsed-literal::
+
+    helm install cilium |CHART_RELEASE| \\
+        --namespace kube-system \\
+        --set routingMode=native \\
+        --set kubeProxyReplacement=true \\
+        --set loadBalancer.mode=snat \\
+        --set bpf.lbModeAnnotation=true \\
+        --set k8sServiceHost=${API_SERVER_IP} \\
+        --set k8sServicePort=${API_SERVER_PORT}
+
+Annotation-based Load Balancing Algorithm Selection
+***************************************************
+
+Cilium has the ability to specify the load balancing algorithm on a per-service
+basis through the ``service.cilium.io/lb-algorithm`` annotation. Setting
+``bpf.lbAlgorithmAnnotation=true`` opts into this ability for the BPF and
+corresponding agent code. A typical use-case is to reduce the memory footprint
+which comes with Maglev given the latter requires large lookup tables for each
+service. Thus, if not all services need consistent hashing, then these can
+fallback to a random selection instead.
+
+By default, if no service annotation is provided, the logic falls back to use
+whichever method was specified globally through ``loadBalancer.algorithm``. The
+latter supports either ``random`` or ``maglev`` as values today with ``random``
+being the default if ``loadBalancer.algorithm`` was not explicitly set via Helm.
+
+To add a new service which must use ``random`` as its load balancing algorithm:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/lb-algorithm: random
+  spec:
+    selector:
+      app: example
+    ports:
+      - port: 8765
+        targetPort: 9376
+    type: LoadBalancer
+
+Similarly, for opting into ``maglev``, use the following:
+
+ .. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/lb-algorithm: maglev
+  spec:
+    selector:
+      app: example
+    ports:
+      - port: 8765
+        targetPort: 9376
+    type: LoadBalancer
+
+All north-south traffic is now subsequently subject to ``maglev``-based load
+balancing for the latter example.
+
+Note that ``service.cilium.io/lb-algorithm`` only takes effect upon initial
+service creation and cannot be changed during the lifetime of the given
+Kubernetes service. Switching between load balancing algorithms requires
+recreation of a service.
+
+.. _socketlb-host-netns-only:
 
 Socket LoadBalancer Bypass in Pod Namespace
 *******************************************
@@ -975,19 +1211,28 @@ natively supports ``hostPort`` service mapping without having to use the
 Helm CNI chaining option of ``cni.chainingMode=portmap``.
 
 By specifying ``kubeProxyReplacement=true`` the native hostPort support is
-automatically enabled and therefore no further action is required. Otherwise
-``hostPort.enabled=true`` can be used to enable the setting.
+automatically enabled and therefore no further action is required.
 
 If the ``hostPort`` is specified without an additional ``hostIP``, then the
 Pod will be exposed to the outside world with the same local addresses from
 the node that were detected and used for exposing NodePort services, e.g.
-the Kubernetes InternalIP or ExternalIP if set. Additionally, the Pod is also
-accessible through the loopback address on the node such as ``127.0.0.1:hostPort``.
-If in addition to ``hostPort`` also a ``hostIP`` has been specified for the
-Pod, then the Pod will only be exposed on the given ``hostIP`` instead. A
-``hostIP`` of ``0.0.0.0`` will have the same behavior as if a ``hostIP`` was
-not specified. The ``hostPort`` must not reside in the configured NodePort
-port range to avoid collisions.
+the Kubernetes InternalIP or ExternalIP if set.
+
+Additionally, the Pod is also accessible through the loopback address on the
+node such as ``127.0.0.1:hostPort``. If in addition to ``hostPort`` also
+a ``hostIP`` has been specified for the Pod, then the Pod will only be
+exposed on the given ``hostIP`` instead. A ``hostIP`` of ``0.0.0.0`` will
+have the same behavior as if a ``hostIP`` was not specified.
+
+The ``hostPort`` must not reside in the configured NodePort port range to
+avoid collisions.
+
+Note that ``hostPort`` support relies on Cilium's eBPF kube-proxy replacement
+and in the background plumbs service entries to direct traffic to the local
+host port backend. Given host port is not configured through a Kubernetes
+service object, the full feature set of Kubernetes services (such as custom
+Cilium service annotations) is not available. Instead, host port piggy-backs
+on user-configured defaults of the service handling behavior.
 
 An example deployment in a kube-proxy-free environment therefore is the same
 as in the earlier getting started deployment:
@@ -999,7 +1244,6 @@ as in the earlier getting started deployment:
         --set kubeProxyReplacement=true \\
         --set k8sServiceHost=${API_SERVER_IP} \\
         --set k8sServicePort=${API_SERVER_PORT}
-
 
 Also, ensure that each node IP is known via ``INTERNAL-IP`` or ``EXTERNAL-IP``,
 for example:
@@ -1279,6 +1523,12 @@ to the same service endpoints; but two requests for the same service, sent from
 the same source but to different service ports may be routed to distinct service
 endpoints.
 
+Note that if the session affinity feature is used in combination with Maglev
+consistent hashing to select backends, then Maglev will not take the source
+port as input for its hashing in order to respect the user's ClientIP choice
+(see also `GH#26709 <https://github.com/cilium/cilium/issues/26709>`__ for
+further details).
+
 For users who run with kube-proxy (i.e. with Cilium's kube-proxy replacement
 disabled), the ClusterIP service loadbalancing when a request is sent from a pod
 running in a non-host network namespace is still performed at the pod network
@@ -1309,13 +1559,92 @@ ignore the field regardless whether it is set. This means that any pod or any ho
 process in the cluster will be able to access the ``LoadBalancer`` service internally.
 
 The load balancer source range check feature is enabled by default, and it can be
-disabled by setting ``config.svcSourceRangeCheck=false``. It makes sense to disable
-the check when running on some cloud providers. E.g. `Amazon NLB
+disabled by setting ``config.svcSourceRangeCheck=false``.
+
+It makes sense to disable the check when running on some cloud providers e.g. `Amazon NLB
 <https://kubernetes.io/docs/concepts/services-networking/service/#aws-nlb-support>`__
 natively implements the check, so the kube-proxy replacement's feature can be disabled.
 Meanwhile `GKE internal TCP/UDP load balancer
 <https://cloud.google.com/kubernetes-engine/docs/how-to/service-parameters#lb_source_ranges>`__
 does not, so the feature must be kept enabled in order to restrict the access.
+
+By default the specified white-listed CIDRs in ``spec.loadBalancerSourceRanges``
+only apply to the ``LoadBalancer`` service, but not the corresponding ``NodePort``
+or ``ClusterIP`` service which get installed along with the ``LoadBalancer`` service.
+
+If this behavior is not desired, then there are two options available: One possibility
+is to avoid the creation of corresponding ``NodePort`` and ``ClusterIP`` services via
+``service.cilium.io/type`` annotation:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/type: LoadBalancer
+  spec:
+    ports:
+      - port: 80
+        targetPort: 80
+    type: LoadBalancer
+    loadBalancerSourceRanges:
+    - 192.168.1.0/24
+
+The other possibility is to propagate the white-listed CIDRs to all externally
+exposed service types. Meaning, ``NodePort`` as well as ``ClusterIP`` (if
+externally accessible, see :ref:`External Access To ClusterIP Services <external_access_to_clusterip_services>`
+section) also filter traffic based on the source IP addresses.
+This option can be enabled in Helm via ``bpf.lbSourceRangeAllTypes=true``.
+
+The ``loadBalancerSourceRanges`` by default specifies an allow-list of CIDRs,
+meaning, traffic originating not from those CIDRs is automatically dropped.
+
+Cilium also supports the option to turn this list into a deny-list, in order
+to block traffic from certain CIDRs while allowing everything else. This
+behavior can be achieved through the ``service.cilium.io/src-ranges-policy``
+annotation which accepts the values of ``allow`` or ``deny``.
+
+The default ``loadBalancerSourceRanges`` behavior equals to
+``service.cilium.io/src-ranges-policy: allow``:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/type: LoadBalancer
+      service.cilium.io/src-ranges-policy: allow
+  spec:
+    ports:
+      - port: 80
+        targetPort: 80
+    type: LoadBalancer
+    loadBalancerSourceRanges:
+    - 192.168.1.0/24
+
+In order to turn the CIDR list into a deny-list while allowing traffic not
+originating from this set, this can be changed into ``service.cilium.io/src-ranges-policy: deny``:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    annotations:
+      service.cilium.io/type: LoadBalancer
+      service.cilium.io/src-ranges-policy: deny
+  spec:
+    ports:
+      - port: 80
+        targetPort: 80
+    type: LoadBalancer
+    loadBalancerSourceRanges:
+    - 192.168.1.0/24
 
 Service Proxy Name Configuration
 ********************************
@@ -1336,13 +1665,18 @@ working, take a look at `this KEP
     free mode, make sure that default Kubernetes services like ``kube-dns`` and ``kubernetes``
     have the required label value.
 
-Topology Aware Hints
-********************
+Traffic Distribution and Topology Aware Hints
+*********************************************
 
-The kube-proxy replacement implements the K8s service
-`Topology Aware Hints <https://kubernetes.io/docs/concepts/services-networking/topology-aware-hints>`__.
-This allows Cilium nodes to prefer service endpoints residing in the same zone.
-To enable the feature, set ``loadBalancer.serviceTopology=true``.
+The kube-proxy replacement implements both Kubernetes `Topology Aware Routing
+<https://kubernetes.io/docs/concepts/services-networking/topology-aware-routing>`__,
+and the more recent `Traffic Distribution
+<https://kubernetes.io/docs/concepts/services-networking/service/#traffic-distribution>`__
+features.
+
+Both of these features work by setting ``hints`` on EndpointSlices that enable
+Cilium to route to endpoints residing in the same zone. To enable the feature,
+set ``loadBalancer.serviceTopology=true``.
 
 Neighbor Discovery
 ******************
@@ -1435,6 +1769,21 @@ As per `k8s Service <https://kubernetes.io/docs/concepts/services-networking/ser
 Cilium's eBPF kube-proxy replacement by default disallows access to a ClusterIP service from outside the cluster.
 This can be allowed by setting ``bpf.lbExternalClusterIP=true``.
 
+Kubernetes API server high availability
+***************************************
+
+If you are running multiple instances of Kubernetes API servers in your cluster, you can set the ``k8s-api-server-urls`` flag
+so that Cilium can fail over to an active instance. Cilium switches to the ``kubernetes`` service address so that
+API requests are load-balanced to API server endpoints during runtime. However, if the initially configured API servers
+are rotated while the agent is down, you can update the ``k8s-api-server-urls`` flag with the updated API servers.
+
+.. parsed-literal::
+
+    helm install cilium |CHART_RELEASE| \\
+        --namespace kube-system \\
+        --set kubeProxyReplacement=true \\
+        --set k8s.apiServerURLs="https://172.21.0.4:6443 https://172.21.0.5:6443 https://172.21.0.6:6443"
+
 Observability
 *************
 
@@ -1494,14 +1843,15 @@ and selected service endpoint.
     Jan 13 13:47:20.932: default/mediabot:38750 (ID:5618) <> default/nginx (ID:35772) pre-xlate-rev TRACED (TCP)
 
 Socket LB tracing with Hubble requires cilium agent to detect pod cgroup paths.
-If you see a warning message in cilium agent ``No valid cgroup base path found: socket load-balancing tracing with Hubble will not work.``,
+If you see a message in cilium agent ``Failed to setup socket load-balancing tracing with Hubble.``,
 you can trace packets using ``cilium-dbg monitor`` instead.
 
 .. note::
 
-    In case of the warning log, please file a GitHub issue with the cgroup path
-    for any of your pods, obtained by running the following command on a Kubernetes
-    node in your cluster: ``sudo crictl inspectp -o=json $POD_ID | grep cgroup``.
+    If you observe the message about socket load-balancing setup failure in the logs,
+    please file a GitHub issue with the cgroup path for any of your pods,
+    obtained by running the following command on a Kubernetes node in your
+    cluster: ``sudo crictl inspectp -o=json $POD_ID | grep cgroup``.
 
 .. code-block:: shell-session
 
@@ -1593,15 +1943,27 @@ For more information, see `this GitHub issue <https://github.com/cilium/cilium/i
 Limitations
 ###########
 
-    * Cilium's eBPF kube-proxy replacement currently cannot be used with :ref:`encryption_ipsec`.
     * Cilium's eBPF kube-proxy replacement relies upon the socket-LB feature
       which uses eBPF cgroup hooks to implement the service translation. Using it with libceph
       deployments currently requires support for the getpeername(2) hook address translation in
       eBPF, which is only available for kernels v5.8 and higher.
-    * In order to support nfs in the kernel with the socket-LB feature, ensure that
-      kernel commit ``0bdf399342c5 ("net: Avoid address overwrite in kernel_connect")``
-      is part of your underlying kernel. Linux kernels v6.6 and higher support it. Older
-      stable kernels are TBD. For a more detailed discussion see :gh-issue:`21541`.
+    * NFS and SMB mounts may break when mounted to a ``Service`` cluster IP while using socket-LB.
+      This issue is known to impact Longhorn, Portworx, and Robin, but may impact other storage
+      systems that implement ``ReadWriteMany`` volumes using this pattern. To avoid this problem,
+      ensure that the following commits are part of your underlying kernel:
+
+      * ``0bdf399342c5 ("net: Avoid address overwrite in kernel_connect")``
+      * ``86a7e0b69bd5 ("net: prevent rewrite of msg_name in sock_sendmsg()")``
+      * ``01b2885d9415 ("net: Save and restore msg_namelen in sock_sendmsg")``
+      * ``cedc019b9f26 ("smb: use kernel_connect() and kernel_bind()")`` (SMB only)
+
+      These patches have been backported to all stable kernels and some distro-specific kernels:
+
+      * **Ubuntu**: ``5.4.0-187-generic``, ``5.15.0-113-generic``, ``6.5.0-41-generic`` or newer.
+      * **RHEL 8**: ``4.18.0-553.8.1.el8_10.x86_64`` or newer (RHEL 8.10+).
+      * **RHEL 9**: ``kernel-5.14.0-427.31.1.el9_4`` or newer (RHEL 9.4+).
+
+      For a more detailed discussion see :gh-issue:`21541`.
     * Cilium's DSR NodePort mode currently does not operate well in environments with
       TCP Fast Open (TFO) enabled. It is recommended to switch to ``snat`` mode in this
       situation.
@@ -1612,29 +1974,19 @@ Limitations
       setting will be ignored and a warning emitted to the Cilium agent log. Similarly,
       explicitly binding the ``hostIP`` to the loopback address in the host namespace is
       currently not supported and will log a warning to the Cilium agent log.
-    * When Cilium's kube-proxy replacement is used with Kubernetes versions(< 1.19) that have
-      support for ``EndpointSlices``, ``Services`` without selectors and backing ``Endpoints``
-      don't work. The reason is that Cilium only monitors changes made to ``EndpointSlices``
-      objects if support is available and ignores ``Endpoints`` in those cases. Kubernetes 1.19
-      release introduces ``EndpointSliceMirroring`` controller that mirrors custom ``Endpoints``
-      resources to corresponding ``EndpointSlices`` and thus allowing backing ``Endpoints``
-      to work. For a more detailed discussion see :gh-issue:`12438`.
-    * When deployed on kernels older than 5.7, Cilium is unable to distinguish between host and
-      pod namespaces due to the lack of kernel support for network namespace cookies. As a result,
-      Kubernetes services are reachable from all pods via the loopback address.
+    * When using the Socket-LB feature and deployed on kernels older than 5.7, Cilium is unable
+      to distinguish between host and pod namespaces due to the lack of kernel support for
+      network namespace cookies. As a result, Kubernetes services are reachable from all pods via
+      the loopback address.
     * The neighbor discovery in a multi-device environment doesn't work with the runtime device
       detection which means that the target devices for the neighbor discovery doesn't follow the
       device changes.
     * When socket-LB feature is enabled, pods sending (connected) UDP traffic to services
       can continue to send traffic to a service backend even after it's deleted. Cilium agent
-      handles such scenarios by forcefully terminating pod sockets in the host network
-      namespace that are connected to deleted backends, so that the pods can be
-      load-balanced to active backends. This functionality requires these
-      kernel configs to be enabled: ``CONFIG_INET_DIAG``, ``CONFIG_INET_UDP_DIAG``
-      and ``CONFIG_INET_DIAG_DESTROY``. If you have application pods (not deployed in the
-      host network namespace) making long-lived connections using (connected) UDP,
-      you can enable ``bpf-lb-sock-hostns-only`` in order to enable the socket-LB
-      feature only in the host network namespace.
+      handles such scenarios by forcefully terminating application sockets that are connected
+      to deleted backends, so that the applications can be load-balanced to active backends.
+      This functionality requires these kernel configs to be enabled:
+      ``CONFIG_INET_DIAG``, ``CONFIG_INET_UDP_DIAG`` and ``CONFIG_INET_DIAG_DESTROY``.
     * Cilium's BPF-based masquerading is recommended over iptables when using the
       BPF-based NodePort. Otherwise, there is a risk for port collisions between
       BPF and iptables SNAT, which might result in dropped NodePort

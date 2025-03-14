@@ -9,15 +9,15 @@ import (
 	"net/netip"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slimv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	k8sTypes "github.com/cilium/cilium/pkg/k8s/types"
 	"github.com/cilium/cilium/pkg/policy/api"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 type fakeResource[T runtime.Object] chan resource.Event[T]
@@ -74,6 +74,7 @@ func addPolicy(tb testing.TB, policies fakeResource[*Policy], params *policyPara
 type policyParams struct {
 	name            string
 	endpointLabels  map[string]string
+	nodeSelectors   map[string]string
 	destinationCIDR string
 	excludedCIDRs   []string
 	nodeLabels      map[string]string
@@ -109,7 +110,15 @@ func newCEGP(params *policyParams) (*v2.CiliumEgressGatewayPolicy, *PolicyConfig
 			egressIP: addr,
 		},
 	}
-
+	if len(params.nodeSelectors) != 0 {
+		policy.nodeSelectors = []api.EndpointSelector{
+			{
+				LabelSelector: &slimv1.LabelSelector{
+					MatchLabels: params.nodeSelectors,
+				},
+			},
+		}
+	}
 	if len(params.endpointLabels) != 0 {
 		policy.endpointSelectors = []api.EndpointSelector{
 			{
@@ -157,6 +166,12 @@ func newCEGP(params *policyParams) (*v2.CiliumEgressGatewayPolicy, *PolicyConfig
 				EgressIP:  params.egressIP,
 			},
 		},
+	}
+
+	if len(params.nodeSelectors) != 0 {
+		cegp.Spec.Selectors[0].NodeSelector = &slimv1.LabelSelector{
+			MatchLabels: params.nodeSelectors,
+		}
 	}
 
 	return cegp, policy

@@ -6,13 +6,13 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
@@ -28,13 +28,15 @@ type NeighborReconcilerOut struct {
 // NeighborReconciler is a ConfigReconciler which reconciles the peers of the
 // provided BGP server with the provided CiliumBGPVirtualRouter.
 type NeighborReconciler struct {
+	logger       *slog.Logger
 	SecretStore  store.BGPCPResourceStore[*slim_corev1.Secret]
 	DaemonConfig *option.DaemonConfig
 }
 
-func NewNeighborReconciler(SecretStore store.BGPCPResourceStore[*slim_corev1.Secret], DaemonConfig *option.DaemonConfig) NeighborReconcilerOut {
+func NewNeighborReconciler(logger *slog.Logger, SecretStore store.BGPCPResourceStore[*slim_corev1.Secret], DaemonConfig *option.DaemonConfig) NeighborReconcilerOut {
 	return NeighborReconcilerOut{
 		Reconciler: &NeighborReconciler{
+			logger:       logger,
 			SecretStore:  SecretStore,
 			DaemonConfig: DaemonConfig,
 		},
@@ -53,6 +55,12 @@ func (r *NeighborReconciler) Priority() int {
 	return 60
 }
 
+func (r *NeighborReconciler) Init(_ *instance.ServerWithConfig) error {
+	return nil
+}
+
+func (r *NeighborReconciler) Cleanup(_ *instance.ServerWithConfig) {}
+
 func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
 	if p.DesiredConfig == nil {
 		return fmt.Errorf("attempted neighbor reconciliation with nil CiliumBGPPeeringPolicy")
@@ -61,10 +69,8 @@ func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) e
 		return fmt.Errorf("attempted neighbor reconciliation with nil ServerWithConfig")
 	}
 	var (
-		l = log.WithFields(
-			logrus.Fields{
-				"component": "NeighborReconciler",
-			},
+		l = r.logger.With(
+			types.ComponentLogField, "NeighborReconciler",
 		)
 		toCreate []*v2alpha1api.CiliumBGPNeighbor
 		toRemove []*v2alpha1api.CiliumBGPNeighbor
@@ -147,39 +153,54 @@ func (r *NeighborReconciler) Reconcile(ctx context.Context, p ReconcileParams) e
 		}
 	}
 
-	// create new neighbors
-	for _, n := range toCreate {
-		l.Infof("Adding peer %v %v to local ASN %v", n.PeerAddress, n.PeerASN, p.DesiredConfig.LocalASN)
-		tcpPassword, err := r.fetchPeerPassword(p.CurrentServer, n)
-		if err != nil {
-			return fmt.Errorf("failed fetching password for neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
-		}
-		if err := p.CurrentServer.Server.AddNeighbor(ctx, types.NeighborRequest{Neighbor: n, Password: tcpPassword}); err != nil {
+	// remove neighbors
+	for _, n := range toRemove {
+		l.Info(
+			"Removing peer from local ASN",
+			types.PeerLogField, n.PeerAddress,
+			types.PeerASNLogField, n.PeerASN,
+			types.LocalASNLogField, p.DesiredConfig.LocalASN,
+		)
+		if err := p.CurrentServer.Server.RemoveNeighbor(ctx, types.ToNeighborV1(n, "")); err != nil {
 			return fmt.Errorf("failed while reconciling neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
-		r.updateMetadata(p.CurrentServer, n, tcpPassword)
+		r.deleteMetadata(p.CurrentServer, n)
 	}
 
 	// update neighbors
 	for _, n := range toUpdate {
-		l.Infof("Updating peer %v %v in local ASN %v", n.PeerAddress, n.PeerASN, p.DesiredConfig.LocalASN)
+		l.Info(
+			"Updating peer in local ASN",
+			types.PeerLogField, n.PeerAddress,
+			types.PeerASNLogField, n.PeerASN,
+			types.LocalASNLogField, p.DesiredConfig.LocalASN,
+		)
 		tcpPassword, err := r.fetchPeerPassword(p.CurrentServer, n)
 		if err != nil {
 			return fmt.Errorf("failed fetching password for neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
-		if err := p.CurrentServer.Server.UpdateNeighbor(ctx, types.NeighborRequest{Neighbor: n, Password: tcpPassword}); err != nil {
+		if err := p.CurrentServer.Server.UpdateNeighbor(ctx, types.ToNeighborV1(n, tcpPassword)); err != nil {
 			return fmt.Errorf("failed while reconciling neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
 		r.updateMetadata(p.CurrentServer, n, tcpPassword)
 	}
 
-	// remove neighbors
-	for _, n := range toRemove {
-		l.Infof("Removing peer %v %v from local ASN %v", n.PeerAddress, n.PeerASN, p.DesiredConfig.LocalASN)
-		if err := p.CurrentServer.Server.RemoveNeighbor(ctx, types.NeighborRequest{Neighbor: n}); err != nil {
+	// create new neighbors
+	for _, n := range toCreate {
+		l.Info(
+			"Adding peer to local ASN",
+			types.PeerLogField, n.PeerAddress,
+			types.PeerASNLogField, n.PeerASN,
+			types.LocalASNLogField, p.DesiredConfig.LocalASN,
+		)
+		tcpPassword, err := r.fetchPeerPassword(p.CurrentServer, n)
+		if err != nil {
+			return fmt.Errorf("failed fetching password for neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
+		}
+		if err := p.CurrentServer.Server.AddNeighbor(ctx, types.ToNeighborV1(n, tcpPassword)); err != nil {
 			return fmt.Errorf("failed while reconciling neighbor %v %v: %w", n.PeerAddress, n.PeerASN, err)
 		}
-		r.deleteMetadata(p.CurrentServer, n)
+		r.updateMetadata(p.CurrentServer, n, tcpPassword)
 	}
 
 	return nil
@@ -202,11 +223,8 @@ func (r *NeighborReconciler) getMetadata(sc *instance.ServerWithConfig) Neighbor
 }
 
 func (r *NeighborReconciler) fetchPeerPassword(sc *instance.ServerWithConfig, n *v2alpha1api.CiliumBGPNeighbor) (string, error) {
-	l := log.WithFields(
-		logrus.Fields{
-			"component": "NeighborReconciler.fetchPeerPassword",
-		},
-	)
+	l := r.logger.With(types.ComponentLogField, "NeighborReconciler.fetchPeerPassword")
+
 	if n.AuthSecretRef != nil {
 		secretRef := *n.AuthSecretRef
 		old := r.getMetadata(sc)[r.neighborID(n)].currentPassword
@@ -217,17 +235,17 @@ func (r *NeighborReconciler) fetchPeerPassword(sc *instance.ServerWithConfig, n 
 		}
 		if !ok {
 			if old != "" {
-				l.Errorf("Failed to fetch secret %q: not found (will continue with old secret)", secretRef)
+				l.Error("Failed to fetch secret-ref: not found (will continue with old secret)", types.SecretRefLogField, secretRef)
 				return old, nil
 			}
-			l.Errorf("Failed to fetch secret %q: not found (will continue with empty password)", secretRef)
+			l.Error("Failed to fetch secret-ref: not found (will continue with empty password)", types.SecretRefLogField, secretRef)
 			return "", nil
 		}
 		tcpPassword := string(secret["password"])
 		if tcpPassword == "" {
 			return "", fmt.Errorf("failed to fetch secret %q: missing password key", secretRef)
 		}
-		l.Debugf("Using TCP password from secret %q", secretRef)
+		l.Debug("Using TCP password from secret", types.SecretRefLogField, secretRef)
 		return tcpPassword, nil
 	}
 	return "", nil

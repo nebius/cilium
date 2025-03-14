@@ -5,8 +5,8 @@ package gateway_api
 
 import (
 	"context"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,12 +30,14 @@ import (
 type tlsRouteReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	logger *slog.Logger
 }
 
-func newTLSRouteReconciler(mgr ctrl.Manager) *tlsRouteReconciler {
+func newTLSRouteReconciler(mgr ctrl.Manager, logger *slog.Logger) *tlsRouteReconciler {
 	return &tlsRouteReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		logger: logger,
 	}
 }
 
@@ -53,10 +55,11 @@ func (r *tlsRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					namespace := helpers.NamespaceDerefOr(backend.Namespace, route.Namespace)
 					backendServiceName, err := helpers.GetBackendServiceName(r.Client, namespace, backend.BackendObjectReference)
 					if err != nil {
-						log.WithFields(logrus.Fields{
-							logfields.Controller: "tlsRoute",
-							logfields.Resource:   client.ObjectKeyFromObject(rawObj),
-						}).WithError(err).Error("Failed to get backend service name")
+						r.logger.Error("Failed to get backend service name",
+							logfields.Controller, "tlsRoute",
+							logfields.Resource, client.ObjectKeyFromObject(rawObj),
+							logfields.Error, err,
+						)
 						continue
 					}
 					backendServices = append(backendServices,
@@ -122,7 +125,8 @@ func (r *tlsRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	builder := ctrl.NewControllerManagedBy(mgr).
 		// Watch for changes to TLSRoute
-		For(&gatewayv1alpha2.TLSRoute{}).
+		For(&gatewayv1alpha2.TLSRoute{},
+			builder.WithPredicates(predicate.NewPredicateFuncs(r.hasMatchingGatewayParent()))).
 		// Watch for changes to Backend services
 		Watches(&corev1.Service{}, r.enqueueRequestForBackendService()).
 		// Watch for changes to Reference Grants
@@ -130,7 +134,7 @@ func (r *tlsRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Watch for changes to Gateways and enqueue TLSRoutes that reference them
 		Watches(&gatewayv1.Gateway{}, r.enqueueRequestForGateway(),
 			builder.WithPredicates(
-				predicate.NewPredicateFuncs(hasMatchingController(context.Background(), mgr.GetClient(), controllerName)),
+				predicate.NewPredicateFuncs(hasMatchingController(context.Background(), mgr.GetClient(), controllerName, r.logger)),
 			))
 
 	if helpers.HasServiceImportSupport(r.Client.Scheme()) {
@@ -165,16 +169,16 @@ func (r *tlsRouteReconciler) enqueueRequestForGateway() handler.EventHandler {
 
 func (r *tlsRouteReconciler) enqueueFromIndex(index string) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
-		scopedLog := log.WithFields(logrus.Fields{
-			logfields.Controller: "tlsRoute",
-			logfields.Resource:   client.ObjectKeyFromObject(o),
-		})
+		scopedLog := r.logger.With(
+			logfields.Controller, tlsRoute,
+			logfields.Resource, client.ObjectKeyFromObject(o),
+		)
 		rList := &gatewayv1alpha2.TLSRouteList{}
 
 		if err := r.Client.List(context.Background(), rList, &client.ListOptions{
 			FieldSelector: fields.OneTermEqualSelector(index, client.ObjectKeyFromObject(o).String()),
 		}); err != nil {
-			scopedLog.WithError(err).Error("Failed to get related TLSRoutes")
+			scopedLog.Error("Failed to get related TLSRoutes", logfields.Error, err)
 			return []reconcile.Request{}
 		}
 
@@ -187,7 +191,7 @@ func (r *tlsRouteReconciler) enqueueFromIndex(index string) handler.MapFunc {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: route,
 			})
-			scopedLog.WithField("tlsRoute", route).Info("Enqueued TLSRoute for resource")
+			scopedLog.Info("Enqueued TLSRoute for resource", tlsRoute, route)
 		}
 		return requests
 	}
@@ -195,14 +199,15 @@ func (r *tlsRouteReconciler) enqueueFromIndex(index string) handler.MapFunc {
 
 func (r *tlsRouteReconciler) enqueueAll() handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
-		scopedLog := log.WithFields(logrus.Fields{
-			logfields.Controller: "tlsRoute",
-			logfields.Resource:   client.ObjectKeyFromObject(o),
-		})
+		scopedLog := r.logger.With(
+			logfields.Controller, tlsRoute,
+			logfields.Resource, client.ObjectKeyFromObject(o),
+		)
+
 		trList := &gatewayv1alpha2.TLSRouteList{}
 
 		if err := r.Client.List(ctx, trList, &client.ListOptions{}); err != nil {
-			scopedLog.WithError(err).Error("Failed to get TLSRoutes")
+			scopedLog.Error("Failed to get TLSRoutes", logfields.Error, err)
 			return []reconcile.Request{}
 		}
 
@@ -215,8 +220,36 @@ func (r *tlsRouteReconciler) enqueueAll() handler.MapFunc {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: route,
 			})
-			scopedLog.WithField("tlsRoute", route).Info("Enqueued TLSRoute for resource")
+			scopedLog.Info("Enqueued TLSRoute for resource", tlsRoute, route)
 		}
 		return requests
+	}
+}
+
+func (r *tlsRouteReconciler) hasMatchingGatewayParent() func(object client.Object) bool {
+	hasMatchingControllerFn := hasMatchingController(context.Background(), r.Client, controllerName, r.logger)
+	return func(obj client.Object) bool {
+		tr, ok := obj.(*gatewayv1alpha2.TLSRoute)
+		if !ok {
+			return false
+		}
+
+		for _, parent := range tr.Spec.ParentRefs {
+			if !helpers.IsGateway(parent) {
+				continue
+			}
+			gw := &gatewayv1.Gateway{}
+			if err := r.Client.Get(context.Background(), types.NamespacedName{
+				Namespace: helpers.NamespaceDerefOr(parent.Namespace, tr.Namespace),
+				Name:      string(parent.Name),
+			}, gw); err != nil {
+				continue
+			}
+			if hasMatchingControllerFn(gw) {
+				return true
+			}
+		}
+
+		return false
 	}
 }

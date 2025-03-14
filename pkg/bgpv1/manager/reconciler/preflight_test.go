@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
@@ -99,6 +100,7 @@ func TestPreflightReconciler(t *testing.T) {
 	}
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
+			l := hivetest.Logger(t)
 			// our test BgpServer with our original router ID and local port
 			srvParams := types.ServerParameters{
 				Global: types.BGPGlobal{
@@ -107,7 +109,7 @@ func TestPreflightReconciler(t *testing.T) {
 					ListenPort: tt.localPort,
 				},
 			}
-			testSC, err := instance.NewServerWithConfig(context.Background(), log, srvParams)
+			testSC, err := instance.NewServerWithConfig(context.Background(), l, srvParams)
 			if err != nil {
 				t.Fatalf("failed to create test BgpServer: %v", err)
 			}
@@ -126,7 +128,7 @@ func TestPreflightReconciler(t *testing.T) {
 				LocalASN: 64125,
 			}
 
-			preflightReconciler := NewPreflightReconciler().Reconciler
+			preflightReconciler := NewPreflightReconciler(l).Reconciler
 			params := ReconcileParams{
 				CurrentServer: testSC,
 				DesiredConfig: newc,
@@ -211,7 +213,7 @@ func TestReconcileAfterServerReinit(t *testing.T) {
 		},
 	}
 
-	testSC, err := instance.NewServerWithConfig(context.Background(), log, srvParams)
+	testSC, err := instance.NewServerWithConfig(context.Background(), hivetest.Logger(t), srvParams)
 	require.NoError(t, err)
 
 	originalServer := testSC.Server
@@ -223,13 +225,13 @@ func TestReconcileAfterServerReinit(t *testing.T) {
 	// Validate pod CIDR and service announcements work as expected
 	newc := &v2alpha1api.CiliumBGPVirtualRouter{
 		LocalASN:        localASN,
-		ExportPodCIDR:   pointer.Bool(true),
+		ExportPodCIDR:   ptr.To[bool](true),
 		Neighbors:       []v2alpha1api.CiliumBGPNeighbor{},
 		ServiceSelector: serviceSelector,
 	}
 
 	daemonConfig := &option.DaemonConfig{IPAM: "Kubernetes"}
-	exportPodCIDRReconciler := NewExportPodCIDRReconciler(daemonConfig).Reconciler
+	exportPodCIDRReconciler := NewExportPodCIDRReconciler(hivetest.Logger(t), daemonConfig).Reconciler
 	params := ReconcileParams{
 		CurrentServer: testSC,
 		DesiredConfig: newc,
@@ -258,7 +260,7 @@ func TestReconcileAfterServerReinit(t *testing.T) {
 		"cilium.io/bgp-virtual-router.64125": fmt.Sprintf("router-id=%s,local-port=%d", newRouterID, localPort),
 	}
 
-	preflightReconciler := NewPreflightReconciler().Reconciler
+	preflightReconciler := NewPreflightReconciler(hivetest.Logger(t)).Reconciler
 
 	// Trigger pre flight reconciler
 	err = preflightReconciler.Reconcile(context.Background(), params)

@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_FIB_H_
-#define __LIB_FIB_H_
+#pragma once
 
 #include <bpf/ctx/ctx.h>
 #include <bpf/api.h>
@@ -10,6 +9,19 @@
 #include "common.h"
 #include "neigh.h"
 #include "l3.h"
+
+static __always_inline int
+add_l2_hdr(struct __ctx_buff *ctx __maybe_unused)
+{
+	__u16 proto = ctx_get_protocol(ctx);
+
+	if (ctx_change_head(ctx, __ETH_HLEN, 0))
+		return DROP_INVALID;
+	if (eth_store_proto(ctx, proto, 0) < 0)
+		return DROP_WRITE_ERROR;
+
+	return 0;
+}
 
 static __always_inline int
 maybe_add_l2_hdr(struct __ctx_buff *ctx __maybe_unused,
@@ -25,12 +37,7 @@ maybe_add_l2_hdr(struct __ctx_buff *ctx __maybe_unused,
 		/* The packet is going to be redirected from L3 to L2
 		 * device, so we need to create L2 header first.
 		 */
-		__u16 proto = ctx_get_protocol(ctx);
-
-		if (ctx_change_head(ctx, __ETH_HLEN, 0))
-			return DROP_INVALID;
-		if (eth_store_proto(ctx, proto, 0) < 0)
-			return DROP_WRITE_ERROR;
+		return add_l2_hdr(ctx);
 	}
 	return 0;
 }
@@ -45,8 +52,9 @@ static __always_inline bool fib_ok(int ret)
   * @arg needs_l2_check		check for L3 -> L2 redirect
   * @arg fib_params		FIB lookup parameters
   * @arg allow_neigh_map	fallback to neighbour map for DMAC
-  * @arg fib_ret		result of a preceding FIB lookup
+  * @arg fib_result		result of a preceding FIB lookup
   * @arg oif			egress interface index
+  * @arg ext_err		extended error
   *
   * Returns:
   *   - result of BPF redirect
@@ -77,19 +85,13 @@ static __always_inline bool fib_ok(int ret)
 static __always_inline int
 fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 		const struct bpf_fib_lookup_padded *fib_params,
-		bool allow_neigh_map, __s8 *fib_ret, int *oif)
+		bool allow_neigh_map, int fib_result, int *oif, __s8 *ext_err)
 {
-	/* sanity check, we only enter this function with these two fib lookup
-	 * return codes.
-	 */
-	if (*fib_ret && (*fib_ret != BPF_FIB_LKUP_RET_NO_NEIGH))
-		return DROP_NO_FIB;
-
 	/* determine which oif to use before needs_l2_check determines if layer 2
 	 * header needs to be pushed.
 	 */
 	if (fib_params) {
-		if (*fib_ret == BPF_FIB_LKUP_RET_NO_NEIGH &&
+		if (fib_result == BPF_FIB_LKUP_RET_NO_NEIGH &&
 		    !is_defined(HAVE_FIB_IFINDEX) && *oif) {
 			/* For kernels without d1c362e1dd68 ("bpf: Always
 			 * return target ifindex in bpf_fib_lookup") we
@@ -115,7 +117,7 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 	}
 
 	/* determine if we are performing redirect or redirect_neigh*/
-	switch (*fib_ret) {
+	switch (fib_result) {
 	case BPF_FIB_LKUP_RET_SUCCESS:
 		if (eth_store_daddr(ctx, fib_params->l.dmac, 0) < 0)
 			return DROP_WRITE_ERROR;
@@ -136,11 +138,11 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 						     &fib_params->l.ipv6_dst,
 						     sizeof(nh_params.ipv6_nh));
 
-				return redirect_neigh(*oif, &nh_params,
-						sizeof(nh_params), 0);
+				return (int)redirect_neigh(*oif, &nh_params,
+							   sizeof(nh_params), 0);
 			}
 
-			return redirect_neigh(*oif, NULL, 0, 0);
+			return (int)redirect_neigh(*oif, NULL, 0, 0);
 		} else {
 			union macaddr smac = NATIVE_DEV_MAC_BY_IFINDEX(*oif);
 			union macaddr *dmac = NULL;
@@ -156,7 +158,7 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 			}
 
 			if (!dmac) {
-				*fib_ret = BPF_FIB_MAP_NO_NEIGH;
+				*ext_err = BPF_FIB_MAP_NO_NEIGH;
 				return DROP_NO_FIB;
 			}
 			if (eth_store_daddr_aligned(ctx, dmac->addr, 0) < 0)
@@ -166,13 +168,13 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 		}
 	};
 out_send:
-	return ctx_redirect(ctx, *oif, 0);
+	return (int)ctx_redirect(ctx, *oif, 0);
 }
 
 static __always_inline int
 fib_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 	     struct bpf_fib_lookup_padded *fib_params __maybe_unused,
-	     bool use_neigh_map, __s8 *fib_err __maybe_unused, int *oif)
+	     bool use_neigh_map, __s8 *ext_err __maybe_unused, int *oif)
 {
 #ifdef ENABLE_SKIP_FIB
 	*oif = DIRECT_ROUTING_DEV_IFINDEX;
@@ -181,17 +183,22 @@ fib_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 	if (!is_defined(ENABLE_SKIP_FIB) || !neigh_resolver_available()) {
 		int ret;
 
-		ret = fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), 0);
-		*fib_err = (__s8)ret;
+		ret = (int)fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), 0);
+		switch (ret) {
+		case BPF_FIB_LKUP_RET_SUCCESS:
+		case BPF_FIB_LKUP_RET_NO_NEIGH:
+			break;
+		default:
+			*ext_err = (__s8)ret;
+			return DROP_NO_FIB;
+		}
 
 		return fib_do_redirect(ctx, needs_l2_check, fib_params, use_neigh_map,
-				       fib_err, oif);
+				       ret, oif, ext_err);
 	}
 
-	*fib_err = BPF_FIB_LKUP_RET_NO_NEIGH;
-
 	return fib_do_redirect(ctx, needs_l2_check, NULL, use_neigh_map,
-			       fib_err, oif);
+			       BPF_FIB_LKUP_RET_NO_NEIGH, oif, ext_err);
 }
 
 #ifdef ENABLE_IPV6
@@ -214,13 +221,13 @@ fib_lookup_v6(struct __ctx_buff *ctx, struct bpf_fib_lookup_padded *fib_params,
 	ipv6_addr_copy((union v6addr *)&fib_params->l.ipv6_dst,
 		       (union v6addr *)ipv6_dst);
 
-	return fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), flags);
+	return (int)fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), flags);
 };
 
 static __always_inline int
 fib_redirect_v6(struct __ctx_buff *ctx, int l3_off,
 		struct ipv6hdr *ip6 __maybe_unused, const bool needs_l2_check,
-		bool allow_neigh_map, __s8 *fib_err __maybe_unused, int *oif)
+		bool allow_neigh_map, __s8 *ext_err __maybe_unused, int *oif)
 {
 	struct bpf_fib_lookup_padded fib_params __maybe_unused = {0};
 	int ret;
@@ -230,25 +237,32 @@ fib_redirect_v6(struct __ctx_buff *ctx, int l3_off,
 #endif
 
 	if (!is_defined(ENABLE_SKIP_FIB) || !neigh_resolver_available()) {
-		ret = fib_lookup_v6(ctx, &fib_params, &ip6->saddr, &ip6->daddr, 0);
-		*fib_err = (__s8)ret;
+		int fib_result;
+
+		fib_result = fib_lookup_v6(ctx, &fib_params, &ip6->saddr, &ip6->daddr, 0);
+		switch (fib_result) {
+		case BPF_FIB_LKUP_RET_SUCCESS:
+		case BPF_FIB_LKUP_RET_NO_NEIGH:
+			break;
+		default:
+			*ext_err = (__s8)fib_result;
+			return DROP_NO_FIB;
+		}
 
 		ret = ipv6_l3(ctx, l3_off, NULL, NULL, METRIC_EGRESS);
 		if (unlikely(ret != CTX_ACT_OK))
 			return ret;
 
 		return fib_do_redirect(ctx, needs_l2_check, &fib_params, allow_neigh_map,
-				       fib_err, oif);
+				       fib_result, oif, ext_err);
 	}
 
 	ret = ipv6_l3(ctx, l3_off, NULL, NULL, METRIC_EGRESS);
 	if (unlikely(ret != CTX_ACT_OK))
 		return ret;
 
-	*fib_err = BPF_FIB_LKUP_RET_NO_NEIGH;
-
 	return fib_do_redirect(ctx, needs_l2_check, NULL, allow_neigh_map,
-			       fib_err, oif);
+			       BPF_FIB_LKUP_RET_NO_NEIGH, oif, ext_err);
 }
 #endif /* ENABLE_IPV6 */
 
@@ -267,13 +281,13 @@ fib_lookup_v4(struct __ctx_buff *ctx, struct bpf_fib_lookup_padded *fib_params,
 	fib_params->l.ipv4_src	= ipv4_src;
 	fib_params->l.ipv4_dst	= ipv4_dst;
 
-	return fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), flags);
+	return (int)fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), flags);
 }
 
 static __always_inline int
 fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
 		struct iphdr *ip4 __maybe_unused, const bool needs_l2_check,
-		bool allow_neigh_map, __s8 *fib_err __maybe_unused, int *oif)
+		bool allow_neigh_map, __s8 *ext_err __maybe_unused, int *oif)
 {
 	struct bpf_fib_lookup_padded fib_params __maybe_unused = {0};
 	int ret;
@@ -283,25 +297,31 @@ fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
 #endif
 
 	if (!is_defined(ENABLE_SKIP_FIB) || !neigh_resolver_available()) {
-		ret = fib_lookup_v4(ctx, &fib_params, ip4->saddr, ip4->daddr, 0);
-		*fib_err = (__s8)ret;
+		int fib_result;
+
+		fib_result = fib_lookup_v4(ctx, &fib_params, ip4->saddr, ip4->daddr, 0);
+		switch (fib_result) {
+		case BPF_FIB_LKUP_RET_SUCCESS:
+		case BPF_FIB_LKUP_RET_NO_NEIGH:
+			break;
+		default:
+			*ext_err = (__s8)fib_result;
+			return DROP_NO_FIB;
+		}
 
 		ret = ipv4_l3(ctx, l3_off, NULL, NULL, ip4);
 		if (unlikely(ret != CTX_ACT_OK))
 			return ret;
 
 		return fib_do_redirect(ctx, needs_l2_check, &fib_params, allow_neigh_map,
-				       fib_err, oif);
+				       fib_result, oif, ext_err);
 	}
 
 	ret = ipv4_l3(ctx, l3_off, NULL, NULL, ip4);
 	if (unlikely(ret != CTX_ACT_OK))
 		return ret;
 
-	*fib_err = BPF_FIB_LKUP_RET_NO_NEIGH;
-
 	return fib_do_redirect(ctx, needs_l2_check, NULL, allow_neigh_map,
-			       fib_err, oif);
+			       BPF_FIB_LKUP_RET_NO_NEIGH, oif, ext_err);
 }
 #endif /* ENABLE_IPV4 */
-#endif /* __LIB_FIB_H_ */

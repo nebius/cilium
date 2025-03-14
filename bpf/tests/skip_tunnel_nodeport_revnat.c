@@ -18,7 +18,6 @@
  * Now include testing defaults
  */
 #define ROUTER_IP
-#include "config_replacement.h"
 #undef ROUTER_IP
 #include "node_config.h"
 
@@ -149,9 +148,9 @@ setup(struct __ctx_buff *ctx, bool v4, bool flag_skip_tunnel)
 	 * Otherwise, leftover state from previous tests will have an impact,
 	 * as the tests and checks assume we have a fresh state every time.
 	 */
-	clear_map(&METRICS_MAP);
-	clear_map(&CT_MAP_TCP4);
-	clear_map(&CT_MAP_TCP6);
+	clear_map(&cilium_metrics);
+	clear_map(&cilium_ct4_global);
+	clear_map(&cilium_ct6_global);
 	clear_map(get_cluster_snat_map_v4(0));
 	clear_map(get_cluster_snat_map_v6(0));
 
@@ -193,8 +192,8 @@ setup(struct __ctx_buff *ctx, bool v4, bool flag_skip_tunnel)
 		 */
 		struct ipv4_nat_target target = {
 			.addr = NODEPORT_IPV4,
-			.min_port = NODEPORT_NAT_PORT,
-			.max_port = NODEPORT_NAT_PORT,
+			.min_port = __bpf_ntohs(NODEPORT_NAT_PORT),
+			.max_port = __bpf_ntohs(NODEPORT_NAT_PORT) + 1,
 		};
 
 		void *map = get_cluster_snat_map_v4(0);
@@ -235,8 +234,8 @@ setup(struct __ctx_buff *ctx, bool v4, bool flag_skip_tunnel)
 		};
 		struct ipv6_nat_target target = {
 			.addr = *((union v6addr *)NODEPORT_IPV6),
-			.min_port = NODEPORT_NAT_PORT,
-			.max_port = NODEPORT_NAT_PORT,
+			.min_port = __bpf_ntohs(NODEPORT_NAT_PORT),
+			.max_port = __bpf_ntohs(NODEPORT_NAT_PORT) + 1,
 		};
 
 		struct ipv6_nat_entry state;
@@ -301,7 +300,7 @@ check_ctx(const struct __ctx_buff *ctx, bool v4, __u32 expected_result)
 		key.reason = REASON_FORWARDED;
 		key.dir = METRIC_EGRESS;
 
-		entry = map_lookup_elem(&METRICS_MAP, &key);
+		entry = map_lookup_elem(&cilium_metrics, &key);
 		if (!entry)
 			test_fatal("metrics entry not found")
 

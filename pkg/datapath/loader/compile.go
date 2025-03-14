@@ -22,8 +22,9 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/command/exec"
-	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 )
@@ -57,6 +58,10 @@ const (
 	overlayPrefix = "bpf_overlay"
 	overlayProg   = overlayPrefix + "." + string(outputSource)
 	overlayObj    = overlayPrefix + ".o"
+
+	wireguardPrefix = "bpf_wireguard"
+	wireguardProg   = wireguardPrefix + "." + string(outputSource)
+	wireguardObj    = wireguardPrefix + ".o"
 )
 
 var (
@@ -96,7 +101,7 @@ type directoryInfo struct {
 
 var (
 	standardCFlags = []string{"-O2", "--target=bpf", "-std=gnu89",
-		"-nostdinc", fmt.Sprintf("-D__NR_CPUS__=%d", common.GetNumPossibleCPUs(log)),
+		"-nostdinc",
 		"-Wall", "-Wextra", "-Werror", "-Wshadow",
 		"-Wno-address-of-packed-member",
 		"-Wno-unknown-warning-option",
@@ -381,4 +386,44 @@ func compileOverlay(ctx context.Context, opts []string) error {
 		return err
 	}
 	return nil
+}
+
+func compileWireguard(ctx context.Context) (err error) {
+	dirs := &directoryInfo{
+		Library: option.Config.BpfDir,
+		Runtime: option.Config.StateDir,
+		Output:  option.Config.StateDir,
+		State:   option.Config.StateDir,
+	}
+	scopedLog := log.WithField(logfields.Debug, true)
+
+	versionCmd := exec.CommandContext(ctx, compiler, "--version")
+	compilerVersion, err := versionCmd.CombinedOutput(scopedLog, true)
+	if err != nil {
+		return err
+	}
+	scopedLog.WithFields(logrus.Fields{
+		compiler: string(compilerVersion),
+	}).Debug("Compiling wireguard programs")
+
+	prog := &progInfo{
+		Source:     wireguardProg,
+		Output:     wireguardObj,
+		OutputType: outputObject,
+	}
+	// Write out assembly and preprocessing files for debugging purposes
+	if _, err := compile(ctx, prog, dirs); err != nil {
+		scopedLog.WithField(logfields.Params, logfields.Repr(prog)).
+			WithError(err).Warn("Failed to compile")
+		return err
+	}
+	return nil
+}
+
+type compilationLock struct {
+	lock.RWMutex
+}
+
+func NewCompilationLock() types.CompilationLock {
+	return &compilationLock{}
 }

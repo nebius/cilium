@@ -4,9 +4,8 @@
 package multicast
 
 import (
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
-
-	"github.com/cilium/cilium/pkg/hive/cell"
 )
 
 const (
@@ -18,7 +17,7 @@ var Cell = cell.Module(
 	"multicastmaps",
 	"Multicast Maps provides interfaces to the multicast data-path maps",
 	cell.Provide(NewGroupV4Map),
-	cell.Config(Config{}),
+	cell.Config(defaultConfig),
 )
 
 type Config struct {
@@ -28,4 +27,8 @@ type Config struct {
 // Flags implements cell.Flagger interface.
 func (cfg Config) Flags(flags *pflag.FlagSet) {
 	flags.Bool(Multicast, cfg.MulticastEnabled, "Enables multicast in Cilium")
+}
+
+var defaultConfig = Config{
+	MulticastEnabled: false,
 }

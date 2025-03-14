@@ -6,9 +6,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
@@ -17,10 +14,6 @@
 #define ENABLE_HOST_ROUTING
 
 #define DISABLE_LOOPBACK_LB
-
-/* Skip ingress policy checks, not needed to validate hairpin flow */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
-#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -32,14 +25,40 @@
 #define BACKEND_IP		v4_pod_one
 #define BACKEND_PORT		__bpf_htons(8080)
 
-#define NATIVE_DEV_IFINDEX	24
-#define DEFAULT_IFACE		NATIVE_DEV_IFINDEX
+#define DEFAULT_IFACE		24
 #define BACKEND_IFACE		25
 #define SVC_EGRESS_IFACE	26
+
+#define BACKEND_EP_ID		127
 
 static volatile const __u8 *client_mac = mac_one;
 static volatile const __u8 *node_mac = mac_three;
 static volatile const __u8 *backend_mac = mac_four;
+
+__section("mock-handle-policy")
+int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
+{
+	return TC_ACT_REDIRECT;
+}
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(max_entries, 256);
+	__array(values, int());
+} mock_policy_call_map __section(".maps") = {
+	.values = {
+		[BACKEND_EP_ID] = &mock_handle_policy,
+	},
+};
+
+#define tail_call_dynamic mock_tail_call_dynamic
+static __always_inline __maybe_unused void
+mock_tail_call_dynamic(struct __ctx_buff *ctx __maybe_unused,
+		       const void *map __maybe_unused, __u32 slot __maybe_unused)
+{
+	tail_call(ctx, &mock_policy_call_map, slot);
+}
 
 #define fib_lookup mock_fib_lookup
 
@@ -84,8 +103,6 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 	return CTX_ACT_DROP;
 }
 
-#define SECCTX_FROM_IPCACHE 1
-
 #include "bpf_host.c"
 
 #include "lib/endpoint.h"
@@ -93,6 +110,9 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 
 #define FROM_NETDEV	0
 #define TO_NETDEV	1
+
+ASSIGN_CONFIG(__u32, interface_ifindex, DEFAULT_IFACE)
+ASSIGN_CONFIG(__u32, host_secctx_from_ipcache, 1)
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
@@ -167,7 +187,7 @@ SETUP("tc", "tc_nodeport_dsr_backend")
 int nodeport_dsr_backend_setup(struct __ctx_buff *ctx)
 {
 	/* add local backend */
-	endpoint_v4_add_entry(BACKEND_IP, BACKEND_IFACE, 0, 0,
+	endpoint_v4_add_entry(BACKEND_IP, BACKEND_IFACE, BACKEND_EP_ID, 0, 0, 0,
 			      (__u8 *)backend_mac, (__u8 *)node_mac);
 
 	ipcache_v4_add_entry(BACKEND_IP, 0, 112233, 0, 0);
@@ -227,6 +247,9 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x400a))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (opt->type != DSR_IPV4_OPT_TYPE)
 		test_fatal("type in DSR IP option has changed")
 	if (opt->len != 8)
@@ -241,6 +264,9 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0xd7d0))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	struct ipv4_ct_tuple tuple;
 	struct ct_entry *ct_entry;
@@ -344,11 +370,17 @@ static __always_inline int check_reply(const struct __ctx_buff *ctx)
 	if (l3->daddr != CLIENT_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4baa))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != FRONTEND_PORT)
 		test_fatal("src port hasn't been RevNATed to frontend port");
 
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x01a9))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }
@@ -490,6 +522,9 @@ int nodeport_dsr_backend_redirect_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x3509))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (opt->type != DSR_IPV4_OPT_TYPE)
 		test_fatal("type in DSR IP option has changed")
 	if (opt->len != 8)
@@ -504,6 +539,9 @@ int nodeport_dsr_backend_redirect_check(struct __ctx_buff *ctx)
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0xcccf))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	struct ipv4_ct_tuple tuple;
 	struct ct_entry *ct_entry;
@@ -621,11 +659,17 @@ int nodeport_dsr_backend_redirect_reply_check(struct __ctx_buff *ctx)
 	if (l3->daddr != CLIENT_IP_2)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x3611))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != BACKEND_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0xcccf))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }

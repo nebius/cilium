@@ -41,13 +41,18 @@ echo -e "# This file is based on $(RELATIVE_DIR)/cilium/$(VALUES_TMPL_FILE_NAME)
 $(YQ) ea '. as $$item ireduce ({}; . * $$item )' $(1) | envsubst >> $(2)
 endef
 
+COMMON_LABELS_EXCLUSIONS := --exclude validate.yaml
+
 all: update-versions check-values-yaml docs lint
+
+# Add the ability to override variables and add more targets.
+-include Makefile.override
 
 update-chart: $(ROOT_DIR)/VERSION # Update chart versions to point to the current version.
 	$(ECHO_GEN)cilium/Chart.yaml
 	$(QUIET)grep -lR -e 'version:' -e 'appVersion:' $(CILIUM_CHARTS)/ \
 		| xargs -L 1 $(SED) -i -e 's/'$(CILIUM_CHART_REGEX)'/\1 '$(VERSION)'/g'
-	$(QUIET)$(SED) -i 's;icon:.*;icon: $(LOGO_BASE_URL)/cilium@$(CILIUM_BRANCH)/$(LOGO_PATH);' $(CHART_FILE)
+	$(QUIET)$(SED) -i 's;icon:.*;icon: $(LOGO_BASE_URL)/cilium@main/$(LOGO_PATH);' $(CHART_FILE)
 
 check-values-yaml: cilium/values.schema.json
 	$(ECHO_CHECK) $@
@@ -73,6 +78,15 @@ CRD_FILES := $(shell find $(ROOT_DIR)/examples/crds/*/ -type f)
 CRDS := $(foreach path,$(patsubst %.yaml,%,$(CRD_FILES)),$(shell basename $(path)))
 lint:
 	$(ECHO_CHECK)
+	$(QUIET)grep -RL $(COMMON_LABELS_EXCLUSIONS) .Values.commonLabels $(ROOT_DIR)/$(RELATIVE_DIR)/cilium/templates/*.yaml $(ROOT_DIR)/$(RELATIVE_DIR)/cilium/templates/**/*.yaml >> missing_label
+	$(QUIET)if [ -s missing_label ]; then \
+		echo "These files are missing the .Values.commonLabels, please add them and submit your changes" ; \
+		cat missing_label ; \
+		rm -f missing_label ; \
+		exit 1; \
+	else \
+		rm -f missing_label ; \
+	fi;
 	$(QUIET)for crd in $(CRDS); do \
 		grep -q $$crd $(CHART_FILE) \
 		|| (echo -e "$$crd not found in $(CHART_FILE).\nPlease update the chart to include $$crd."; exit 1); \

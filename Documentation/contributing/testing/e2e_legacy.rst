@@ -9,6 +9,12 @@
 End-To-End Testing Framework (Legacy)
 =====================================
 
+.. warning::
+   The Ginkgo end-to-end testing framework is deprecated. New end-to-end
+   tests should be implemented using the `cilium-cli
+   <https://github.com/cilium/cilium-cli/#connectivity-check>`_ connectivity
+   testing framework. For more information, see :ref:`testsuite`.
+
 Introduction
 ~~~~~~~~~~~~
 
@@ -40,14 +46,6 @@ GitHub Actions provide an alternative mode for running Cilium's end-to-end tests
 The configuration is set up to closely match the environment used in GHA. Refer
 to the relevant documentation for instructions on running tests using GHA.
 
-Running Tests with Vagrant
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-To run tests locally using Vagrant, the test scripts invoke ``vagrant`` to create
-virtual machine(s). These tests utilize the Ginkgo testing framework, leveraging
-its rich capabilities and the benefits of Go's compilation-time checks and
-strong typing.
-
 Running End-To-End Tests
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -72,8 +70,8 @@ usage information.
 
    .. code-block:: shell-session
 
-      $ HELM_VERSION=3.7.0
-      $ wget "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+      $ HELM_VERSION=v3.13.1
+      $ wget "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
       $ tar -xf "helm-v${HELM_VERSION}-linux-amd64.tar.gz"
       $ mv linux-amd64/helm ./helm
 
@@ -135,7 +133,7 @@ usage information.
           -m 12G \
           -enable-kvm \
           -cpu host \
-          -hda /tmp/_images/datapath-conformance.qcow2 \
+          -drive file=/tmp/_images/datapath-conformance.qcow2,if=virtio,index=0,media=disk \
           -netdev user,id=user.0,hostfwd=tcp::2222-:22 \
           -device virtio-net-pci,netdev=user.0 \
           -fsdev local,id=host_id,path=./,security_model=none \
@@ -174,9 +172,6 @@ usage information.
       # else
       #   ./contrib/scripts/kind.sh "" 1 "" "${kubernetes_image}" "iptables" "${ip_family}"
       # fi
-      ## Some tests using demo-customcalls.yaml are mounting this directoy
-      # mkdir -p /home/vagrant/go/src/github.com/cilium
-      # ln -s /host /home/vagrant/go/src/github.com/cilium/cilium
       # git config --global --add safe.directory /cilium
 
    Verify that kind is running inside the VM:
@@ -251,7 +246,6 @@ usage information.
         -cilium.hubble-relay-image=quay.io/${quay_org}/hubble-relay-ci \
         -cilium.hubble-relay-tag=${commit_sha} \
         -cilium.kubeconfig=/root/.kube/config \
-        -cilium.provision-k8s=false \
         -cilium.operator-suffix=-ci \
         -cilium.holdEnvironment=true
       Using CNI_INTEGRATION="kind"
@@ -445,8 +439,6 @@ framework in the ``test/`` directory and interact with ginkgo directly:
             Pass the environment invoking ginkgo, including PATH, to subcommands
       -cilium.provision
             Provision Vagrant boxes and Cilium before running test (default true)
-      -cilium.provision-k8s
-            Specifies whether Kubernetes should be deployed and installed via kubeadm or not (default true)
       -cilium.runQuarantined
             Run tests that are under quarantine.
       -cilium.showCommands
@@ -552,7 +544,7 @@ Best Practices for Writing Tests
 
 * Provide informative output to console during a test using the `By construct <https://onsi.github.io/ginkgo/#documenting-complex-specs-by>`_. This helps with debugging and gives those who did not write the test a good idea of what is going on. The lower the barrier of entry is for understanding tests, the better our tests will be!
 * Leave the testing environment in the same state that it was in when the test started by deleting resources, resetting configuration, etc.
-* Gather logs in the case that a test fails. If a test fails while running on Jenkins, a postmortem needs to be done to analyze why. So, dumping logs to a location where Jenkins can pick them up is of the highest imperative. Use the following code in an ``AfterFailed`` method:
+* Gather logs in the case that a test fails. If a test fails while running on Ginkgo, a postmortem needs to be done to analyze why. So, dumping logs to a location where Ginkgo can pick them up is of the highest imperative. Use the following code in an ``AfterFailed`` method:
 
 .. code-block:: go
 
@@ -674,7 +666,7 @@ test an exhaustive data will be added.
 	level=info msg=Starting testName=RuntimeKafka
 	level=info msg="Vagrant: running command \"vagrant ssh-config runtime\""
 	cmd: "sudo cilium-dbg status" exitCode: 0
-	 KVStore:            Ok         Consul: 172.17.0.3:8300
+	 KVStore:            Ok         Etcd: 172.17.0.3:4001
 	ContainerRuntime:   Ok
 	Kubernetes:         Disabled
 	Kubernetes APIs:    [""]
@@ -739,7 +731,7 @@ To run tests with Kind, try
 
 .. code-block:: shell-session
 
-  K8S_VERSION=1.25 ginkgo --focus=K8s -- -cilium.provision=false --cilium.image=localhost:5000/cilium/cilium-dev -cilium.tag=local  --cilium.operator-image=localhost:5000/cilium/operator -cilium.operator-tag=local -cilium.kubeconfig=`echo ~/.kube/config` -cilium.provision-k8s=false  -cilium.testScope=K8s -cilium.operator-suffix=
+  K8S_VERSION=1.25 ginkgo --focus=K8s -- -cilium.provision=false --cilium.image=localhost:5000/cilium/cilium-dev -cilium.tag=local  --cilium.operator-image=localhost:5000/cilium/operator -cilium.operator-tag=local -cilium.kubeconfig=`echo ~/.kube/config` -cilium.testScope=K8s -cilium.operator-suffix=
 
 
 Running in GKE

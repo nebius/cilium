@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -15,7 +15,7 @@ import (
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
@@ -31,42 +31,47 @@ type checks struct {
 
 var (
 	peer1 = PeerData{
-		Peer: &v2alpha1.CiliumBGPNodePeer{
+		Peer: &v2.CiliumBGPNodePeer{
 			Name:        "peer-1",
 			PeerAddress: ptr.To[string]("192.168.0.1"),
 			PeerASN:     ptr.To[int64](64124),
-			PeerConfigRef: &v2alpha1.PeerConfigReference{
-				Group: "cilium.io",
-				Kind:  v2alpha1.BGPPCKindDefinition,
-				Name:  "peer-config",
+			PeerConfigRef: &v2.PeerConfigReference{
+				Name: "peer-config",
 			},
 		},
-		Config: &v2alpha1.CiliumBGPPeerConfigSpec{
-			Transport: &v2alpha1.CiliumBGPTransport{
-				LocalPort: ptr.To[int32](v2alpha1.DefaultBGPPeerLocalPort),
-				PeerPort:  ptr.To[int32](v2alpha1.DefaultBGPPeerPort),
+		Config: &v2.CiliumBGPPeerConfigSpec{
+			Transport: &v2.CiliumBGPTransport{
+				PeerPort: ptr.To[int32](v2.DefaultBGPPeerPort),
 			},
 		},
 	}
 
 	peer2 = PeerData{
-		Peer: &v2alpha1.CiliumBGPNodePeer{
+		Peer: &v2.CiliumBGPNodePeer{
 			Name:        "peer-2",
 			PeerAddress: ptr.To[string]("192.168.0.2"),
 			PeerASN:     ptr.To[int64](64124),
-			PeerConfigRef: &v2alpha1.PeerConfigReference{
-				Group: "cilium.io",
-				Kind:  v2alpha1.BGPPCKindDefinition,
-				Name:  "peer-config",
+			PeerConfigRef: &v2.PeerConfigReference{
+				Name: "peer-config",
 			},
 		},
-		Config: &v2alpha1.CiliumBGPPeerConfigSpec{
-			Transport: &v2alpha1.CiliumBGPTransport{
-				LocalPort: ptr.To[int32](v2alpha1.DefaultBGPPeerLocalPort),
-				PeerPort:  ptr.To[int32](v2alpha1.DefaultBGPPeerPort),
+		Config: &v2.CiliumBGPPeerConfigSpec{
+			Transport: &v2.CiliumBGPTransport{
+				PeerPort: ptr.To[int32](v2.DefaultBGPPeerPort),
 			},
 		},
 	}
+
+	peer2UpdatedASN = func() PeerData {
+		peer2Copy := PeerData{
+			Peer:     peer2.Peer.DeepCopy(),
+			Config:   peer2.Config.DeepCopy(),
+			Password: peer2.Password,
+		}
+
+		peer2Copy.Peer.PeerASN = ptr.To[int64](64125)
+		return peer2Copy
+	}()
 
 	peer2UpdatedTimers = func() PeerData {
 		peer2Copy := PeerData{
@@ -75,7 +80,7 @@ var (
 			Password: peer2.Password,
 		}
 
-		peer2Copy.Config.Timers = &v2alpha1.CiliumBGPTimers{
+		peer2Copy.Config.Timers = &v2.CiliumBGPTimers{
 			ConnectRetryTimeSeconds: ptr.To[int32](3),
 			HoldTimeSeconds:         ptr.To[int32](9),
 			KeepAliveTimeSeconds:    ptr.To[int32](3),
@@ -91,9 +96,8 @@ var (
 			Password: peer2.Password,
 		}
 
-		peer2Copy.Config.Transport = &v2alpha1.CiliumBGPTransport{
-			LocalPort: ptr.To[int32](1790),
-			PeerPort:  ptr.To[int32](1790),
+		peer2Copy.Config.Transport = &v2.CiliumBGPTransport{
+			PeerPort: ptr.To[int32](1790),
 		}
 
 		return peer2Copy
@@ -106,7 +110,7 @@ var (
 			Password: peer2.Password,
 		}
 
-		peer2Copy.Config.GracefulRestart = &v2alpha1.CiliumBGPNeighborGracefulRestart{
+		peer2Copy.Config.GracefulRestart = &v2.CiliumBGPNeighborGracefulRestart{
 			Enabled:            true,
 			RestartTimeSeconds: ptr.To[int32](3),
 		}
@@ -173,6 +177,12 @@ func TestNeighborReconciler(t *testing.T) {
 			err:          nil,
 		},
 		{
+			name:         "update config : ASN",
+			neighbors:    []PeerData{peer1, peer2},
+			newNeighbors: []PeerData{peer1, peer2UpdatedASN},
+			err:          nil,
+		},
+		{
 			name:         "update config : timers",
 			neighbors:    []PeerData{peer1, peer2},
 			newNeighbors: []PeerData{peer1, peer2UpdatedTimers},
@@ -220,20 +230,27 @@ func TestNeighborReconciler(t *testing.T) {
 				},
 			}
 
-			testInstance, err := instance.NewBGPInstance(context.Background(), logrus.WithField("unit_test", tt.name), srvParams)
+			testInstance, err := instance.NewBGPInstance(context.Background(), hivetest.Logger(t), "test-instance", srvParams)
 			req.NoError(err)
 
 			t.Cleanup(func() {
 				testInstance.Router.Stop()
 			})
 
-			params, nodeConfig := setupNeighbors(tt.neighbors)
+			params, nodeConfig := setupNeighbors(t, tt.neighbors)
 
 			// setup initial neighbors
 			neighborReconciler := NewNeighborReconciler(params).Reconciler
+			neighborReconciler.Init(testInstance)
+			defer neighborReconciler.Cleanup(testInstance)
 			reconcileParams := ReconcileParams{
 				BGPInstance:   testInstance,
 				DesiredConfig: nodeConfig,
+				CiliumNode: &v2.CiliumNode{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "bgp-node",
+					},
+				},
 			}
 			err = neighborReconciler.Reconcile(context.Background(), reconcileParams)
 			req.NoError(err)
@@ -242,11 +259,18 @@ func TestNeighborReconciler(t *testing.T) {
 			validatePeers(req, tt.neighbors, getRunningPeers(req, testInstance), tt.checks)
 
 			// update neighbors
-			params, nodeConfig = setupNeighbors(tt.newNeighbors)
-			neighborReconciler = NewNeighborReconciler(params).Reconciler
+
+			params, nodeConfig = setupNeighbors(t, tt.newNeighbors)
+			neighborReconciler.(*NeighborReconciler).PeerConfig = params.PeerConfig
+			neighborReconciler.(*NeighborReconciler).SecretStore = params.SecretStore
 			reconcileParams = ReconcileParams{
 				BGPInstance:   testInstance,
 				DesiredConfig: nodeConfig,
+				CiliumNode: &v2.CiliumNode{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "bgp-node",
+					},
+				},
 			}
 			err = neighborReconciler.Reconcile(context.Background(), reconcileParams)
 			req.NoError(err)
@@ -257,16 +281,16 @@ func TestNeighborReconciler(t *testing.T) {
 	}
 }
 
-func setupNeighbors(peers []PeerData) (NeighborReconcilerIn, *v2alpha1.CiliumBGPNodeInstance) {
+func setupNeighbors(t *testing.T, peers []PeerData) (NeighborReconcilerIn, *v2.CiliumBGPNodeInstance) {
 	// Desired BGP Node config
-	nodeConfig := &v2alpha1.CiliumBGPNodeInstance{
+	nodeConfig := &v2.CiliumBGPNodeInstance{
 		Name: "bgp-node",
 	}
 
 	// setup fake store for peer config
-	var objects []*v2alpha1.CiliumBGPPeerConfig
+	var objects []*v2.CiliumBGPPeerConfig
 	for _, p := range peers {
-		obj := &v2alpha1.CiliumBGPPeerConfig{
+		obj := &v2.CiliumBGPPeerConfig{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: p.Peer.PeerConfigRef.Name,
 			},
@@ -275,7 +299,7 @@ func setupNeighbors(peers []PeerData) (NeighborReconcilerIn, *v2alpha1.CiliumBGP
 		objects = append(objects, obj)
 		nodeConfig.Peers = append(nodeConfig.Peers, *p.Peer)
 	}
-	peerConfigStore := store.InitMockStore[*v2alpha1.CiliumBGPPeerConfig](objects)
+	peerConfigStore := store.InitMockStore[*v2.CiliumBGPPeerConfig](objects)
 
 	// setup secret store
 	secrets := make(map[string][]byte)
@@ -297,7 +321,7 @@ func setupNeighbors(peers []PeerData) (NeighborReconcilerIn, *v2alpha1.CiliumBGP
 	secretStore := store.InitMockStore[*slim_corev1.Secret](secretObjs)
 
 	return NeighborReconcilerIn{
-		Logger:       logrus.WithField("unit_test", "neighbors"),
+		Logger:       hivetest.Logger(t),
 		SecretStore:  secretStore,
 		PeerConfig:   peerConfigStore,
 		DaemonConfig: &option.DaemonConfig{BGPSecretsNamespace: "bgp-secrets"},
@@ -350,21 +374,21 @@ func getRunningPeers(req *require.Assertions, instance *instance.BGPInstance) []
 
 	var runningPeers []PeerData
 	for _, peer := range getPeerResp.Peers {
-		peerObj := &v2alpha1.CiliumBGPNodePeer{
+		peerObj := &v2.CiliumBGPNodePeer{
 			PeerAddress: ptr.To[string](peer.PeerAddress),
 			PeerASN:     ptr.To[int64](peer.PeerAsn),
 		}
 
-		peerConfObj := &v2alpha1.CiliumBGPPeerConfigSpec{
-			Transport: &v2alpha1.CiliumBGPTransport{
+		peerConfObj := &v2.CiliumBGPPeerConfigSpec{
+			Transport: &v2.CiliumBGPTransport{
 				PeerPort: ptr.To[int32](int32(peer.PeerPort)),
 			},
-			Timers: &v2alpha1.CiliumBGPTimers{
+			Timers: &v2.CiliumBGPTimers{
 				ConnectRetryTimeSeconds: ptr.To[int32](int32(peer.ConnectRetryTimeSeconds)),
 				HoldTimeSeconds:         ptr.To[int32](int32(peer.ConfiguredHoldTimeSeconds)),
 				KeepAliveTimeSeconds:    ptr.To[int32](int32(peer.ConfiguredKeepAliveTimeSeconds)),
 			},
-			GracefulRestart: &v2alpha1.CiliumBGPNeighborGracefulRestart{
+			GracefulRestart: &v2.CiliumBGPNeighborGracefulRestart{
 				Enabled:            peer.GracefulRestart.Enabled,
 				RestartTimeSeconds: ptr.To[int32](int32(peer.GracefulRestart.RestartTimeSeconds)),
 			},

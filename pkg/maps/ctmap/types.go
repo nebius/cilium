@@ -4,9 +4,12 @@
 package ctmap
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"unsafe"
+
+	"github.com/cilium/stream"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/byteorder"
@@ -148,21 +151,6 @@ func (m mapType) maxEntries() int {
 	case mapTypeIPv4TCPLocal, mapTypeIPv6TCPLocal, mapTypeIPv4AnyLocal, mapTypeIPv6AnyLocal:
 		return mapNumEntriesLocal
 
-	default:
-		panic("Unexpected map type " + m.String())
-	}
-}
-
-func (m mapType) bpfDefine() string {
-	switch m {
-	case mapTypeIPv4TCPLocal, mapTypeIPv4TCPGlobal:
-		return "CT_MAP_TCP4"
-	case mapTypeIPv6TCPLocal, mapTypeIPv6TCPGlobal:
-		return "CT_MAP_TCP6"
-	case mapTypeIPv4AnyLocal, mapTypeIPv4AnyGlobal:
-		return "CT_MAP_ANY4"
-	case mapTypeIPv6AnyLocal, mapTypeIPv6AnyGlobal:
-		return "CT_MAP_ANY6"
 	default:
 		panic("Unexpected map type " + m.String())
 	}
@@ -627,7 +615,7 @@ func (c *CtEntry) StringWithTimeDiff(toRemSecs func(uint32) string) string {
 		timeDiff = ""
 	}
 
-	return fmt.Sprintf("expires=%d%s Packets=%d Bytes=%d RxFlagsSeen=%#02x LastRxReport=%d TxFlagsSeen=%#02x LastTxReport=%d %s RevNAT=%d SourceSecurityID=%d IfIndex=%d \n",
+	return fmt.Sprintf("expires=%d%s Packets=%d Bytes=%d RxFlagsSeen=%#02x LastRxReport=%d TxFlagsSeen=%#02x LastTxReport=%d %s RevNAT=%d SourceSecurityID=%d IfIndex=%d BackendID=%d \n",
 		c.Lifetime,
 		timeDiff,
 		c.Packets,
@@ -639,7 +627,8 @@ func (c *CtEntry) StringWithTimeDiff(toRemSecs func(uint32) string) string {
 		c.flagsString(),
 		byteorder.NetworkToHost16(c.RevNAT),
 		c.SourceSecurityID,
-		c.IfIndex)
+		c.IfIndex,
+		c.BackendID)
 }
 
 // String returns the readable format
@@ -648,3 +637,35 @@ func (c *CtEntry) String() string {
 }
 
 func (c *CtEntry) New() bpf.MapValue { return &CtEntry{} }
+
+type GCRunner interface {
+	// Enable enables the periodic execution of the connection tracking garbage collection.
+	Enable()
+
+	// Run runs the oneshot connection tracking garbage collection.
+	Run(m *Map, filter GCFilter) (int, error)
+
+	// Observe4 allows external consumers to observe ongoing GC iterations over CT maps for IPv4 entries.
+	Observe4() stream.Observable[GCEvent]
+
+	// Observe6 allows external consumers to observe ongoing GC iterations over CT maps for IPv6 entries.
+	Observe6() stream.Observable[GCEvent]
+}
+
+type fakeCTMapGC struct{}
+
+func NewFakeGCRunner() GCRunner { return fakeCTMapGC{} }
+
+func (fakeCTMapGC) Enable() {}
+
+func (g fakeCTMapGC) Run(m *Map, filter GCFilter) (int, error) {
+	return 0, nil
+}
+
+func (g fakeCTMapGC) Observe4() stream.Observable[GCEvent] {
+	return stream.FuncObservable[GCEvent](func(ctx context.Context, next func(event GCEvent), complete func(err error)) {})
+}
+
+func (g fakeCTMapGC) Observe6() stream.Observable[GCEvent] {
+	return stream.FuncObservable[GCEvent](func(ctx context.Context, next func(event GCEvent), complete func(err error)) {})
+}

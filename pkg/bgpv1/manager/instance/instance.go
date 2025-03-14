@@ -5,12 +5,12 @@ package instance
 
 import (
 	"context"
-
-	"github.com/sirupsen/logrus"
+	"log/slog"
 
 	"github.com/cilium/cilium/pkg/bgpv1/gobgp"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 )
 
 // ServerWithConfig is a container for providing interface with underlying router implementation
@@ -22,6 +22,9 @@ import (
 //
 // This is used in BGPv1 implementation.
 type ServerWithConfig struct {
+	// ASN is the local ASN number of the virtual router instance.
+	ASN uint32
+
 	// backed BgpServer configured in accordance to the accompanying
 	// CiliumBGPVirtualRouter configuration.
 	Server types.Router
@@ -31,7 +34,7 @@ type ServerWithConfig struct {
 	//
 	// If this field is nil it means the above BgpServer has had no
 	// configuration applied to it.
-	Config *v2alpha1api.CiliumBGPVirtualRouter
+	Config *v2alpha1.CiliumBGPVirtualRouter
 
 	// ReconcilerMetadata holds reconciler-specific metadata keyed by the reconciler name,
 	// opaque outside the respective reconciler.
@@ -46,12 +49,13 @@ type ServerWithConfig struct {
 //
 // Canceling the provided context will kill the BgpServer along with calling the
 // underlying BgpServer's Stop() method.
-func NewServerWithConfig(ctx context.Context, log *logrus.Entry, params types.ServerParameters) (*ServerWithConfig, error) {
+func NewServerWithConfig(ctx context.Context, log *slog.Logger, params types.ServerParameters) (*ServerWithConfig, error) {
 	s, err := gobgp.NewGoBGPServer(ctx, log, params)
 	if err != nil {
 		return nil, err
 	}
 	return &ServerWithConfig{
+		ASN:                params.Global.ASN,
 		Server:             s,
 		Config:             nil,
 		ReconcilerMetadata: make(map[string]any),
@@ -62,9 +66,11 @@ func NewServerWithConfig(ctx context.Context, log *logrus.Entry, params types.Se
 //
 // This is used in BGPv2 implementation.
 type BGPInstance struct {
-	Config   *v2alpha1api.CiliumBGPNodeInstance
-	Router   types.Router
-	Metadata map[string]any
+	Name      string
+	Global    types.BGPGlobal
+	CancelCtx context.CancelFunc
+	Config    *v2.CiliumBGPNodeInstance
+	Router    types.Router
 }
 
 // NewBGPInstance will start an underlying BGP instance utilizing types.ServerParameters
@@ -75,15 +81,19 @@ type BGPInstance struct {
 //
 // Canceling the provided context will kill the BGP instance along with calling the
 // underlying Router's Stop() method.
-func NewBGPInstance(ctx context.Context, log *logrus.Entry, params types.ServerParameters) (*BGPInstance, error) {
-	s, err := gobgp.NewGoBGPServer(ctx, log, params)
+func NewBGPInstance(ctx context.Context, log *slog.Logger, name string, params types.ServerParameters) (*BGPInstance, error) {
+	gobgpCtx, cancel := context.WithCancel(ctx)
+	s, err := gobgp.NewGoBGPServer(gobgpCtx, log, params)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	return &BGPInstance{
-		Config:   nil,
-		Router:   s,
-		Metadata: make(map[string]any),
+		Name:      name,
+		Global:    params.Global,
+		CancelCtx: cancel,
+		Config:    nil,
+		Router:    s,
 	}, nil
 }

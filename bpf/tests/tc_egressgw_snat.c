@@ -5,10 +5,6 @@
 
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
-#include "config_replacement.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV4
@@ -17,8 +13,6 @@
 #define ENABLE_MASQUERADE_IPV4
 #define ENCAP_IFINDEX		42
 #define SECONDARY_IFACE_IFINDEX	44
-
-#define SECCTX_FROM_IPCACHE 1
 
 #define ctx_redirect mock_ctx_redirect
 static __always_inline __maybe_unused int
@@ -31,6 +25,8 @@ mock_fib_lookup(void *ctx __maybe_unused, struct bpf_fib_lookup *params __maybe_
 		int plen __maybe_unused, __u32 flags __maybe_unused);
 
 #include "bpf_host.c"
+
+ASSIGN_CONFIG(__u32, host_secctx_from_ipcache, 1)
 
 #include "lib/egressgw.h"
 #include "lib/ipcache.h"
@@ -90,6 +86,7 @@ int egressgw_snat1_setup(struct __ctx_buff *ctx)
 				  GATEWAY_NODE_IP, EGRESS_IP);
 
 	/* Jump into the entrypoint */
+	ctx_egw_done_set(ctx);
 	tail_call_static(ctx, entry_call_map, TO_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
@@ -152,6 +149,7 @@ SETUP("tc", "tc_egressgw_snat2")
 int egressgw_snat2_setup(struct __ctx_buff *ctx)
 {
 	/* Jump into the entrypoint */
+	ctx_egw_done_set(ctx);
 	tail_call_static(ctx, entry_call_map, TO_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
@@ -164,6 +162,118 @@ int egressgw_snat2_check(struct __ctx_buff *ctx)
 			.test = TEST_SNAT2,
 			.packets = 1,
 			.status_code = CTX_ACT_OK
+		});
+
+	del_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0Xffffff, 24);
+
+	return ret;
+}
+
+/* Test that a packet matching an egress gateway policy on the to-netdev program
+ * gets correctly SNATed with the desired egress IP of the policy, event if the
+ * packet hits a stale NAT entry.
+ */
+PKTGEN("tc", "tc_egressgw_tuple_collision1")
+int egressgw_tuple_collision1_pktgen(struct __ctx_buff *ctx)
+{
+	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_SNAT_TUPLE_COLLISION,
+		});
+}
+
+SETUP("tc", "tc_egressgw_tuple_collision1")
+int egressgw_tuple_collision1_setup(struct __ctx_buff *ctx)
+{
+	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0xffffff, 24,
+				  GATEWAY_NODE_IP, EGRESS_IP);
+
+	/* Jump into the entrypoint */
+	ctx_egw_done_set(ctx);
+	tail_call_static(ctx, entry_call_map, TO_NETDEV);
+	/* Fail if we didn't jump */
+	return TEST_ERROR;
+}
+
+CHECK("tc", "tc_egressgw_tuple_collision1")
+int egressgw_tuple_collision1_check(const struct __ctx_buff *ctx)
+{
+	int ret = egressgw_snat_check(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_SNAT_TUPLE_COLLISION,
+			.packets = 1,
+			.status_code = CTX_ACT_OK
+		});
+
+	del_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0Xffffff, 24);
+
+	return ret;
+}
+
+PKTGEN("tc", "tc_egressgw_tuple_collision2")
+int egressgw_tuple_collision2_pktgen(struct __ctx_buff *ctx)
+{
+	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_SNAT_TUPLE_COLLISION,
+		});
+}
+
+SETUP("tc", "tc_egressgw_tuple_collision2")
+int egressgw_tuple_collision2_setup(struct __ctx_buff *ctx)
+{
+	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0xffffff, 24,
+				  GATEWAY_NODE_IP, EGRESS_IP3);
+
+	/* Jump into the entrypoint */
+	ctx_egw_done_set(ctx);
+	tail_call_static(ctx, entry_call_map, TO_NETDEV);
+	/* Fail if we didn't jump */
+	return TEST_ERROR;
+}
+
+CHECK("tc", "tc_egressgw_tuple_collision2")
+int egressgw_tuple_collision2_check(const struct __ctx_buff *ctx)
+{
+	return egressgw_snat_check(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_SNAT_TUPLE_COLLISION,
+			.tuple_collision = true,
+			.packets = 2,
+			.status_code = CTX_ACT_OK
+		});
+}
+
+/* Test that a packet matching an egress gateway policy on the from-netdev program
+ * gets correctly revSNATed and connection tracked, even if the packet hits a
+ * stale NAT entry.
+ */
+PKTGEN("tc", "tc_egressgw_tuple_collision2_reply")
+int egressgw_tuple_collision2_reply_pktgen(struct __ctx_buff *ctx)
+{
+	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_SNAT_TUPLE_COLLISION,
+			.tuple_collision = true,
+			.dir = CT_INGRESS,
+		});
+}
+
+SETUP("tc", "tc_egressgw_tuple_collision2_reply")
+int egressgw_tuple_collision2_reply_setup(struct __ctx_buff *ctx)
+{
+	/* install ipcache entry for the CLIENT_IP: */
+	ipcache_v4_add_entry(CLIENT_IP, 0, 0, CLIENT_NODE_IP, 0);
+
+	/* Jump into the entrypoint */
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
+	/* Fail if we didn't jump */
+	return TEST_ERROR;
+}
+
+CHECK("tc", "tc_egressgw_tuple_collision2_reply")
+int egressgw_tuple_collision2_reply_check(const struct __ctx_buff *ctx)
+{
+	int ret = egressgw_snat_check(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_SNAT_TUPLE_COLLISION,
+			.dir = CT_INGRESS,
+			.packets = 3,
+			.status_code = CTX_ACT_REDIRECT,
 		});
 
 	del_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0Xffffff, 24);
@@ -190,6 +300,7 @@ int egressgw_skip_excluded_cidr_snat_setup(struct __ctx_buff *ctx)
 	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP, 32, EGRESS_GATEWAY_EXCLUDED_CIDR, 0);
 
 	/* Jump into the entrypoint */
+	ctx_egw_done_set(ctx);
 	tail_call_static(ctx, entry_call_map, TO_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
@@ -224,6 +335,9 @@ int egressgw_skip_excluded_cidr_snat_check(const struct __ctx_buff *ctx)
 	l3 = (void *)l2 + sizeof(struct ethhdr);
 	if ((void *)l3 + sizeof(struct iphdr) > data_end)
 		test_fatal("l3 out of bounds");
+
+	if (l3->check != bpf_htons(0x4112))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
 	l4 = (void *)l3 + sizeof(struct iphdr);
 	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
@@ -266,6 +380,7 @@ int egressgw_fib_redirect_setup(struct __ctx_buff *ctx)
 				  GATEWAY_NODE_IP, EGRESS_IP2);
 
 	/* Jump into the entrypoint */
+	ctx_egw_done_set(ctx);
 	tail_call_static(ctx, entry_call_map, TO_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;

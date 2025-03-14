@@ -7,12 +7,12 @@ import (
 	"context"
 	"fmt"
 
+	gobgp "github.com/osrg/gobgp/v3/api"
+
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/time"
-
-	gobgp "github.com/osrg/gobgp/v3/api"
 )
 
 // GetBgp returns bgp global configuration from gobgp server
@@ -64,6 +64,10 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context) (types.GetPeerStateRespo
 		}
 
 		if peer.State != nil {
+			if peer.Conf.PeerAsn == 0 { // if peerAsn is not set, use peer state peerAsn
+				peerState.PeerAsn = int64(peer.State.PeerAsn)
+			}
+
 			peerState.SessionState = toAgentSessionState(peer.State.SessionState).String()
 
 			// Uptime is time since session got established.
@@ -83,7 +87,7 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context) (types.GetPeerStateRespo
 		if peer.EbgpMultihop != nil && peer.EbgpMultihop.Enabled {
 			peerState.EbgpMultihopTTL = int64(peer.EbgpMultihop.MultihopTtl)
 		} else {
-			peerState.EbgpMultihopTTL = int64(v2alpha1api.DefaultBGPEBGPMultihopTTL) // defaults to 1 if not enabled
+			peerState.EbgpMultihopTTL = int64(v2.DefaultBGPEBGPMultihopTTL) // defaults to 1 if not enabled
 		}
 
 		if peer.Timers != nil {

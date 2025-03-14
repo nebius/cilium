@@ -4,8 +4,8 @@
 package tunnel
 
 import (
-	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -15,7 +15,7 @@ var Cell = cell.Module(
 	"datapath-tunnel-config",
 	"Tunneling configurations",
 
-	cell.Config(userCfg{TunnelProtocol: defaults.TunnelProtocol}),
+	cell.Config(defaultConfig),
 
 	cell.Provide(
 		newConfig,
@@ -41,12 +41,6 @@ var Cell = cell.Module(
 				// See encap_geneve_dsr_opt[4,6] in nodeport.h
 				WithoutMTUAdaptation(),
 			)
-		},
-
-		// Enable tunnel configuration when High Scale IPCache is enabled (this is
-		// currently handled here, as the corresponding logic has not yet been modularized).
-		func(dcfg *option.DaemonConfig) EnablerOut {
-			return NewEnabler(dcfg.EnableHighScaleIPcache)
 		},
 	),
 )

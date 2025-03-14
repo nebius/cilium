@@ -7,51 +7,58 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
-	"github.com/cilium/cilium/pkg/statedb"
-	"github.com/cilium/cilium/pkg/statedb/reconciler"
 	"github.com/cilium/cilium/pkg/time"
 )
 
 func TestFullPath(t *testing.T) {
 	testCases := []struct {
-		name        string
+		name        []string
 		expected    string
 		expectedErr bool
 	}{
 		{
-			name:     "net.ipv4.ip_forward",
+			name:     []string{"net", "ipv4", "ip_forward"},
 			expected: "/proc/sys/net/ipv4/ip_forward",
 		},
 		{
-			name:     "net.ipv4.conf.all.forwarding",
+			name:     []string{"net", "ipv4", "conf", "all", "forwarding"},
 			expected: "/proc/sys/net/ipv4/conf/all/forwarding",
 		},
 		{
-			name:     "net.ipv6.conf.all.forwarding",
+			name:     []string{"net", "ipv6", "conf", "all", "forwarding"},
 			expected: "/proc/sys/net/ipv6/conf/all/forwarding",
 		},
 		{
-			name:     "foo.bar",
+			name:     []string{"net", "ipv6", "conf", "eth0.100", "forwarding"},
+			expected: "/proc/sys/net/ipv6/conf/eth0.100/forwarding",
+		},
+		{
+			name:     []string{"foo", "bar"},
 			expected: "/proc/sys/foo/bar",
 		},
 		{
-			name:        "double..dot",
+			name:        []string{"double", "", "dot"},
 			expectedErr: true,
 		},
 		{
-			name:        "invalid.char$",
+			name:        []string{"invalid", "char$"},
 			expectedErr: true,
+		},
+		{
+			name:     []string{"Foo", "Bar"},
+			expected: "/proc/sys/Foo/Bar",
 		},
 	}
 
@@ -61,7 +68,7 @@ func TestFullPath(t *testing.T) {
 			assert.Error(t, err)
 		} else {
 			assert.NoError(t, err)
-			assert.Equal(t, path, tc.expected)
+			assert.Equal(t, tc.expected, path)
 		}
 	}
 }
@@ -77,8 +84,6 @@ func TestWaitForReconciliation(t *testing.T) {
 	)
 
 	hive := hive.New(
-		statedb.Cell,
-
 		cell.Module(
 			"sysctl-test",
 			"sysctl-test",
@@ -97,54 +102,51 @@ func TestWaitForReconciliation(t *testing.T) {
 		),
 	)
 
-	assert.NoError(t, hive.Start(context.Background()))
+	tlog := hivetest.Logger(t)
+	assert.NoError(t, hive.Start(tlog, context.Background()))
 
 	time.MaxInternalTimerDelay = time.Millisecond
 	t.Cleanup(func() { time.MaxInternalTimerDelay = 0 })
 
 	sysctl := &reconcilingSysctl{db, settings, nil, ""}
-	sysctl.Enable(paramName)
+	sysctl.Enable([]string{paramName})
 
 	// waitForReconciliation should timeout
-	assert.Error(t, sysctl.waitForReconciliation(paramName))
+	assert.Error(t, sysctl.waitForReconciliation([]string{paramName}))
 
 	// fake a successful reconciliation
 	txn := db.WriteTxn(settings)
-	old, _, found := settings.First(txn, tables.SysctlNameIndex.Query(paramName))
-	_, exist, err := settings.Insert(txn, old.WithStatus(reconciler.StatusDone()))
+	old, _, found := settings.Get(txn, tables.SysctlNameIndex.Query(paramName))
+	_, exist, err := settings.Insert(txn, old.Clone().SetStatus(reconciler.StatusDone()))
 	txn.Commit()
 
 	assert.True(t, found)
-	assert.Equal(t, old.Status.Kind, reconciler.StatusKindPending)
+	assert.Equal(t, reconciler.StatusKindPending, old.Status.Kind)
 	assert.True(t, exist)
 	assert.NoError(t, err)
 
 	// waitForReconciliation should return without error
-	assert.NoError(t, sysctl.waitForReconciliation(paramName))
+	assert.NoError(t, sysctl.waitForReconciliation([]string{paramName}))
 
-	assert.NoError(t, hive.Stop(context.Background()))
+	assert.NoError(t, hive.Stop(tlog, context.Background()))
 }
 
 func TestSysctl(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
-	settings := []string{
-		"net.ipv4.ip_forward",
-		"net.ipv4.conf.all.forwarding",
-		"net.ipv6.conf.all.forwarding",
+	settings := [][]string{
+		{"net", "ipv4", "ip_forward"},
+		{"net", "ipv4", "conf", "all", "forwarding"},
+		{"net", "ipv6", "conf", "all", "forwarding"},
 	}
 
 	var sysctl Sysctl
 
 	hive := hive.New(
-		statedb.Cell,
-		job.Cell,
-		reconciler.Cell,
-
 		cell.Module(
 			"sysctl-test",
 			"sysctl-test",
-			cell.Config(Config{}),
+			cell.Config(defaultConfig),
 
 			cell.Provide(
 				func() afero.Fs {
@@ -154,11 +156,9 @@ func TestSysctl(t *testing.T) {
 			cell.Provide(
 				newReconcilingSysctl,
 				tables.NewSysctlTable,
-				reconciler.New[*tables.Sysctl],
-				newReconcilerConfig,
+				newReconciler,
 				newOps,
 			),
-			cell.Invoke(reconciler.Register[*tables.Sysctl]),
 		),
 
 		cell.Invoke(func(s Sysctl) {
@@ -184,7 +184,8 @@ func TestSysctl(t *testing.T) {
 		}),
 	)
 
-	assert.NoError(t, hive.Start(context.Background()))
+	tlog := hivetest.Logger(t)
+	assert.NoError(t, hive.Start(tlog, context.Background()))
 
 	for _, s := range settings {
 		assert.NoError(t, sysctl.Write(s, "1"))
@@ -227,28 +228,24 @@ func TestSysctl(t *testing.T) {
 	for _, s := range batch {
 		val, err := sysctl.Read(s.Name)
 		assert.NoError(t, err)
-		assert.Equal(t, s.Val, val, "unexpected value for parameter %q", s)
+		assert.Equal(t, s.Val, val, "unexpected value %q for parameter %q", val, s.Name)
 	}
 
-	assert.NoError(t, hive.Stop(context.Background()))
+	assert.NoError(t, hive.Stop(tlog, context.Background()))
 }
 
 func TestSysctlIgnoreErr(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
-	parameter := tables.Sysctl{Name: "net.core.bpf_jit_enable", Val: "1", IgnoreErr: true}
+	parameter := tables.Sysctl{Name: []string{"net", "core", "bpf_jit_enable"}, Val: "1", IgnoreErr: true}
 
 	var sysctl Sysctl
 
 	hive := hive.New(
-		statedb.Cell,
-		job.Cell,
-		reconciler.Cell,
-
 		cell.Module(
 			"sysctl-test",
 			"sysctl-test",
-			cell.Config(Config{}),
+			cell.Config(defaultConfig),
 
 			cell.Provide(
 				func() afero.Fs {
@@ -258,11 +255,9 @@ func TestSysctlIgnoreErr(t *testing.T) {
 			cell.Provide(
 				newReconcilingSysctl,
 				tables.NewSysctlTable,
-				reconciler.New[*tables.Sysctl],
-				newReconcilerConfig,
+				newReconciler,
 				newOps,
 			),
-			cell.Invoke(reconciler.Register[*tables.Sysctl]),
 		),
 
 		cell.Invoke(func(s Sysctl) {
@@ -270,15 +265,15 @@ func TestSysctlIgnoreErr(t *testing.T) {
 		}),
 	)
 
-	assert.NoError(t, hive.Start(context.Background()))
+	tlog := hivetest.Logger(t)
+	assert.NoError(t, hive.Start(tlog, context.Background()))
 
 	// should not return an error since the parameter is marked as IgnoreErr
 	assert.NoError(t, sysctl.ApplySettings([]tables.Sysctl{parameter}))
 
-	assert.NoError(t, hive.Stop(context.Background()))
+	assert.NoError(t, hive.Stop(tlog, context.Background()))
 }
 
-func sysctlToPath(name string) string {
-	elems := strings.Split(name, ".")
-	return filepath.Join(append([]string{"/proc", "sys"}, elems...)...)
+func sysctlToPath(name []string) string {
+	return filepath.Join(append([]string{"/proc", "sys"}, name...)...)
 }

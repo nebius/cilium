@@ -27,8 +27,6 @@ int cil_from_network(struct __ctx_buff *ctx)
 
 	bpf_clear_meta(ctx);
 
-	barrier_data(ctx);  /* clang-10 workaround */
-
 	/* This program should be attached to the tc-ingress of
 	 * the network-facing device. Thus, as far as Cilium
 	 * knows, no one touches to the ctx->mark before this
@@ -84,12 +82,12 @@ int cil_from_network(struct __ctx_buff *ctx)
 #endif
 
 out:
-	send_trace_notify(ctx, obs_point_from, 0, 0, 0,
-			  ingress_ifindex,
+	send_trace_notify(ctx, obs_point_from, UNKNOWN_ID, UNKNOWN_ID,
+			  TRACE_EP_ID_UNKNOWN, ingress_ifindex,
 			  trace.reason, trace.monitor);
 
-	send_trace_notify(ctx, obs_point_to, 0, 0, 0,
-			  ingress_ifindex,
+	send_trace_notify(ctx, obs_point_to, UNKNOWN_ID, UNKNOWN_ID,
+			  TRACE_EP_ID_UNKNOWN, ingress_ifindex,
 			  trace.reason, trace.monitor);
 
 	return ret;

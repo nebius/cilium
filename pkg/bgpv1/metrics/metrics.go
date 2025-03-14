@@ -5,27 +5,19 @@ package metrics
 
 import (
 	"context"
+	"log/slog"
 	"net/netip"
 	"strconv"
 
+	"github.com/cilium/hive/cell"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/bgpv1/agent"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
-)
-
-const (
-	LabelVRouter  = "vrouter"
-	LabelNeighbor = "neighbor"
-	LabelAfi      = "afi"
-	LabelSafi     = "safi"
-
-	metricsSubsystem = "bgp_control_plane"
 )
 
 type collector struct {
@@ -39,15 +31,15 @@ type collector struct {
 type collectorIn struct {
 	cell.In
 
-	Logger        logrus.FieldLogger
+	Logger        *slog.Logger
 	DaemonConfig  *option.DaemonConfig
 	Registry      *metrics.Registry
 	RouterManager agent.BGPRouterManager
 }
 
 // RegisterCollector registers the BGP Control Plane metrics collector to the
-// global prometheus registry. We don't rely on the cell.Metric because the
-// collectors we can provide through cell.Metric needs to implement
+// global prometheus registry. We don't rely on the metrics.Metric because the
+// collectors we can provide through metrics.Metric needs to implement
 // prometheus.Collector per metric which is not optimal in our case. We can
 // retrieve the multiple metrics from the single call to
 // RouterManager.GetPeers() and it is wasteful to call the same function
@@ -60,19 +52,19 @@ func RegisterCollector(in collectorIn) {
 	}
 	in.Registry.MustRegister(&collector{
 		SessionState: prometheus.NewDesc(
-			prometheus.BuildFQName(metrics.Namespace, metricsSubsystem, "session_state"),
+			prometheus.BuildFQName(metrics.Namespace, types.MetricsSubsystem, "session_state"),
 			"Current state of the BGP session with the peer, Up = 1 or Down = 0",
-			[]string{LabelVRouter, LabelNeighbor}, nil,
+			[]string{types.LabelVRouter, types.LabelNeighbor, types.LabelNeighborAsn}, nil,
 		),
 		TotalAdvertisedRoutes: prometheus.NewDesc(
-			prometheus.BuildFQName(metrics.Namespace, metricsSubsystem, "advertised_routes"),
+			prometheus.BuildFQName(metrics.Namespace, types.MetricsSubsystem, "advertised_routes"),
 			"Number of routes advertised to the peer",
-			[]string{LabelVRouter, LabelNeighbor, LabelAfi, LabelSafi}, nil,
+			[]string{types.LabelVRouter, types.LabelNeighbor, types.LabelNeighborAsn, types.LabelAfi, types.LabelSafi}, nil,
 		),
 		TotalReceivedRoutes: prometheus.NewDesc(
-			prometheus.BuildFQName(metrics.Namespace, metricsSubsystem, "received_routes"),
+			prometheus.BuildFQName(metrics.Namespace, types.MetricsSubsystem, "received_routes"),
 			"Number of routes received from the peer",
-			[]string{LabelVRouter, LabelNeighbor, LabelAfi, LabelSafi}, nil,
+			[]string{types.LabelVRouter, types.LabelNeighbor, types.LabelNeighborAsn, types.LabelAfi, types.LabelSafi}, nil,
 		),
 		in: in,
 	})
@@ -94,7 +86,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	peers, err := c.in.RouterManager.GetPeers(ctx)
 	cancel()
 	if err != nil {
-		c.in.Logger.WithError(err).Error("Failed to retrieve BGP peer information. Metrics is not collected.")
+		c.in.Logger.Error("Failed to retrieve BGP peer information. Metrics is not collected.", logfields.Error, err)
 		return
 	}
 
@@ -111,6 +103,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		neighborLabel := netip.AddrPortFrom(addr, uint16(peer.PeerPort)).String()
+		neighborAsnLabel := strconv.FormatInt(peer.PeerAsn, 10)
 
 		// Collect session state metrics
 		var up float64
@@ -125,6 +118,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 			up,
 			vrouterLabel,
 			neighborLabel,
+			neighborAsnLabel,
 		)
 
 		// Collect route metrics per address family
@@ -138,6 +132,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 				float64(family.Advertised),
 				vrouterLabel,
 				neighborLabel,
+				neighborAsnLabel,
 				family.Afi,
 				family.Safi,
 			)
@@ -147,6 +142,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 				float64(family.Received),
 				vrouterLabel,
 				neighborLabel,
+				neighborAsnLabel,
 				family.Afi,
 				family.Safi,
 			)

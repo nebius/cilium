@@ -5,11 +5,10 @@ package secretsync
 
 import (
 	"fmt"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
 	ctrlRuntime "sigs.k8s.io/controller-runtime"
-
-	"github.com/cilium/cilium/pkg/hive/cell"
 )
 
 // Cell manages K8s Secret synchronization from application namespaces
@@ -36,7 +35,7 @@ var Cell = cell.Module(
 type secretSyncParams struct {
 	cell.In
 
-	Logger    logrus.FieldLogger
+	Logger    *slog.Logger
 	Lifecycle cell.Lifecycle
 
 	CtrlRuntimeManager ctrlRuntime.Manager

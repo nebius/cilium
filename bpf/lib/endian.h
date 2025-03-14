@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_ENDIAN_H_
-#define __LIB_ENDIAN_H_
+#pragma once
 
-#include <bpf/ctx/ctx.h>
 #include <bpf/api.h>
+#include <bpf/types_mapper.h>
 
 #define ___bpf_mvb(x, b, n, m) ((__u##b)(x) << (b-(n+1)*8) >> (b-8) << (m*8))
 
@@ -78,5 +77,3 @@
 #define bpf_be64_to_cpu(x)			\
 	(__builtin_constant_p(x) ?		\
 	 __bpf_constant_be64_to_cpu(x) : __bpf_be64_to_cpu(x))
-
-#endif /* __LIB_ENDIAN_H_ */

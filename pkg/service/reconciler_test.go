@@ -10,16 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/statedb"
+	"github.com/cilium/cilium/pkg/source"
 )
 
 type mockSyncNodePort struct {
@@ -53,12 +54,11 @@ func TestServiceReconciler(t *testing.T) {
 	)
 
 	h := hive.New(
-		job.Cell,
-		statedb.Cell,
 		cell.Module("test", "test",
 			cell.Provide(
 				tables.NewNodeAddressTable,
 				statedb.RWTable[tables.NodeAddress].ToTable,
+				source.NewSources,
 			),
 			cell.Invoke(statedb.RegisterTable[tables.NodeAddress]),
 			cell.Provide(func() syncNodePort { return mock }),
@@ -70,7 +70,8 @@ func TestServiceReconciler(t *testing.T) {
 		),
 	)
 
-	require.NoError(t, h.Start(context.TODO()), "Start")
+	tlog := hivetest.Logger(t)
+	require.NoError(t, h.Start(tlog, context.TODO()), "Start")
 
 	mock.Lock()
 	mock.errToReturn = errors.New("fail")
@@ -106,6 +107,6 @@ func TestServiceReconciler(t *testing.T) {
 			return mock.success
 		}, time.Second, 10*time.Millisecond)
 
-	require.NoError(t, h.Stop(context.TODO()), "Stop")
+	require.NoError(t, h.Stop(tlog, context.TODO()), "Stop")
 
 }

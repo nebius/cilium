@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cilium/statedb"
 	"github.com/spf13/cobra"
 
 	"github.com/cilium/cilium/api/v1/client/daemon"
@@ -18,9 +19,8 @@ import (
 	"github.com/cilium/cilium/pkg/command"
 	healthPkg "github.com/cilium/cilium/pkg/health/client"
 	"github.com/cilium/cilium/pkg/health/defaults"
-	"github.com/cilium/cilium/pkg/healthv2"
-	healthTypes "github.com/cilium/cilium/pkg/healthv2/types"
-	"github.com/cilium/cilium/pkg/statedb"
+	"github.com/cilium/cilium/pkg/hive/health"
+	"github.com/cilium/cilium/pkg/hive/health/types"
 )
 
 // statusCmd represents the daemon_status command
@@ -33,11 +33,13 @@ var statusCmd = &cobra.Command{
 }
 
 var (
-	statusDetails pkg.StatusDetails
-	allHealth     bool
-	brief         bool
-	timeout       time.Duration
-	healthLines   = 10
+	statusDetails          pkg.StatusDetails
+	allHealth              bool
+	brief                  bool
+	requireK8sConnectivity bool
+	timeout                time.Duration
+	healthLines            = 10
+	allNodes               = false
 )
 
 func init() {
@@ -49,6 +51,7 @@ func init() {
 	statusCmd.Flags().BoolVar(&statusDetails.AllClusters, "all-clusters", false, "Show all clusters")
 	statusCmd.Flags().BoolVar(&allHealth, "all-health", false, "Show all health status, not just failing")
 	statusCmd.Flags().BoolVar(&brief, "brief", false, "Only print a one-line status message")
+	statusCmd.Flags().BoolVar(&requireK8sConnectivity, "require-k8s-connectivity", true, "If true, when the cilium-agent cannot access the Kubernetes control plane, this status command returns a non-zero exit status.")
 	statusCmd.Flags().BoolVar(&verbose, "verbose", false, "Equivalent to --all-addresses --all-controllers --all-nodes --all-redirects --all-clusters --all-health")
 	statusCmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "Sets the timeout to use when querying for health")
 	command.AddOutputOption(statusCmd)
@@ -71,8 +74,15 @@ func statusDaemon() {
 	if allHealth {
 		healthLines = 0
 	}
+
+	if statusDetails.AllNodes {
+		allNodes = true
+		healthLines = 0
+	}
+
 	params := daemon.NewGetHealthzParamsWithTimeout(timeout)
 	params.SetBrief(&brief)
+	params.SetRequireK8sConnectivity(&requireK8sConnectivity)
 	if resp, err := client.Daemon.GetHealthz(params); err != nil {
 		if brief {
 			fmt.Fprintf(os.Stderr, "%s\n", "cilium: daemon unreachable")
@@ -108,26 +118,14 @@ func statusDaemon() {
 			}
 		}
 		if healthEnabled {
-			table := statedb.NewRemoteTable[healthTypes.Status](client, "health")
-			ss := []healthTypes.Status{}
-			iter, errChan := table.LowerBound(context.Background(), healthv2.PrimaryIndex.Query("agent"))
-
-			if iter != nil {
-				err := statedb.ProcessEach[healthTypes.Status](
-					iter,
-					func(obj healthTypes.Status, rev statedb.Revision) error {
-						ss = append(ss, obj)
-						return nil
-					})
-				if err != nil {
-					return
-				}
-			}
+			table := newRemoteTable[types.Status]("health")
+			iter, errChan := table.LowerBound(context.Background(), health.PrimaryIndex.Query("agent"))
+			ss := statedb.Collect(iter)
 			if err := <-errChan; err != nil {
 				Fatalf("Failed while streaming remote health data table: %s", err)
 			}
 
-			healthPkg.GetAndFormatHealthStatus(w, true, allHealth, healthLines)
+			healthPkg.GetAndFormatHealthStatus(w, allNodes, verbose, healthLines)
 			healthPkg.GetAndFormatModulesHealth(w, ss, allHealth)
 		} else {
 			fmt.Fprint(w, "Cluster health:\t\tProbe disabled\n")

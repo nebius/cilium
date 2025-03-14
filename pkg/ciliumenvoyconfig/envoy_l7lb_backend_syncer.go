@@ -6,11 +6,11 @@ package ciliumenvoyconfig
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	envoy_config_core "github.com/cilium/proxy/go/envoy/config/core/v3"
 	envoy_config_endpoint "github.com/cilium/proxy/go/envoy/config/endpoint/v3"
-	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -24,7 +24,7 @@ const anyPort = "*"
 
 // envoyServiceBackendSyncer syncs the backends of a Service as Endpoints to the Envoy L7 proxy.
 type envoyServiceBackendSyncer struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
 
 	envoyXdsServer envoy.XDSServer
 
@@ -38,7 +38,7 @@ func (*envoyServiceBackendSyncer) ProxyName() string {
 	return "Envoy"
 }
 
-func newEnvoyServiceBackendSyncer(logger logrus.FieldLogger, envoyXdsServer envoy.XDSServer) *envoyServiceBackendSyncer {
+func newEnvoyServiceBackendSyncer(logger *slog.Logger, envoyXdsServer envoy.XDSServer) *envoyServiceBackendSyncer {
 	return &envoyServiceBackendSyncer{
 		logger:         logger,
 		envoyXdsServer: envoyXdsServer,
@@ -49,22 +49,22 @@ func newEnvoyServiceBackendSyncer(logger logrus.FieldLogger, envoyXdsServer envo
 func (r *envoyServiceBackendSyncer) Sync(svc *loadbalancer.SVC) error {
 	r.l7lbSvcsMutex.RLock()
 	l7lbInfo, exists := r.l7lbSvcs[svc.Name]
-	r.l7lbSvcsMutex.RUnlock()
-
 	if !exists {
+		r.l7lbSvcsMutex.RUnlock()
 		return nil
 	}
+	frontendPorts := l7lbInfo.GetAllFrontendPorts()
+	r.l7lbSvcsMutex.RUnlock()
 
 	// Filter backend based on list of port numbers, then upsert backends
 	// as Envoy endpoints
-	be := filterServiceBackends(svc, l7lbInfo.GetAllFrontendPorts())
+	be := filterServiceBackends(svc, frontendPorts)
 
-	r.logger.
-		WithField("filteredBackends", be).
-		WithField(logfields.L7LBFrontendPorts, l7lbInfo.GetAllFrontendPorts()).
-		WithField(logfields.ServiceNamespace, svc.Name.Namespace).
-		WithField(logfields.ServiceName, svc.Name.Name).
-		Debug("Upsert envoy endpoints")
+	r.logger.Debug("Upsert envoy endpoints",
+		logfields.L7LBFrontendPorts, frontendPorts,
+		logfields.ServiceNamespace, svc.Name.Namespace,
+		logfields.ServiceName, svc.Name.Name,
+	)
 	if err := r.upsertEnvoyEndpoints(svc.Name, be); err != nil {
 		return fmt.Errorf("failed to update backends in Envoy: %w", err)
 	}
@@ -134,8 +134,10 @@ func getEndpointsForLBBackends(serviceName loadbalancer.ServiceName, backendMap 
 	for port, bes := range backendMap {
 		var lbEndpoints []*envoy_config_endpoint.LbEndpoint
 		for _, be := range bes {
-			if be.Protocol != loadbalancer.TCP {
-				// Only TCP services supported with Envoy for now
+			// The below is to make sure that UDP and SCTP are not allowed instead of comparing with lb.TCP
+			// The reason is to avoid extra dependencies with ongoing work to differentiate protocols in datapath,
+			// which might add more values such as lb.Any, lb.None, etc.
+			if be.Protocol == loadbalancer.UDP || be.Protocol == loadbalancer.SCTP {
 				continue
 			}
 
@@ -199,12 +201,11 @@ func filterServiceBackends(svc *loadbalancer.SVC, onlyPorts []string) map[string
 	for _, port := range onlyPorts {
 		// check for port number
 		if port == strconv.Itoa(int(svc.Frontend.Port)) {
-			return map[string][]*loadbalancer.Backend{
-				port: preferredBackends,
-			}
+			res[port] = preferredBackends
 		}
 
-		// check for either named port
+		// Continue checking for either named port as the same service
+		// can be used with multiple port types together
 		for _, backend := range preferredBackends {
 			if port == backend.FEPortName {
 				res[port] = append(res[port], backend)
@@ -218,9 +219,9 @@ func filterServiceBackends(svc *loadbalancer.SVC, onlyPorts []string) map[string
 // filterPreferredBackends returns the slice of backends which are preferred for the given service.
 // If there is no preferred backend, it returns the slice of all backends.
 func filterPreferredBackends(backends []*loadbalancer.Backend) []*loadbalancer.Backend {
-	res := []*loadbalancer.Backend{}
+	var res []*loadbalancer.Backend
 	for _, backend := range backends {
-		if backend.Preferred == loadbalancer.Preferred(true) {
+		if backend.Preferred {
 			res = append(res, backend)
 		}
 	}
@@ -233,7 +234,7 @@ func filterPreferredBackends(backends []*loadbalancer.Backend) []*loadbalancer.B
 
 type backendSyncInfo struct {
 	// Names of the L7 LB resources (e.g. CEC) that need this service's backends to be
-	// synced to to an L7 Loadbalancer.
+	// synced to an L7 Loadbalancer.
 	backendRefs map[service.L7LBResourceName]backendSyncCECInfo
 }
 

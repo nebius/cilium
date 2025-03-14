@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_L3_H_
-#define __LIB_L3_H_
+#pragma once
 
 #include "common.h"
+#include "maps.h"
 #include "ipv6.h"
 #include "ipv4.h"
 #include "eps.h"
@@ -13,17 +13,7 @@
 #include "l4.h"
 #include "icmp6.h"
 #include "csum.h"
-
-/*
- * When the host routing is enabled we need to check policies at source, as in
- * this case the skb is delivered directly to pod's namespace and the ingress
- * policy (the cil_to_container BPF program) is bypassed.
- */
-#if defined(ENABLE_ENDPOINT_ROUTES) && defined(ENABLE_HOST_ROUTING)
-#  ifndef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
-#  define FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
-#  endif
-#endif
+#include "token_bucket.h"
 
 #ifdef ENABLE_IPV6
 static __always_inline int ipv6_l3(struct __ctx_buff *ctx, int l3_off,
@@ -75,7 +65,7 @@ l3_local_delivery(struct __ctx_buff *ctx, __u32 seclabel,
 		  __u32 magic __maybe_unused,
 		  const struct endpoint_info *ep __maybe_unused,
 		  __u8 direction __maybe_unused,
-		  bool from_host __maybe_unused, bool hairpin_flow __maybe_unused,
+		  bool from_host __maybe_unused,
 		  bool from_tunnel __maybe_unused, __u32 cluster_id __maybe_unused)
 {
 #ifdef LOCAL_DELIVERY_METRICS
@@ -87,8 +77,24 @@ l3_local_delivery(struct __ctx_buff *ctx, __u32 seclabel,
 	update_metrics(ctx_full_len(ctx), direction, REASON_FORWARDED);
 #endif
 
+	if (direction == METRIC_INGRESS && !from_host) {
+		/*
+		 * Traffic from nodes, local endpoints, or hairpin connections is ignored
+		 */
+		int ret;
+
+		ret = accept(ctx, ep->lxc_id);
+		if (IS_ERR(ret))
+			return ret;
+	}
+
+/*
+ * When BPF host routing is enabled we need to check policies at source, as in
+ * this case the skb is delivered directly to pod's namespace and the ingress
+ * policy (the cil_to_container BPF program) is bypassed.
+ */
 #if defined(USE_BPF_PROG_FOR_INGRESS_POLICY) && \
-	!defined(FORCE_LOCAL_POLICY_EVAL_AT_SOURCE)
+    !defined(ENABLE_HOST_ROUTING)
 	set_identity_mark(ctx, seclabel, magic);
 
 # if !defined(ENABLE_NODEPORT)
@@ -107,25 +113,15 @@ l3_local_delivery(struct __ctx_buff *ctx, __u32 seclabel,
 
 	return redirect_ep(ctx, ep->ifindex, from_host, from_tunnel);
 #else
-# ifndef DISABLE_LOOPBACK_LB
-	/* Skip ingress policy enforcement for hairpin traffic. As the hairpin
-	 * traffic is destined to a local pod (more specifically, the same pod
-	 * the traffic originated from) we skip the tail call for ingress policy
-	 * enforcement, and directly redirect it to the endpoint.
-	 */
-	if (unlikely(hairpin_flow))
-		return redirect_ep(ctx, ep->ifindex, from_host, from_tunnel);
-# endif /* DISABLE_LOOPBACK_LB */
 
 	/* Jumps to destination pod's BPF program to enforce ingress policies. */
 	ctx_store_meta(ctx, CB_SRC_LABEL, seclabel);
-	ctx_store_meta(ctx, CB_IFINDEX, ep->ifindex);
+	ctx_store_meta(ctx, CB_DELIVERY_REDIRECT, 1);
 	ctx_store_meta(ctx, CB_FROM_HOST, from_host ? 1 : 0);
 	ctx_store_meta(ctx, CB_FROM_TUNNEL, from_tunnel ? 1 : 0);
 	ctx_store_meta(ctx, CB_CLUSTER_ID_INGRESS, cluster_id);
 
-	tail_call_dynamic(ctx, &POLICY_CALL_MAP, ep->lxc_id);
-	return DROP_MISSED_TAIL_CALL;
+	return tail_call_policy(ctx, ep->lxc_id);
 #endif
 }
 
@@ -152,7 +148,7 @@ static __always_inline int ipv6_local_delivery(struct __ctx_buff *ctx, int l3_of
 		return ret;
 
 	return l3_local_delivery(ctx, seclabel, magic, ep, direction, from_host,
-				 false, from_tunnel, 0);
+				 from_tunnel, 0);
 }
 #endif /* ENABLE_IPV6 */
 
@@ -166,8 +162,7 @@ static __always_inline int ipv4_local_delivery(struct __ctx_buff *ctx, int l3_of
 					       struct iphdr *ip4,
 					       const struct endpoint_info *ep,
 					       __u8 direction, bool from_host,
-					       bool hairpin_flow, bool from_tunnel,
-					       __u32 cluster_id)
+					       bool from_tunnel, __u32 cluster_id)
 {
 	mac_t router_mac = ep->node_mac;
 	mac_t lxc_mac = ep->mac;
@@ -180,8 +175,6 @@ static __always_inline int ipv4_local_delivery(struct __ctx_buff *ctx, int l3_of
 		return ret;
 
 	return l3_local_delivery(ctx, seclabel, magic, ep, direction, from_host,
-				 hairpin_flow, from_tunnel, cluster_id);
+				 from_tunnel, cluster_id);
 }
 #endif /* SKIP_POLICY_MAP */
-
-#endif

@@ -304,15 +304,6 @@ func TestExecuteHeaderProbes(t *testing.T) {
 	}
 }
 
-func TestOuterSourceIPProbe(t *testing.T) {
-	testutils.PrivilegedTest(t)
-	testutils.SkipOnOldKernel(t, "5.19", "source IP support in struct bpf_tunnel_key")
-
-	if err := HaveOuterSourceIPSupport(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestSKBAdjustRoomL2RoomMACSupportProbe(t *testing.T) {
 	testutils.PrivilegedTest(t)
 	testutils.SkipOnOldKernel(t, "5.2", "BPF_ADJ_ROOM_MAC mode support in bpf_skb_adjust_room")
@@ -332,6 +323,24 @@ func TestHaveDeadCodeElimSupport(t *testing.T) {
 	testutils.PrivilegedTest(t)
 
 	if err := HaveDeadCodeElim(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHaveTCX(t *testing.T) {
+	testutils.PrivilegedTest(t)
+	testutils.SkipOnOldKernel(t, "6.6", "tcx bpf_link")
+
+	if err := HaveTCX(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHaveNetkit(t *testing.T) {
+	testutils.PrivilegedTest(t)
+	testutils.SkipOnOldKernel(t, "6.7", "netkit bpf_link")
+
+	if err := HaveNetkit(); err != nil {
 		t.Fatal(err)
 	}
 }

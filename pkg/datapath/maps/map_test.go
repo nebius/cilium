@@ -4,24 +4,14 @@
 package maps
 
 import (
-	"sort"
+	"slices"
 	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/checker"
 	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
 	"github.com/cilium/cilium/pkg/datapath/types"
 )
-
-// Hook up gocheck into the "go test" runner.
-type MapTestSuite struct{}
-
-var _ = Suite(&MapTestSuite{})
-
-func Test(t *testing.T) {
-	TestingT(t)
-}
 
 type testEPManager struct {
 	endpoints       map[uint16]struct{}
@@ -63,7 +53,7 @@ func newTestBWManager() types.BandwidthManager {
 	return &fakeTypes.BandwidthManager{}
 }
 
-func (s *MapTestSuite) TestCollectStaleMapGarbage(c *C) {
+func TestCollectStaleMapGarbage(t *testing.T) {
 
 	testCases := []struct {
 		name            string
@@ -79,9 +69,9 @@ func (s *MapTestSuite) TestCollectStaleMapGarbage(c *C) {
 				42,
 			},
 			paths: []string{
-				"cilium_policy_00001",
-				"cilium_policy_00001",
-				"cilium_policy_00042",
+				"cilium_policy_v2_00001",
+				"cilium_policy_v2_00001",
+				"cilium_policy_v2_00042",
 				"cilium_ct6_00001",
 				"cilium_ct4_00001",
 				"cilium_ct_any6_00001",
@@ -96,15 +86,15 @@ func (s *MapTestSuite) TestCollectStaleMapGarbage(c *C) {
 				42,
 			},
 			paths: []string{
-				"cilium_policy_00001",
-				"cilium_policy_00042",
+				"cilium_policy_v2_00001",
+				"cilium_policy_v2_00042",
 				"cilium_ct6_00001",
 				"cilium_ct4_00001",
 				"cilium_ct_any6_00001",
 				"cilium_ct_any4_00001",
 			},
 			removedPaths: []string{
-				"cilium_policy_00001",
+				"cilium_policy_v2_00001",
 				"cilium_ct6_00001",
 				"cilium_ct4_00001",
 				"cilium_ct_any6_00001",
@@ -120,15 +110,15 @@ func (s *MapTestSuite) TestCollectStaleMapGarbage(c *C) {
 				1,
 			},
 			paths: []string{
-				"cilium_policy_00001",
-				"cilium_policy_00042",
+				"cilium_policy_v2_00001",
+				"cilium_policy_v2_00042",
 				"cilium_ct6_00001",
 				"cilium_ct4_00001",
 				"cilium_ct_any6_00001",
 				"cilium_ct_any4_00001",
 			},
 			removedPaths: []string{
-				"cilium_policy_00042",
+				"cilium_policy_v2_00042",
 			},
 			removedMappings: []int{
 				42,
@@ -138,16 +128,16 @@ func (s *MapTestSuite) TestCollectStaleMapGarbage(c *C) {
 			name:      "Delete every map",
 			endpoints: []uint16{},
 			paths: []string{
-				"cilium_policy_00001",
-				"cilium_policy_00042",
+				"cilium_policy_v2_00001",
+				"cilium_policy_v2_00042",
 				"cilium_ct6_00001",
 				"cilium_ct4_00001",
 				"cilium_ct_any6_00001",
 				"cilium_ct_any4_00001",
 			},
 			removedPaths: []string{
-				"cilium_policy_00001",
-				"cilium_policy_00042",
+				"cilium_policy_v2_00001",
+				"cilium_policy_v2_00042",
 				"cilium_ct6_00001",
 				"cilium_ct4_00001",
 				"cilium_ct_any6_00001",
@@ -165,22 +155,22 @@ func (s *MapTestSuite) TestCollectStaleMapGarbage(c *C) {
 				42,
 			},
 			paths: []string{
-				"cilium_policy_1",
-				"cilium_policy_42",
+				"cilium_policy_v2_1",
+				"cilium_policy_v2_42",
 				"cilium_ct6_1",
 				"cilium_ct4_1",
 				"cilium_ct_any6_1",
 				"cilium_ct_any4_1",
-				"cilium_policy_00001",
-				"cilium_policy_00042",
+				"cilium_policy_v2_00001",
+				"cilium_policy_v2_00042",
 				"cilium_ct6_00001",
 				"cilium_ct4_00001",
 				"cilium_ct_any6_00001",
 				"cilium_ct_any4_00001",
 			},
 			removedPaths: []string{
-				"cilium_policy_1",
-				"cilium_policy_42",
+				"cilium_policy_v2_1",
+				"cilium_policy_v2_42",
 				"cilium_ct6_1",
 				"cilium_ct4_1",
 				"cilium_ct_any6_1",
@@ -191,22 +181,23 @@ func (s *MapTestSuite) TestCollectStaleMapGarbage(c *C) {
 	}
 
 	for _, tt := range testCases {
-		c.Log(tt.name)
-		testEPManager := newTestEPManager()
-		bwManager := newTestBWManager()
-		sweeper := NewMapSweeper(testEPManager, bwManager)
+		t.Run(tt.name, func(t *testing.T) {
+			testEPManager := newTestEPManager()
+			bwManager := newTestBWManager()
+			sweeper := NewMapSweeper(testEPManager, bwManager)
 
-		for _, ep := range tt.endpoints {
-			testEPManager.addEndpoint(ep)
-		}
-		for _, path := range tt.paths {
-			err := sweeper.walk(path, nil, nil)
-			c.Assert(err, IsNil)
-		}
-		sort.Strings(tt.removedPaths)
-		sort.Strings(testEPManager.removedPaths)
-		sort.Ints(tt.removedMappings)
-		sort.Ints(testEPManager.removedMappings)
-		c.Assert(testEPManager.removedPaths, checker.DeepEquals, tt.removedPaths)
+			for _, ep := range tt.endpoints {
+				testEPManager.addEndpoint(ep)
+			}
+			for _, path := range tt.paths {
+				err := sweeper.walk(path, nil, nil)
+				require.NoError(t, err)
+			}
+			slices.Sort(tt.removedPaths)
+			slices.Sort(testEPManager.removedPaths)
+			slices.Sort(tt.removedMappings)
+			slices.Sort(testEPManager.removedMappings)
+			require.EqualValues(t, tt.removedPaths, testEPManager.removedPaths)
+		})
 	}
 }

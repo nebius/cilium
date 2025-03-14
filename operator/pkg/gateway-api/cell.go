@@ -7,9 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -20,11 +22,13 @@ import (
 	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
 
 	operatorOption "github.com/cilium/cilium/operator/option"
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	gatewayApiTranslation "github.com/cilium/cilium/operator/pkg/model/translation/gateway-api"
 	"github.com/cilium/cilium/operator/pkg/secretsync"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -34,47 +38,55 @@ var Cell = cell.Module(
 	"Manages the Gateway API controllers",
 
 	cell.Config(gatewayApiConfig{
-		EnableGatewayAPISecretsSync:   true,
-		EnableGatewayAPIProxyProtocol: false,
-		GatewayAPISecretsNamespace:    "cilium-secrets",
-		GatewayAPIXffNumTrustedHops:   0,
+		EnableGatewayAPISecretsSync:            true,
+		EnableGatewayAPIProxyProtocol:          false,
+		EnableGatewayAPIAppProtocol:            false,
+		EnableGatewayAPIAlpn:                   false,
+		GatewayAPIServiceExternalTrafficPolicy: "Cluster",
+		GatewayAPISecretsNamespace:             "cilium-secrets",
+		GatewayAPIXffNumTrustedHops:            0,
 
 		GatewayAPIHostnetworkEnabled:           false,
 		GatewayAPIHostnetworkNodelabelselector: "",
 	}),
+
 	cell.Invoke(initGatewayAPIController),
 	cell.Provide(registerSecretSync),
 )
 
-var requiredGVK = []schema.GroupVersionKind{
-	gatewayv1.SchemeGroupVersion.WithKind("gatewayclasses"),
-	gatewayv1.SchemeGroupVersion.WithKind("gateways"),
-	gatewayv1.SchemeGroupVersion.WithKind("httproutes"),
-	gatewayv1beta1.SchemeGroupVersion.WithKind("referencegrants"),
-	gatewayv1alpha2.SchemeGroupVersion.WithKind("grpcroutes"),
-	gatewayv1alpha2.SchemeGroupVersion.WithKind("tlsroutes"),
+var requiredGVKs = []schema.GroupVersionKind{
+	gatewayv1.SchemeGroupVersion.WithKind(helpers.GatewayClassKind),
+	gatewayv1.SchemeGroupVersion.WithKind(helpers.GatewayKind),
+	gatewayv1.SchemeGroupVersion.WithKind(helpers.HTTPRouteKind),
+	gatewayv1.SchemeGroupVersion.WithKind(helpers.GRPCRouteKind),
+	gatewayv1beta1.SchemeGroupVersion.WithKind(helpers.ReferenceGrantKind),
+}
+
+var optionalGVKs = []schema.GroupVersionKind{
+	gatewayv1alpha2.SchemeGroupVersion.WithKind(helpers.TLSRouteKind),
+	mcsapiv1alpha1.SchemeGroupVersion.WithKind(helpers.ServiceImportKind),
 }
 
 type gatewayApiConfig struct {
-	KubeProxyReplacement string
-	EnableNodePort       bool
-
-	EnableGatewayAPISecretsSync   bool
-	EnableGatewayAPIProxyProtocol bool
-	GatewayAPISecretsNamespace    string
-	GatewayAPIXffNumTrustedHops   uint32
+	EnableGatewayAPISecretsSync            bool
+	EnableGatewayAPIProxyProtocol          bool
+	EnableGatewayAPIAppProtocol            bool
+	EnableGatewayAPIAlpn                   bool
+	GatewayAPIServiceExternalTrafficPolicy string
+	GatewayAPISecretsNamespace             string
+	GatewayAPIXffNumTrustedHops            uint32
 
 	GatewayAPIHostnetworkEnabled           bool
 	GatewayAPIHostnetworkNodelabelselector string
 }
 
 func (r gatewayApiConfig) Flags(flags *pflag.FlagSet) {
-	flags.String("kube-proxy-replacement", r.KubeProxyReplacement, "Enable only selected features (will panic if any selected feature cannot be enabled) (\"false\"), or enable all features (will panic if any feature cannot be enabled) (\"true\") (default \"false\")")
-	flags.Bool("enable-node-port", r.EnableNodePort, "Enable NodePort type services by Cilium")
-
 	flags.Bool("enable-gateway-api-secrets-sync", r.EnableGatewayAPISecretsSync, "Enables fan-in TLS secrets sync from multiple namespaces to singular namespace (specified by gateway-api-secrets-namespace flag)")
 	flags.Bool("enable-gateway-api-proxy-protocol", r.EnableGatewayAPIProxyProtocol, "Enable proxy protocol for all GatewayAPI listeners. Note that _only_ Proxy protocol traffic will be accepted once this is enabled.")
+	flags.Bool("enable-gateway-api-app-protocol", r.EnableGatewayAPIAppProtocol, "Enables Backend Protocol selection (GEP-1911) for Gateway API via appProtocol")
+	flags.Bool("enable-gateway-api-alpn", r.EnableGatewayAPIAlpn, "Enables exposing ALPN with HTTP2 and HTTP/1.1 support for Gateway API")
 	flags.Uint32("gateway-api-xff-num-trusted-hops", r.GatewayAPIXffNumTrustedHops, "The number of additional GatewayAPI proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.")
+	flags.String("gateway-api-service-externaltrafficpolicy", r.GatewayAPIServiceExternalTrafficPolicy, "Kubernetes LoadBalancer Service externalTrafficPolicy for all Gateway instances.")
 	flags.String("gateway-api-secrets-namespace", r.GatewayAPISecretsNamespace, "Namespace having tls secrets used by CEC for Gateway API")
 	flags.Bool("gateway-api-hostnetwork-enabled", r.GatewayAPIHostnetworkEnabled, "Exposes Gateway listeners on the host network.")
 	flags.String("gateway-api-hostnetwork-nodelabelselector", r.GatewayAPIHostnetworkNodelabelselector, "Label selector that matches the nodes where the gateway listeners should be exposed. It's a list of comma-separated key-value label pairs. e.g. 'kubernetes.io/os=linux,kubernetes.io/hostname=kind-worker'")
@@ -83,7 +95,7 @@ func (r gatewayApiConfig) Flags(flags *pflag.FlagSet) {
 type gatewayAPIParams struct {
 	cell.In
 
-	Logger             logrus.FieldLogger
+	Logger             *slog.Logger
 	K8sClient          k8sClient.Clientset
 	CtrlRuntimeManager ctrlRuntime.Manager
 	Scheme             *runtime.Scheme
@@ -98,43 +110,73 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		return nil
 	}
 
-	if params.GatewayApiConfig.KubeProxyReplacement != option.KubeProxyReplacementTrue &&
-		!params.GatewayApiConfig.EnableNodePort {
+	if params.OperatorConfig.KubeProxyReplacement != option.KubeProxyReplacementTrue &&
+		!params.OperatorConfig.EnableNodePort {
 		params.Logger.Warn("Gateway API support requires either kube-proxy-replacement or enable-node-port enabled")
 		return nil
 	}
 
-	params.Logger.WithField("requiredGVK", requiredGVK).Info("Checking for required GatewayAPI resources")
-	if err := checkRequiredCRDs(context.Background(), params.K8sClient); err != nil {
-		params.Logger.WithError(err).Error("Required GatewayAPI resources are not found, please refer to docs for installation instructions")
+	if err := validateExternalTrafficPolicy(params); err != nil {
+		return err
+	}
+
+	params.Logger.Info(
+		"Checking for required and optional GatewayAPI resources",
+		logfields.RequiredGVK, requiredGVKs,
+		logfields.OptionalGVK, optionalGVKs,
+	)
+	installedKinds, err := checkCRDs(context.Background(), params.K8sClient, params.Logger, requiredGVKs, optionalGVKs)
+	if err != nil {
+		params.Logger.Error("Required GatewayAPI resources are not found, please refer to docs for installation instructions", logfields.Error, err)
 		return nil
 	}
 
-	if err := registerGatewayAPITypesToScheme(params.Scheme); err != nil {
+	if err := registerGatewayAPITypesToScheme(params.Scheme, installedKinds); err != nil {
 		return err
 	}
 
-	if err := registerMCSAPITypesToScheme(params.K8sClient, params.Scheme); err != nil {
+	if err := v2alpha1.AddToScheme(params.Scheme); err != nil {
 		return err
 	}
 
-	cecTranslator := translation.NewCECTranslator(
-		params.GatewayApiConfig.GatewayAPISecretsNamespace,
-		params.GatewayApiConfig.EnableGatewayAPIProxyProtocol,
-		true, // hostNameSuffixMatch
-		params.OperatorConfig.ProxyIdleTimeoutSeconds,
-		params.GatewayApiConfig.GatewayAPIHostnetworkEnabled,
-		translation.ParseNodeLabelSelector(params.GatewayApiConfig.GatewayAPIHostnetworkNodelabelselector),
-		params.AgentConfig.EnableIPv4,
-		params.AgentConfig.EnableIPv6,
-		params.GatewayApiConfig.GatewayAPIXffNumTrustedHops,
-	)
+	cfg := translation.Config{
+		SecretsNamespace: params.GatewayApiConfig.GatewayAPISecretsNamespace,
+		ServiceConfig: translation.ServiceConfig{
+			ExternalTrafficPolicy: params.GatewayApiConfig.GatewayAPIServiceExternalTrafficPolicy,
+		},
+		HostNetworkConfig: translation.HostNetworkConfig{
+			Enabled:           params.GatewayApiConfig.GatewayAPIHostnetworkEnabled,
+			NodeLabelSelector: translation.ParseNodeLabelSelector(params.GatewayApiConfig.GatewayAPIHostnetworkNodelabelselector),
+		},
+		IPConfig: translation.IPConfig{
+			IPv4Enabled: params.AgentConfig.EnableIPv4,
+			IPv6Enabled: params.AgentConfig.EnableIPv6,
+		},
+		ListenerConfig: translation.ListenerConfig{
+			UseProxyProtocol:         params.GatewayApiConfig.EnableGatewayAPIProxyProtocol,
+			UseAlpn:                  params.GatewayApiConfig.EnableGatewayAPIAlpn,
+			StreamIdleTimeoutSeconds: params.OperatorConfig.ProxyStreamIdleTimeoutSeconds,
+		},
+		ClusterConfig: translation.ClusterConfig{
+			IdleTimeoutSeconds: params.OperatorConfig.ProxyIdleTimeoutSeconds,
+			UseAppProtocol:     params.GatewayApiConfig.EnableGatewayAPIAppProtocol,
+		},
+		RouteConfig: translation.RouteConfig{
+			HostNameSuffixMatch: true,
+		},
+		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
+			XFFNumTrustedHops: params.GatewayApiConfig.GatewayAPIXffNumTrustedHops,
+		},
+	}
+	cecTranslator := translation.NewCECTranslator(cfg)
 
-	gatewayAPITranslator := gatewayApiTranslation.NewTranslator(cecTranslator, params.GatewayApiConfig.GatewayAPIHostnetworkEnabled)
+	gatewayAPITranslator := gatewayApiTranslation.NewTranslator(cecTranslator, cfg)
 
 	if err := registerReconcilers(
 		params.CtrlRuntimeManager,
 		gatewayAPITranslator,
+		params.Logger,
+		installedKinds,
 	); err != nil {
 		return fmt.Errorf("failed to create gateway controller: %w", err)
 	}
@@ -145,7 +187,8 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 // registerSecretSync registers the Gateway API for secret synchronization based on TLS secrets referenced
 // by a Cilium Gateway resource.
 func registerSecretSync(params gatewayAPIParams) secretsync.SecretSyncRegistrationOut {
-	if err := checkRequiredCRDs(context.Background(), params.K8sClient); err != nil {
+	// In this case, we don't care about optional CRDs, so we ignore the second parameter.
+	if _, err := checkCRDs(context.Background(), params.K8sClient, params.Logger, requiredGVKs, optionalGVKs); err != nil {
 		return secretsync.SecretSyncRegistrationOut{}
 	}
 
@@ -161,6 +204,17 @@ func registerSecretSync(params gatewayAPIParams) secretsync.SecretSyncRegistrati
 			SecretsNamespace:     params.GatewayApiConfig.GatewayAPISecretsNamespace,
 		},
 	}
+}
+
+func validateExternalTrafficPolicy(params gatewayAPIParams) error {
+	if params.GatewayApiConfig.GatewayAPIHostnetworkEnabled && params.GatewayApiConfig.GatewayAPIServiceExternalTrafficPolicy != "" {
+		params.Logger.Warn("Gateway API host networking is enabled, externalTrafficPolicy will be ignored.")
+		return nil
+	} else if params.GatewayApiConfig.GatewayAPIServiceExternalTrafficPolicy == string(corev1.ServiceExternalTrafficPolicyCluster) ||
+		params.GatewayApiConfig.GatewayAPIServiceExternalTrafficPolicy == string(corev1.ServiceExternalTrafficPolicyLocal) {
+		return nil
+	}
+	return fmt.Errorf("invalid externalTrafficPolicy: %s", params.GatewayApiConfig.GatewayAPIServiceExternalTrafficPolicy)
 }
 
 func checkCRD(ctx context.Context, clientset k8sClient.Clientset, gvk schema.GroupVersionKind) error {
@@ -187,58 +241,116 @@ func checkCRD(ctx context.Context, clientset k8sClient.Clientset, gvk schema.Gro
 	return nil
 }
 
-func checkRequiredCRDs(ctx context.Context, clientset k8sClient.Clientset) error {
+// checkCRDs checks if required and optional CRDs are present in the cluster,
+// returns an error if the required CRDs are not installed, and returns the
+// schema.GroupVersionKind of any optional CRDs that are installed.
+func checkCRDs(ctx context.Context, clientset k8sClient.Clientset, logger *slog.Logger, requiredGVKs, optionalGVKs []schema.GroupVersionKind) ([]schema.GroupVersionKind, error) {
 	var res error
-	for _, gvk := range requiredGVK {
+	var presentGVKs []schema.GroupVersionKind
+
+	for _, gvk := range requiredGVKs {
 		if err := checkCRD(ctx, clientset, gvk); err != nil {
 			res = errors.Join(res, err)
 		}
 	}
-	return res
-}
 
-// registerReconcilers registers the Gateway API reconcilers to the controller-runtime library manager.
-func registerReconcilers(mgr ctrlRuntime.Manager, translator translation.Translator) error {
-	reconcilers := []interface {
-		SetupWithManager(mgr ctrlRuntime.Manager) error
-	}{
-		newGatewayClassReconciler(mgr),
-		newGatewayReconciler(mgr, translator),
-		newReferenceGrantReconciler(mgr),
-		newHTTPRouteReconciler(mgr),
-		newGRPCRouteReconciler(mgr),
-		newTLSRouteReconciler(mgr),
+	for _, optionalGVK := range optionalGVKs {
+		if err := checkCRD(ctx, clientset, optionalGVK); err != nil {
+			logger.Debug("CRD is not present, will not handle it", logfields.OptionalGVK, optionalGVK)
+			continue
+		}
+		// note that the .Kind field contains the _resource_ name -
+		// the plural, lowercase version of the name.
+		presentGVKs = append(presentGVKs, optionalGVK)
 	}
 
-	for _, r := range reconcilers {
+	return presentGVKs, res
+}
+
+// registerReconcilers registers Gateway API reconcilers to the controller-runtime library manager.
+// optionalKinds are previously autodetected based on what CRDs are present in the cluster.
+func registerReconcilers(mgr ctrlRuntime.Manager, translator translation.Translator, logger *slog.Logger, installedCRDs []schema.GroupVersionKind) error {
+	requiredReconcilers := []interface {
+		SetupWithManager(mgr ctrlRuntime.Manager) error
+	}{
+		newGatewayClassReconciler(mgr, logger),
+		newGatewayReconciler(mgr, translator, logger, installedCRDs),
+		newReferenceGrantReconciler(mgr, logger),
+		newHTTPRouteReconciler(mgr, logger),
+		newGammaHttpRouteReconciler(mgr, translator, logger),
+		newGRPCRouteReconciler(mgr, logger),
+		newGatewayClassConfigReconciler(mgr, logger),
+	}
+
+	for _, r := range requiredReconcilers {
 		if err := r.SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("failed to setup reconciler: %w", err)
 		}
 	}
 
+	// To add a new optionalKind, remember you also need to add the GVK into
+	// the optionalGVKs global.
+	// Note that optionalKinds contains the lower-case, plural version of the
+	// name.
+	for _, gvk := range installedCRDs {
+		switch gvk.Kind {
+		case helpers.TLSRouteKind:
+			logger.Info("TLSRoute CRD is installed, TLSRoute support is enabled")
+			tlsReconciler := newTLSRouteReconciler(mgr, logger)
+			if err := tlsReconciler.SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("failed to setup optional reconciler: %w", err)
+			}
+		case helpers.ServiceImportKind:
+			// we don't need a reconciler, but we do need to tell folks that the
+			// support is working.
+			logger.Info("ServiceImport CRD is installed, ServiceImport support is enabled")
+		default:
+			panic(fmt.Sprintf("No reconciler available for GVK %s", gvk))
+		}
+	}
 	return nil
 }
 
-func registerGatewayAPITypesToScheme(scheme *runtime.Scheme) error {
-	for gv, f := range map[fmt.Stringer]func(s *runtime.Scheme) error{
-		gatewayv1.GroupVersion:       gatewayv1.AddToScheme,
-		gatewayv1beta1.GroupVersion:  gatewayv1beta1.AddToScheme,
-		gatewayv1alpha2.GroupVersion: gatewayv1alpha2.AddToScheme,
-	} {
-		if err := f(scheme); err != nil {
-			return fmt.Errorf("failed to add types from %s to scheme: %w", gv, err)
+func registerGatewayAPITypesToScheme(scheme *runtime.Scheme, optionalKinds []schema.GroupVersionKind) error {
+	// Autodetection of installed types means we have to add things to the scheme
+	// ourselves for non-Standard GroupVersions, we can't use the generated
+	// functions.
+
+	addToSchema := make(map[fmt.Stringer]func(s *runtime.Scheme) error)
+
+	// We can safely install the GA resources
+	addToSchema[gatewayv1.GroupVersion] = gatewayv1.AddToScheme
+	// We can also safely install the v1beta1 resources, as these are legacy
+	// and also included in the Standard install
+	addToSchema[gatewayv1beta1.GroupVersion] = gatewayv1beta1.AddToScheme
+
+	for _, optionalKind := range optionalKinds {
+		// Note that we're using the full GVK as the map key here - this is fine
+		// because the key is just a fmt.Stringer
+		// We need to do this because there needs to be one entry
+		//
+		// Note that these calls are usually done using the package-level
+		// AddToScheme, but we can't use that here because we want to only
+		// enable things on a per-resource basis.
+		addToSchema[optionalKind] = func(s *runtime.Scheme) error {
+			s.AddKnownTypes(optionalKind.GroupVersion(), helpers.GetConcreteObject(optionalKind))
+			// We also need to add the List version to the Schema
+			listKind := optionalKind.Kind[:len(optionalKind.Kind)-1] + "lists"
+			optionalKindList := schema.GroupVersionKind{
+				Group:   optionalKind.Group,
+				Version: optionalKind.Version,
+				Kind:    listKind,
+			}
+			s.AddKnownTypes(optionalKind.GroupVersion(), helpers.GetConcreteObject(optionalKindList))
+			metav1.AddToGroupVersion(s, optionalKind.GroupVersion())
+			return nil
 		}
 	}
 
-	return nil
-}
-
-func registerMCSAPITypesToScheme(clientset k8sClient.Clientset, scheme *runtime.Scheme) error {
-	serviceImportSupport := checkCRD(context.Background(), clientset, mcsapiv1alpha1.SchemeGroupVersion.WithKind("serviceimports")) == nil
-	log.WithField("enabled", serviceImportSupport).
-		Info("Multi-cluster Service API ServiceImport GatewayAPI integration")
-	if serviceImportSupport {
-		return mcsapiv1alpha1.AddToScheme(scheme)
+	for gv, f := range addToSchema {
+		if err := f(scheme); err != nil {
+			return fmt.Errorf("failed to add types from %s to scheme: %w", gv, err)
+		}
 	}
 
 	return nil

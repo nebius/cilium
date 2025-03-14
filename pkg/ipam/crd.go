@@ -7,12 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
 	"net"
 	"reflect"
+	"slices"
 	"strconv"
 	"sync"
 
-	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +24,7 @@ import (
 
 	alibabaCloud "github.com/cilium/cilium/pkg/alibabacloud/utils"
 	"github.com/cilium/cilium/pkg/cidr"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/ip"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
@@ -30,7 +33,9 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/informer"
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
@@ -49,6 +54,7 @@ const (
 // nodeStore represents a CiliumNode custom resource and binds the CR to a list
 // of allocators
 type nodeStore struct {
+	logger *slog.Logger
 	// mutex protects access to all members of this struct
 	mutex lock.RWMutex
 
@@ -74,19 +80,22 @@ type nodeStore struct {
 
 	conf      *option.DaemonConfig
 	mtuConfig MtuConfiguration
+	sysctl    sysctl.Sysctl
 }
 
 // newNodeStore initializes a new store which reflects the CiliumNode custom
 // resource of the specified node name
-func newNodeStore(nodeName string, conf *option.DaemonConfig, owner Owner, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration) *nodeStore {
-	log.WithField(fieldName, nodeName).Info("Subscribed to CiliumNode custom resource")
+func newNodeStore(logger *slog.Logger, nodeName string, conf *option.DaemonConfig, owner Owner, localNodeStore *node.LocalNodeStore, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration, sysctl sysctl.Sysctl) *nodeStore {
+	logger.Info("Subscribed to CiliumNode custom resource", fieldName, nodeName)
 
 	store := &nodeStore{
+		logger:             logger,
 		allocators:         []*crdAllocator{},
 		allocationPoolSize: map[Family]int{},
 		conf:               conf,
 		mtuConfig:          mtuConfig,
 		clientset:          clientset,
+		sysctl:             sysctl,
 	}
 	store.restoreFinished = make(chan struct{})
 
@@ -96,7 +105,7 @@ func newNodeStore(nodeName string, conf *option.DaemonConfig, owner Owner, clien
 		TriggerFunc: store.refreshNodeTrigger,
 	})
 	if err != nil {
-		log.WithError(err).Fatal("Unable to initialize CiliumNode synchronization trigger")
+		logging.Fatal(logger, "Unable to initialize CiliumNode synchronization trigger", logfields.Error, err)
 	}
 	store.refreshTrigger = t
 
@@ -120,7 +129,11 @@ func newNodeStore(nodeName string, conf *option.DaemonConfig, owner Owner, clien
 					store.updateLocalNodeResource(node.DeepCopy())
 					k8sEventReg.K8sEventProcessed("CiliumNode", "create", true)
 				} else {
-					log.Warningf("Unknown CiliumNode object type %s received: %+v", reflect.TypeOf(obj), obj)
+					logger.Warn(
+						"Unknown CiliumNode object type received",
+						logfields.Type, reflect.TypeOf(obj),
+						logfields.Object, obj,
+					)
 				}
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
@@ -143,10 +156,18 @@ func newNodeStore(nodeName string, conf *option.DaemonConfig, owner Owner, clien
 						store.updateLocalNodeResource(newNode)
 						k8sEventReg.K8sEventProcessed("CiliumNode", "update", true)
 					} else {
-						log.Warningf("Unknown CiliumNode object type %T received: %+v", oldNode, oldNode)
+						logger.Warn(
+							"Unknown CiliumNode object type received",
+							logfields.Type, reflect.TypeOf(oldNode),
+							logfields.Object, oldNode,
+						)
 					}
 				} else {
-					log.Warningf("Unknown CiliumNode object type %T received: %+v", oldNode, oldNode)
+					logger.Warn(
+						"Unknown CiliumNode object type received",
+						logfields.Type, reflect.TypeOf(oldNode),
+						logfields.Object, oldNode,
+					)
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
@@ -165,29 +186,38 @@ func newNodeStore(nodeName string, conf *option.DaemonConfig, owner Owner, clien
 
 	go ciliumNodeInformer.Run(wait.NeverStop)
 
-	log.WithField(fieldName, nodeName).Info("Waiting for CiliumNode custom resource to become available...")
+	logger.Info(
+		"Waiting for CiliumNode custom resource to become available...",
+		fieldName, nodeName,
+	)
 	if ok := cache.WaitForCacheSync(wait.NeverStop, ciliumNodeInformer.HasSynced); !ok {
-		log.WithField(fieldName, nodeName).Fatal("Unable to synchronize CiliumNode custom resource")
+		logging.Fatal(logger, "Unable to synchronize CiliumNode custom resource", fieldName, nodeName)
 	} else {
-		log.WithField(fieldName, nodeName).Info("Successfully synchronized CiliumNode custom resource")
+		logger.Info(
+			"Successfully synchronized CiliumNode custom resource",
+			fieldName, nodeName,
+		)
 	}
 
 	for {
-		minimumReached, required, numAvailable := store.hasMinimumIPsInPool()
-		logFields := logrus.Fields{
-			fieldName:   nodeName,
-			"required":  required,
-			"available": numAvailable,
-		}
+		minimumReached, required, numAvailable := store.hasMinimumIPsInPool(localNodeStore)
+		scopedLog := logger.With(
+			fieldName, nodeName,
+			logfields.Required, required,
+			logfields.Available, numAvailable,
+		)
 		if minimumReached {
-			log.WithFields(logFields).Info("All required IPs are available in CRD-backed allocation pool")
+			scopedLog.Info(
+				"All required IPs are available in CRD-backed allocation pool",
+			)
 			break
 		}
 
-		log.WithFields(logFields).WithField(
+		scopedLog.Info(
+			"Waiting for IPs to become available in CRD-backed allocation pool",
 			logfields.HelpMessage,
 			"Check if cilium-operator pod is running and does not have any warnings or error messages.",
-		).Info("Waiting for IPs to become available in CRD-backed allocation pool")
+		)
 		time.Sleep(5 * time.Second)
 	}
 
@@ -243,38 +273,44 @@ func deriveVpcCIDRs(node *ciliumv2.CiliumNode) (primaryCIDR *cidr.CIDR, secondar
 	return
 }
 
-func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR() bool {
+func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR(localNodeStore *node.LocalNodeStore) bool {
 	if primaryCIDR, secondaryCIDRs := deriveVpcCIDRs(n.ownNode); primaryCIDR != nil {
 		allCIDRs := append([]*cidr.CIDR{primaryCIDR}, secondaryCIDRs...)
-		if nativeCIDR := n.conf.GetIPv4NativeRoutingCIDR(); nativeCIDR != nil {
+		if nativeCIDR := n.conf.IPv4NativeRoutingCIDR; nativeCIDR != nil {
 			found := false
 			for _, vpcCIDR := range allCIDRs {
-				logFields := logrus.Fields{
-					"vpc-cidr":                   vpcCIDR.String(),
-					option.IPv4NativeRoutingCIDR: nativeCIDR.String(),
-				}
-
 				ranges4, _ := ip.CoalesceCIDRs([]*net.IPNet{nativeCIDR.IPNet, vpcCIDR.IPNet})
 				if len(ranges4) != 1 {
-					log.WithFields(logFields).Info("Native routing CIDR does not contain VPC CIDR, trying next")
+					n.logger.Info(
+						"Native routing CIDR does not contain VPC CIDR, trying next",
+						logfields.VPCCIDR, vpcCIDR,
+						option.IPv4NativeRoutingCIDR, nativeCIDR,
+					)
 				} else {
 					found = true
-					log.WithFields(logFields).Info("Native routing CIDR contains VPC CIDR, ignoring autodetected VPC CIDRs.")
+					n.logger.Info(
+						"Native routing CIDR contains VPC CIDR, ignoring autodetected VPC CIDRs.",
+						logfields.VPCCIDR, vpcCIDR,
+						option.IPv4NativeRoutingCIDR, nativeCIDR,
+					)
 					break
 				}
 			}
 			if !found {
-				log.Fatal("None of the VPC CIDRs contains the specified native routing CIDR")
+				logging.Fatal(n.logger, "None of the VPC CIDRs contains the specified native routing CIDR")
 			}
 		} else {
-			log.WithFields(logrus.Fields{
-				"vpc-cidr": primaryCIDR.String(),
-			}).Info("Using autodetected primary VPC CIDR.")
-			n.conf.SetIPv4NativeRoutingCIDR(primaryCIDR)
+			n.logger.Info(
+				"Using autodetected primary VPC CIDR.",
+				logfields.VPCCIDR, primaryCIDR,
+			)
+			localNodeStore.Update(func(n *node.LocalNode) {
+				n.IPv4NativeRoutingCIDR = primaryCIDR
+			})
 		}
 		return true
 	} else {
-		log.Info("Could not determine VPC CIDRs")
+		n.logger.Info("Could not determine VPC CIDRs")
 		return false
 	}
 }
@@ -282,7 +318,7 @@ func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR() bool {
 // hasMinimumIPsInPool returns true if the required number of IPs is available
 // in the allocation pool. It also returns the number of IPs required and
 // available.
-func (n *nodeStore) hasMinimumIPsInPool() (minimumReached bool, required, numAvailable int) {
+func (n *nodeStore) hasMinimumIPsInPool(localNodeStore *node.LocalNodeStore) (minimumReached bool, required, numAvailable int) {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 
@@ -312,7 +348,7 @@ func (n *nodeStore) hasMinimumIPsInPool() (minimumReached bool, required, numAva
 		}
 
 		if n.conf.IPAMMode() == ipamOption.IPAMENI || n.conf.IPAMMode() == ipamOption.IPAMAzure || n.conf.IPAMMode() == ipamOption.IPAMAlibabaCloud {
-			if !n.autoDetectIPv4NativeRoutingCIDR() {
+			if !n.autoDetectIPv4NativeRoutingCIDR(localNodeStore) {
 				minimumReached = false
 			}
 		}
@@ -329,6 +365,49 @@ func (n *nodeStore) deleteLocalNodeResource() {
 	n.mutex.Unlock()
 }
 
+// validateENIConfig validates the ENI configuration in the CiliumNode resource
+// and returns an error if the configuration is not fully set.
+func validateENIConfig(node *ciliumv2.CiliumNode) error {
+	// Check if the VPC CIDR is set for all ENIs
+	for _, eni := range node.Status.ENI.ENIs {
+		if len(eni.VPC.PrimaryCIDR) == 0 {
+			return fmt.Errorf("VPC Primary CIDR not set for ENI %s", eni.ID)
+		}
+
+		for _, c := range eni.VPC.CIDRs {
+			if len(c) == 0 {
+				return fmt.Errorf("VPC CIDR not set for ENI %s", eni.ID)
+			}
+		}
+	}
+
+	// Check if all pool resource IPs are present in the status
+	eniIPMap := map[string][]string{}
+	for k, v := range node.Spec.IPAM.Pool {
+		eniIPMap[v.Resource] = append(eniIPMap[v.Resource], k)
+	}
+
+	for eni, addresses := range eniIPMap {
+		eniFound := false
+		for _, sENI := range node.Status.ENI.ENIs {
+			if eni == sENI.ID {
+				for _, addr := range addresses {
+					if !slices.Contains(sENI.Addresses, addr) {
+						return fmt.Errorf("ENI %s does not have address %s", eni, addr)
+					}
+				}
+				eniFound = true
+			}
+		}
+
+		if !eniFound {
+			return fmt.Errorf("ENI %s not found in status", eni)
+		}
+	}
+
+	return nil
+}
+
 // updateLocalNodeResource is called when the CiliumNode resource representing
 // the local node has been added or updated. It updates the available IPs based
 // on the custom resource passed into the function.
@@ -337,9 +416,12 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 	defer n.mutex.Unlock()
 
 	if n.conf.IPAMMode() == ipamOption.IPAMENI {
-		if err := configureENIDevices(n.ownNode, node, n.mtuConfig); err != nil {
-			log.WithError(err).Errorf("Failed to update routes and rules for ENIs")
+		if err := validateENIConfig(node); err != nil {
+			n.logger.Info("ENI state is not consistent yet", logfields.Error, err)
+			return
 		}
+
+		configureENIDevices(n.logger, n.ownNode, node, n.mtuConfig, n.sysctl)
 	}
 
 	n.ownNode = node
@@ -376,7 +458,7 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 					parsedIP := net.ParseIP(ip)
 					if parsedIP == nil {
 						// Unable to parse IP, no point in trying to remove the route
-						log.Warningf("Unable to parse IP %s", ip)
+						n.logger.Warn("Unable to parse IP", logfields.IPAddr, ip)
 						continue
 					}
 
@@ -387,7 +469,7 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 					})
 					if err != nil && !errors.Is(err, unix.ESRCH) {
 						// We ignore ESRCH, as it means the entry was already deleted
-						log.WithError(err).Warningf("Unable to delete unreachable route for IP %s", ip)
+						n.logger.Warn("Unable to delete unreachable route for IP", logfields.IPAddr, ip)
 						continue
 					}
 				}
@@ -461,7 +543,7 @@ func (n *nodeStore) setOwnNodeWithoutPoolUpdate(node *ciliumv2.CiliumNode) {
 // unused.
 func (n *nodeStore) refreshNodeTrigger(reasons []string) {
 	if err := n.refreshNode(); err != nil {
-		log.WithError(err).Warning("Unable to update CiliumNode custom resource")
+		n.logger.Warn("Unable to update CiliumNode custom resource", logfields.Error, err)
 		n.refreshTrigger.TriggerWithReason("retry after error")
 	}
 }
@@ -484,9 +566,7 @@ func (n *nodeStore) refreshNode() error {
 
 	for _, a := range staleCopyOfAllocators {
 		a.mutex.RLock()
-		for ip, ipInfo := range a.allocated {
-			node.Status.IPAM.Used[ip] = ipInfo
-		}
+		maps.Copy(node.Status.IPAM.Used, a.allocated)
 		a.mutex.RUnlock()
 	}
 
@@ -556,10 +636,11 @@ func (n *nodeStore) allocateNext(allocated ipamTypes.AllocationMap, family Famil
 			if ipInfo.Owner == owner {
 				parsedIP := net.ParseIP(ip)
 				if parsedIP == nil {
-					log.WithFields(logrus.Fields{
-						fieldName: n.ownNode.Name,
-						"ip":      ip,
-					}).Warning("Unable to parse IP in CiliumNode custom resource")
+					n.logger.Warn(
+						"Unable to parse IP in CiliumNode custom resource",
+						fieldName, n.ownNode.Name,
+						logfields.IPAddr, ip,
+					)
 					return nil, nil, fmt.Errorf("invalid custom ip %s for %s. ", ip, owner)
 				}
 				if DeriveFamily(parsedIP) != family {
@@ -583,10 +664,11 @@ func (n *nodeStore) allocateNext(allocated ipamTypes.AllocationMap, family Famil
 			}
 			parsedIP := net.ParseIP(ip)
 			if parsedIP == nil {
-				log.WithFields(logrus.Fields{
-					fieldName: n.ownNode.Name,
-					"ip":      ip,
-				}).Warning("Unable to parse IP in CiliumNode custom resource")
+				n.logger.Warn(
+					"Unable to parse IP in CiliumNode custom resource",
+					fieldName, n.ownNode.Name,
+					logfields.IPAddr, ip,
+				)
 				continue
 			}
 
@@ -627,16 +709,18 @@ type crdAllocator struct {
 	// family is the address family this allocator is allocator for
 	family Family
 
-	conf *option.DaemonConfig
+	conf   *option.DaemonConfig
+	logger *slog.Logger
 }
 
 // newCRDAllocator creates a new CRD-backed IP allocator
-func newCRDAllocator(family Family, c *option.DaemonConfig, owner Owner, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration) Allocator {
+func newCRDAllocator(logger *slog.Logger, family Family, c *option.DaemonConfig, owner Owner, localNodeStore *node.LocalNodeStore, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration, sysctl sysctl.Sysctl) Allocator {
 	initNodeStore.Do(func() {
-		sharedNodeStore = newNodeStore(nodeTypes.GetName(), c, owner, clientset, k8sEventReg, mtuConfig)
+		sharedNodeStore = newNodeStore(logger, nodeTypes.GetName(), c, owner, localNodeStore, clientset, k8sEventReg, mtuConfig, sysctl)
 	})
 
 	allocator := &crdAllocator{
+		logger:    logger,
 		allocated: ipamTypes.AllocationMap{},
 		family:    family,
 		store:     sharedNodeStore,
@@ -649,10 +733,14 @@ func newCRDAllocator(family Family, c *option.DaemonConfig, owner Owner, clients
 }
 
 // deriveGatewayIP accept the CIDR and the index of the IP in this CIDR.
-func deriveGatewayIP(cidr string, index int) string {
+func deriveGatewayIP(logger *slog.Logger, cidr string, index int) string {
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		log.WithError(err).Warningf("Unable to parse subnet CIDR %s", cidr)
+		logger.Warn(
+			"Unable to parse subnet CIDR",
+			logfields.Error, err,
+			logfields.CIDR, cidr,
+		)
 		return ""
 	}
 	gw := ip.GetIPAtIndex(*ipNet, int64(index))
@@ -683,13 +771,13 @@ func (a *crdAllocator) buildAllocationResult(ip net.IP, ipInfo *ipamTypes.Alloca
 				result.CIDRs = []string{eni.VPC.PrimaryCIDR}
 				result.CIDRs = append(result.CIDRs, eni.VPC.CIDRs...)
 				// Add manually configured Native Routing CIDR
-				if a.conf.GetIPv4NativeRoutingCIDR() != nil {
-					result.CIDRs = append(result.CIDRs, a.conf.GetIPv4NativeRoutingCIDR().String())
+				if a.conf.IPv4NativeRoutingCIDR != nil {
+					result.CIDRs = append(result.CIDRs, a.conf.IPv4NativeRoutingCIDR.String())
 				}
 				if eni.Subnet.CIDR != "" {
 					// The gateway for a subnet and VPC is always x.x.x.1
 					// Ref: https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html
-					result.GatewayIP = deriveGatewayIP(eni.Subnet.CIDR, 1)
+					result.GatewayIP = deriveGatewayIP(a.logger, eni.Subnet.CIDR, 1)
 				}
 				result.InterfaceNumber = strconv.Itoa(eni.Number)
 
@@ -734,8 +822,8 @@ func (a *crdAllocator) buildAllocationResult(ip net.IP, ipInfo *ipamTypes.Alloca
 			result.CIDRs = []string{eni.VSwitch.CIDRBlock}
 
 			// Ref: https://www.alibabacloud.com/help/doc-detail/65398.html
-			result.GatewayIP = deriveGatewayIP(eni.VSwitch.CIDRBlock, -3)
-			result.InterfaceNumber = strconv.Itoa(alibabaCloud.GetENIIndexFromTags(eni.Tags))
+			result.GatewayIP = deriveGatewayIP(a.logger, eni.VSwitch.CIDRBlock, -3)
+			result.InterfaceNumber = strconv.Itoa(alibabaCloud.GetENIIndexFromTags(a.logger, eni.Tags))
 			return
 		}
 		return nil, fmt.Errorf("unable to find ENI %s", ipInfo.Resource)

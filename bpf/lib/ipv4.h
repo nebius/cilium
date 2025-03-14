@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_IPV4__
-#define __LIB_IPV4__
+#pragma once
 
 #include <linux/ip.h>
 
@@ -33,7 +32,7 @@ struct {
 	__type(value, struct ipv4_frag_l4ports);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__uint(max_entries, CILIUM_IPV4_FRAG_MAP_MAX_ENTRIES);
-} IPV4_FRAG_DATAGRAMS_MAP __section_maps_btf;
+} cilium_ipv4_frag_datagrams __section_maps_btf;
 #endif
 
 static __always_inline int
@@ -41,14 +40,14 @@ ipv4_csum_update_by_value(struct __ctx_buff *ctx, int l3_off, __u64 old_val,
 			  __u64 new_val, __u32 len)
 {
 	return l3_csum_replace(ctx, l3_off + offsetof(struct iphdr, check),
-			       old_val, new_val, len);
+			       (__u32)old_val, (__u32)new_val, len);
 }
 
 static __always_inline int
 ipv4_csum_update_by_diff(struct __ctx_buff *ctx, int l3_off, __u64 diff)
 {
 	return l3_csum_replace(ctx, l3_off + offsetof(struct iphdr, check),
-			       0, diff, 0);
+			       0, (__u32)diff, 0);
 }
 
 static __always_inline int ipv4_load_daddr(struct __ctx_buff *ctx, int off,
@@ -119,7 +118,7 @@ ipv4_frag_get_l4ports(const struct ipv4_frag_id *frag_id,
 {
 	struct ipv4_frag_l4ports *tmp;
 
-	tmp = map_lookup_elem(&IPV4_FRAG_DATAGRAMS_MAP, frag_id);
+	tmp = map_lookup_elem(&cilium_ipv4_frag_datagrams, frag_id);
 	if (!tmp)
 		return DROP_FRAG_NOT_FOUND;
 
@@ -166,7 +165,7 @@ ipv4_handle_fragmentation(struct __ctx_buff *ctx,
 		/* First logical fragment for this datagram (not necessarily the first
 		 * we receive). Fragment has L4 header, create an entry in datagrams map.
 		 */
-		if (map_update_elem(&IPV4_FRAG_DATAGRAMS_MAP, &frag_id, ports, BPF_ANY))
+		if (map_update_elem(&cilium_ipv4_frag_datagrams, &frag_id, ports, BPF_ANY))
 			update_metrics(ctx_full_len(ctx), ct_to_metrics_dir(ct_dir),
 				       REASON_FRAG_PACKET_UPDATE);
 
@@ -195,5 +194,3 @@ ipv4_load_l4_ports(struct __ctx_buff *ctx, struct iphdr *ip4 __maybe_unused,
 
 	return CTX_ACT_OK;
 }
-
-#endif /* __LIB_IPV4__ */

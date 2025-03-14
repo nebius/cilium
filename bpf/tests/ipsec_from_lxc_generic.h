@@ -4,9 +4,6 @@
 #include "common.h"
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
-#define ROUTER_IP
-#include "config_replacement.h"
-#undef ROUTER_IP
 
 #define NODE_ID 2333
 #define ENCRYPT_KEY 3
@@ -18,6 +15,7 @@
 #include "bpf_lxc.c"
 
 #include "lib/ipcache.h"
+#include "lib/node.h"
 #include "lib/policy.h"
 
 #define FROM_CONTAINER 0
@@ -73,7 +71,7 @@ int ipv4_from_lxc_no_node_id_setup(struct __ctx_buff *ctx)
 	__u32 encrypt_key = 0;
 	struct encrypt_config encrypt_value = { .encrypt_key = ENCRYPT_KEY };
 
-	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
+	map_update_elem(&cilium_encrypt_state, &encrypt_key, &encrypt_value, BPF_ANY);
 
 	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
@@ -102,7 +100,7 @@ int ipv4_from_lxc_no_node_id_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	key.reason = (__u8)-DROP_NO_NODE_ID;
 	key.dir = METRIC_EGRESS;
-	entry = map_lookup_elem(&METRICS_MAP, &key);
+	entry = map_lookup_elem(&cilium_metrics, &key);
 	if (!entry)
 		test_fatal("metrics entry not found");
 
@@ -122,15 +120,7 @@ int ipv4_from_lxc_encrypt_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "02_ipv4_from_lxc_encrypt")
 int ipv4_from_lxc_encrypt_setup(struct __ctx_buff *ctx)
 {
-	struct node_key node_ip = {};
-	struct node_value node_value = {
-		.id = NODE_ID,
-		.spi = 0,
-	};
-
-	node_ip.family = ENDPOINT_KEY_IPV4;
-	node_ip.ip4 = v4_node_two;
-	map_update_elem(&NODE_MAP_V2, &node_ip, &node_value, BPF_ANY);
+	node_v4_add_entry(v4_node_two, NODE_ID, 0);
 
 	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
@@ -196,6 +186,9 @@ int ipv4_from_lxc_encrypt_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l4->dest != tcp_svc_one)
 		test_fatal("dst TCP port was changed");
 
+	if (l4->check != bpf_htons(0x589c))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
 	payload = (void *)l4 + sizeof(struct tcphdr);
 	if ((void *)payload + sizeof(default_data) > data_end)
 		test_fatal("paylaod out of bounds\n");
@@ -220,7 +213,7 @@ int ipv4_from_lxc_new_local_key_setup(struct __ctx_buff *ctx)
 	__u32 encrypt_key = 0;
 	struct encrypt_config encrypt_value = { .encrypt_key = ENCRYPT_KEY + 1 };
 
-	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
+	map_update_elem(&cilium_encrypt_state, &encrypt_key, &encrypt_value, BPF_ANY);
 
 	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
@@ -265,7 +258,7 @@ int ipv4_from_lxc_new_remote_key_setup(struct __ctx_buff *ctx)
 	__u32 encrypt_key = 0;
 	struct encrypt_config encrypt_value = { .encrypt_key = ENCRYPT_KEY };
 
-	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
+	map_update_elem(&cilium_encrypt_state, &encrypt_key, &encrypt_value, BPF_ANY);
 
 	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
@@ -328,17 +321,9 @@ int ipv6_from_lxc_encrypt_setup(struct __ctx_buff *ctx)
 	__u32 encrypt_key = 0;
 	struct encrypt_config encrypt_value = { .encrypt_key = ENCRYPT_KEY };
 
-	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
+	map_update_elem(&cilium_encrypt_state, &encrypt_key, &encrypt_value, BPF_ANY);
 
-	struct node_key node_ip = {};
-	struct node_value node_value = {
-		.id = NODE_ID,
-		.spi = 0,
-	};
-
-	node_ip.family = ENDPOINT_KEY_IPV4;
-	node_ip.ip4 = v4_node_two;
-	map_update_elem(&NODE_MAP_V2, &node_ip, &node_value, BPF_ANY);
+	node_v4_add_entry(v4_node_two, NODE_ID, 0);
 
 	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	return TEST_ERROR;
@@ -403,6 +388,9 @@ int ipv6_from_lxc_encrypt_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	if (l4->dest != tcp_svc_one)
 		test_fatal("dst TCP port was changed");
+
+	if (l4->check != bpf_htons(0xdfe3))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	payload = (void *)l4 + sizeof(struct tcphdr);
 	if ((void *)payload + sizeof(default_data) > data_end)

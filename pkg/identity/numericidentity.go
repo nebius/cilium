@@ -16,7 +16,6 @@ import (
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/labels"
-	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -181,14 +180,6 @@ const (
 	ReservedCiliumEtcdOperator2
 )
 
-// localNodeIdentity is the endpoint identity allocated for the local node
-var localNodeIdentity = struct {
-	lock.Mutex
-	identity NumericIdentity
-}{
-	identity: ReservedIdentityRemoteNode,
-}
-
 type wellKnownIdentities map[NumericIdentity]wellKnownIdentity
 
 // wellKnownIdentitity is an identity for well-known security labels for which
@@ -220,6 +211,12 @@ func (w wellKnownIdentities) LookupByLabels(lbls labels.Labels) *Identity {
 	}
 
 	return nil
+}
+
+func (w wellKnownIdentities) ForEach(yield func(*Identity)) {
+	for _, id := range w {
+		yield(id.identity)
+	}
 }
 
 func (w wellKnownIdentities) lookupByNumericIdentity(identity NumericIdentity) *Identity {
@@ -406,19 +403,19 @@ func initClusterIDShift() {
 
 // GetMinimalNumericIdentity returns the minimal numeric identity not used for
 // reserved purposes.
-func GetMinimalAllocationIdentity() NumericIdentity {
-	if option.Config.ClusterID > 0 {
+func GetMinimalAllocationIdentity(clusterID uint32) NumericIdentity {
+	if clusterID > 0 {
 		// For ClusterID > 0, the identity range just starts from cluster shift,
 		// no well-known-identities need to be reserved from the range.
-		return NumericIdentity((1 << GetClusterIDShift()) * option.Config.ClusterID)
+		return NumericIdentity((1 << GetClusterIDShift()) * clusterID)
 	}
 	return MinimalNumericIdentity
 }
 
 // GetMaximumAllocationIdentity returns the maximum numeric identity that
 // should be handed out by the identity allocator.
-func GetMaximumAllocationIdentity() NumericIdentity {
-	return NumericIdentity((1<<GetClusterIDShift())*(option.Config.ClusterID+1) - 1)
+func GetMaximumAllocationIdentity(clusterID uint32) NumericIdentity {
+	return NumericIdentity((1<<GetClusterIDShift())*(clusterID+1) - 1)
 }
 
 var (
@@ -563,23 +560,6 @@ func (id NumericIdentity) String() string {
 // Uint32 normalizes the ID for use in BPF program.
 func (id NumericIdentity) Uint32() uint32 {
 	return uint32(id)
-}
-
-// GetLocalNodeID returns the configured local node numeric identity that is
-// set in tunnel headers when encapsulating packets originating from the local
-// node.
-func GetLocalNodeID() NumericIdentity {
-	localNodeIdentity.Lock()
-	defer localNodeIdentity.Unlock()
-	return localNodeIdentity.identity
-}
-
-// SetLocalNodeID sets the local node id.
-// Note that currently changes to the local node id only take effect during agent bootstrap
-func SetLocalNodeID(nodeid uint32) {
-	localNodeIdentity.Lock()
-	defer localNodeIdentity.Unlock()
-	localNodeIdentity.identity = NumericIdentity(nodeid)
 }
 
 func GetReservedID(name string) NumericIdentity {

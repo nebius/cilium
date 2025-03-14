@@ -8,8 +8,11 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/require"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
@@ -82,10 +85,10 @@ func TestServiceReconcilerWithLoadBalancer(t *testing.T) {
 	svc1IPv6ETPLocal.Spec.ExternalTrafficPolicy = slim_corev1.ServiceExternalTrafficPolicyLocal
 
 	svc1LbClass := svc1.DeepCopy()
-	svc1LbClass.Spec.LoadBalancerClass = pointer.String(v2alpha1api.BGPLoadBalancerClass)
+	svc1LbClass.Spec.LoadBalancerClass = ptr.To[string](v2alpha1api.BGPLoadBalancerClass)
 
 	svc1UnsupportedClass := svc1LbClass.DeepCopy()
-	svc1UnsupportedClass.Spec.LoadBalancerClass = pointer.String("io.vendor/unsupported-class")
+	svc1UnsupportedClass.Spec.LoadBalancerClass = ptr.To[string]("io.vendor/unsupported-class")
 
 	svc2NonDefault := &slim_corev1.Service{
 		ObjectMeta: slim_metav1.ObjectMeta{
@@ -122,6 +125,26 @@ func TestServiceReconcilerWithLoadBalancer(t *testing.T) {
 		Backends: map[cmtypes.AddrCluster]*k8s.Backend{
 			cmtypes.MustParseAddrCluster("10.0.0.1"): {
 				NodeName: "node1",
+			},
+		},
+	}
+
+	eps1IPv4LocalTerminating := &k8s.Endpoints{
+		ObjectMeta: slim_metav1.ObjectMeta{
+			Name:      "svc-1-ipv4",
+			Namespace: "default",
+		},
+		EndpointSliceID: k8s.EndpointSliceID{
+			ServiceID: k8s.ServiceID{
+				Name:      "svc-1",
+				Namespace: "default",
+			},
+			EndpointSliceName: "svc-1-ipv4",
+		},
+		Backends: map[cmtypes.AddrCluster]*k8s.Backend{
+			cmtypes.MustParseAddrCluster("10.0.0.1"): {
+				NodeName:    "node1",
+				Terminating: true,
 			},
 		},
 	}
@@ -447,6 +470,16 @@ func TestServiceReconcilerWithLoadBalancer(t *testing.T) {
 			upsertedEndpoints:  []*k8s.Endpoints{},
 			updated:            map[resource.Key][]string{},
 		},
+		// Service with terminating endpoint
+		{
+			name:               "etp-local-terminating-endpoint",
+			oldServiceSelector: &blueSelector,
+			newServiceSelector: &blueSelector,
+			advertised:         map[resource.Key][]string{},
+			upsertedServices:   []*slim_corev1.Service{svc1ETPLocal},
+			upsertedEndpoints:  []*k8s.Endpoints{eps1IPv4LocalTerminating},
+			updated:            map[resource.Key][]string{},
+		},
 		// externalTrafficPolicy=Local && IPv4 && single slice && local endpoint
 		{
 			name:               "etp-local-ipv4-single-slice-local",
@@ -574,9 +607,32 @@ func TestServiceReconcilerWithLoadBalancer(t *testing.T) {
 				},
 			},
 		},
+		// service VIP sharing, delete one of the services
+		{
+			name:               "svc-vip-sharing",
+			oldServiceSelector: &blueSelector,
+			newServiceSelector: &blueSelector,
+			advertised: map[resource.Key][]string{
+				svc1Name: {
+					ingressV4Prefix,
+				},
+				svc2NonDefaultName: {
+					ingressV4Prefix,
+				},
+			},
+			deletedServices: []resource.Key{
+				svc1Name,
+			},
+			updated: map[resource.Key][]string{
+				svc2NonDefaultName: {
+					ingressV4Prefix,
+				},
+			},
+		},
 	}
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
+			l := hivetest.Logger(t)
 			// setup our test server, create a BgpServer, advertise the tt.advertised
 			// networks, and store each returned Advertisement in testSC.PodCIDRAnnouncements
 			srvParams := types.ServerParameters{
@@ -591,26 +647,29 @@ func TestServiceReconcilerWithLoadBalancer(t *testing.T) {
 				Neighbors:       []v2alpha1api.CiliumBGPNeighbor{},
 				ServiceSelector: tt.oldServiceSelector,
 			}
-			testSC, err := instance.NewServerWithConfig(context.Background(), log, srvParams)
+			testSC, err := instance.NewServerWithConfig(context.Background(), l, srvParams)
 			if err != nil {
 				t.Fatalf("failed to create test bgp server: %v", err)
 			}
 			testSC.Config = oldc
 
 			diffstore := store.NewFakeDiffStore[*slim_corev1.Service]()
+			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
+
+			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
+			reconciler.Init(testSC)
+			defer reconciler.Cleanup(testSC)
+
 			for _, obj := range tt.upsertedServices {
 				diffstore.Upsert(obj)
 			}
 			for _, key := range tt.deletedServices {
 				diffstore.Delete(key)
 			}
-
-			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
 			for _, obj := range tt.upsertedEndpoints {
 				epDiffStore.Upsert(obj)
 			}
 
-			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
 			serviceAnnouncements := reconciler.getMetadata(testSC)
 
 			for svcKey, cidrs := range tt.advertised {
@@ -661,7 +720,10 @@ func TestServiceReconcilerWithLoadBalancer(t *testing.T) {
 				}
 			}
 
-			log.Printf("%+v %+v", serviceAnnouncements, tt.updated)
+			l.Debug("debug message",
+				types.ServicesAnnouncementsLogField, serviceAnnouncements,
+				types.ServicesUpdatedLogField, tt.updated,
+			)
 
 			// ensure we see tt.updated in testSC.ServiceAnnouncements
 			for svcKey, cidrs := range tt.updated {
@@ -695,6 +757,8 @@ func TestServiceReconcilerWithLoadBalancer(t *testing.T) {
 				}
 			}
 
+			// validate that advertised paths match expected metadata
+			validateAdvertisedPrefixesMatch(t, testSC, tt.updated)
 		})
 	}
 }
@@ -751,10 +815,10 @@ func TestServiceReconcilerWithClusterIP(t *testing.T) {
 	svc1IPv6ITPLocal.Spec.InternalTrafficPolicy = &internalTrafficPolicyLocal
 
 	svc1LbClass := svc1.DeepCopy()
-	svc1LbClass.Spec.LoadBalancerClass = pointer.String(v2alpha1api.BGPLoadBalancerClass)
+	svc1LbClass.Spec.LoadBalancerClass = ptr.To[string](v2alpha1api.BGPLoadBalancerClass)
 
 	svc1UnsupportedClass := svc1LbClass.DeepCopy()
-	svc1UnsupportedClass.Spec.LoadBalancerClass = pointer.String("io.vendor/unsupported-class")
+	svc1UnsupportedClass.Spec.LoadBalancerClass = ptr.To[string]("io.vendor/unsupported-class")
 
 	svc2NonDefault := &slim_corev1.Service{
 		ObjectMeta: slim_metav1.ObjectMeta{
@@ -1233,6 +1297,7 @@ func TestServiceReconcilerWithClusterIP(t *testing.T) {
 	}
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
+			log := hivetest.Logger(t)
 			// setup our test server, create a BgpServer, advertise the tt.advertised
 			// networks, and store each returned Advertisement in testSC.PodCIDRAnnouncements
 			srvParams := types.ServerParameters{
@@ -1254,19 +1319,22 @@ func TestServiceReconcilerWithClusterIP(t *testing.T) {
 			testSC.Config = oldc
 
 			diffstore := store.NewFakeDiffStore[*slim_corev1.Service]()
+			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
+
+			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
+			reconciler.Init(testSC)
+			defer reconciler.Cleanup(testSC)
+
 			for _, obj := range tt.upsertedServices {
 				diffstore.Upsert(obj)
 			}
 			for _, key := range tt.deletedServices {
 				diffstore.Delete(key)
 			}
-
-			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
 			for _, obj := range tt.upsertedEndpoints {
 				epDiffStore.Upsert(obj)
 			}
 
-			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
 			serviceAnnouncements := reconciler.getMetadata(testSC)
 
 			for svcKey, cidrs := range tt.advertised {
@@ -1317,7 +1385,10 @@ func TestServiceReconcilerWithClusterIP(t *testing.T) {
 				}
 			}
 
-			log.Printf("%+v %+v", serviceAnnouncements, tt.updated)
+			log.Debug("debug message",
+				types.ServicesAnnouncementsLogField, serviceAnnouncements,
+				types.ServicesUpdatedLogField, tt.updated,
+			)
 
 			// ensure we see tt.updated in testSC.ServiceAnnouncements
 			for svcKey, cidrs := range tt.updated {
@@ -1351,6 +1422,8 @@ func TestServiceReconcilerWithClusterIP(t *testing.T) {
 				}
 			}
 
+			// validate that advertised paths match expected metadata
+			validateAdvertisedPrefixesMatch(t, testSC, tt.updated)
 		})
 	}
 }
@@ -1406,10 +1479,10 @@ func TestServiceReconcilerWithExternalIP(t *testing.T) {
 	svc1IPv6ETPLocal.Spec.ExternalTrafficPolicy = slim_corev1.ServiceExternalTrafficPolicyLocal
 
 	svc1LbClass := svc1.DeepCopy()
-	svc1LbClass.Spec.LoadBalancerClass = pointer.String(v2alpha1api.BGPLoadBalancerClass)
+	svc1LbClass.Spec.LoadBalancerClass = ptr.To[string](v2alpha1api.BGPLoadBalancerClass)
 
 	svc1UnsupportedClass := svc1LbClass.DeepCopy()
-	svc1UnsupportedClass.Spec.LoadBalancerClass = pointer.String("io.vendor/unsupported-class")
+	svc1UnsupportedClass.Spec.LoadBalancerClass = ptr.To[string]("io.vendor/unsupported-class")
 
 	svc2NonDefault := &slim_corev1.Service{
 		ObjectMeta: slim_metav1.ObjectMeta{
@@ -1887,6 +1960,7 @@ func TestServiceReconcilerWithExternalIP(t *testing.T) {
 	}
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
+			log := hivetest.Logger(t)
 			// setup our test server, create a BgpServer, advertise the tt.advertised
 			// networks, and store each returned Advertisement in testSC.PodCIDRAnnouncements
 			srvParams := types.ServerParameters{
@@ -1908,19 +1982,22 @@ func TestServiceReconcilerWithExternalIP(t *testing.T) {
 			testSC.Config = oldc
 
 			diffstore := store.NewFakeDiffStore[*slim_corev1.Service]()
+			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
+
+			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
+			reconciler.Init(testSC)
+			defer reconciler.Cleanup(testSC)
+
 			for _, obj := range tt.upsertedServices {
 				diffstore.Upsert(obj)
 			}
 			for _, key := range tt.deletedServices {
 				diffstore.Delete(key)
 			}
-
-			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
 			for _, obj := range tt.upsertedEndpoints {
 				epDiffStore.Upsert(obj)
 			}
 
-			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
 			serviceAnnouncements := reconciler.getMetadata(testSC)
 
 			for svcKey, cidrs := range tt.advertised {
@@ -1971,7 +2048,10 @@ func TestServiceReconcilerWithExternalIP(t *testing.T) {
 				}
 			}
 
-			log.Printf("%+v %+v", serviceAnnouncements, tt.updated)
+			log.Debug("debug message",
+				types.ServicesAnnouncementsLogField, serviceAnnouncements,
+				types.ServicesUpdatedLogField, tt.updated,
+			)
 
 			// ensure we see tt.updated in testSC.ServiceAnnouncements
 			for svcKey, cidrs := range tt.updated {
@@ -2005,7 +2085,157 @@ func TestServiceReconcilerWithExternalIP(t *testing.T) {
 				}
 			}
 
+			// validate that advertised paths match expected metadata
+			validateAdvertisedPrefixesMatch(t, testSC, tt.updated)
 		})
+	}
+}
+
+func TestEPUpdateOnly(t *testing.T) {
+	blueSelector := slim_metav1.LabelSelector{MatchLabels: map[string]string{"color": "blue"}}
+	svc1Name := resource.Key{Name: "svc-1", Namespace: "default"}
+	clusterIPV4 := "192.168.0.1"
+	clusterIPV4Prefix := clusterIPV4 + "/32"
+
+	svc1 := &slim_corev1.Service{
+		ObjectMeta: slim_metav1.ObjectMeta{
+			Name:      svc1Name.Name,
+			Namespace: svc1Name.Namespace,
+			Labels:    blueSelector.MatchLabels,
+		},
+		Spec: slim_corev1.ServiceSpec{
+			Type:      slim_corev1.ServiceTypeClusterIP,
+			ClusterIP: clusterIPV4,
+			ClusterIPs: []string{
+				clusterIPV4,
+			},
+		},
+	}
+
+	svc1WithITP := svc1.DeepCopy()
+	internalTrafficPolicyLocal := slim_corev1.ServiceInternalTrafficPolicyLocal
+	svc1WithITP.Spec.InternalTrafficPolicy = &internalTrafficPolicyLocal
+
+	eps1IPv4Local := &k8s.Endpoints{
+		ObjectMeta: slim_metav1.ObjectMeta{
+			Name:      "svc-1-ipv4",
+			Namespace: "default",
+		},
+		EndpointSliceID: k8s.EndpointSliceID{
+			ServiceID: k8s.ServiceID{
+				Name:      "svc-1",
+				Namespace: "default",
+			},
+			EndpointSliceName: "svc-1-ipv4",
+		},
+		Backends: map[cmtypes.AddrCluster]*k8s.Backend{
+			cmtypes.MustParseAddrCluster("10.0.0.1"): {
+				NodeName: "node1",
+			},
+		},
+	}
+	eps1IPv4LocalUpdated := eps1IPv4Local.DeepCopy()
+	eps1IPv4LocalUpdated.Backends = map[cmtypes.AddrCluster]*k8s.Backend{
+		cmtypes.MustParseAddrCluster("10.0.0.1"): {
+			NodeName: "node2",
+		},
+	}
+
+	steps := []struct {
+		name             string
+		vr               *v2alpha1api.CiliumBGPVirtualRouter
+		upsertServices   []*slim_corev1.Service
+		upsertEPs        []*k8s.Endpoints
+		expectedMetadata map[resource.Key][]string
+	}{
+		{
+			name:           "initial setup, cluster wide service",
+			upsertServices: []*slim_corev1.Service{svc1},
+			expectedMetadata: map[resource.Key][]string{
+				svc1Name: {clusterIPV4Prefix},
+			},
+		},
+		{
+			name:             "set service to internalTrafficPolicy=Local",
+			upsertServices:   []*slim_corev1.Service{svc1WithITP},
+			expectedMetadata: map[resource.Key][]string{}, // since there is no local endpoint, no metadata should be added
+		},
+		{
+			name:           "add local endpoint",
+			upsertServices: []*slim_corev1.Service{},        // no update to service
+			upsertEPs:      []*k8s.Endpoints{eps1IPv4Local}, // update endpoints
+			expectedMetadata: map[resource.Key][]string{ // metadata should be added
+				svc1Name: {clusterIPV4Prefix},
+			},
+		},
+		{
+			name:             "remove local endpoint",
+			upsertServices:   []*slim_corev1.Service{},               // no update to service
+			upsertEPs:        []*k8s.Endpoints{eps1IPv4LocalUpdated}, // update endpoint to have backend as node2
+			expectedMetadata: map[resource.Key][]string{              // metadata should be removed
+			},
+		},
+	}
+
+	srvParams := types.ServerParameters{
+		Global: types.BGPGlobal{
+			ASN:        64125,
+			RouterID:   "127.0.0.1",
+			ListenPort: -1,
+		},
+	}
+
+	req := require.New(t)
+
+	vr := &v2alpha1api.CiliumBGPVirtualRouter{
+		LocalASN:              64125,
+		Neighbors:             []v2alpha1api.CiliumBGPNeighbor{},
+		ServiceSelector:       &blueSelector,
+		ServiceAdvertisements: []v2alpha1api.BGPServiceAddressType{v2alpha1api.BGPClusterIPAddr},
+	}
+
+	testSC, err := instance.NewServerWithConfig(context.Background(), hivetest.Logger(t), srvParams)
+	req.NoError(err)
+
+	testSC.Config = vr
+
+	diffstore := store.NewFakeDiffStore[*slim_corev1.Service]()
+	epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
+	reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
+	reconciler.Init(testSC)
+	defer reconciler.Cleanup(testSC)
+
+	for _, step := range steps {
+		t.Logf("running step: %s", step.name)
+
+		for _, svc := range step.upsertServices {
+			diffstore.Upsert(svc)
+		}
+
+		for _, ep := range step.upsertEPs {
+			epDiffStore.Upsert(ep)
+		}
+
+		err := reconciler.Reconcile(context.Background(), ReconcileParams{
+			CurrentServer: testSC,
+			DesiredConfig: vr,
+			CiliumNode: &v2api.CiliumNode{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name: "node1",
+				},
+			},
+		})
+		req.NoError(err)
+
+		// running paths
+		running := make(map[resource.Key][]string)
+		for key, paths := range reconciler.getMetadata(testSC) {
+			for _, path := range paths {
+				running[key] = append(running[key], path.NLRI.String())
+			}
+		}
+
+		req.Equal(step.expectedMetadata, running)
 	}
 }
 
@@ -2084,6 +2314,7 @@ func TestServiceReconcilerWithExternalIPAndClusterIP(t *testing.T) {
 	}
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
+			log := hivetest.Logger(t)
 			// setup our test server, create a BgpServer, advertise the tt.advertised
 			// networks, and store each returned Advertisement in testSC.PodCIDRAnnouncements
 			srvParams := types.ServerParameters{
@@ -2105,19 +2336,22 @@ func TestServiceReconcilerWithExternalIPAndClusterIP(t *testing.T) {
 			testSC.Config = oldc
 
 			diffstore := store.NewFakeDiffStore[*slim_corev1.Service]()
+			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
+
+			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
+			reconciler.Init(testSC)
+			defer reconciler.Cleanup(testSC)
+
 			for _, obj := range tt.upsertedServices {
 				diffstore.Upsert(obj)
 			}
 			for _, key := range tt.deletedServices {
 				diffstore.Delete(key)
 			}
-
-			epDiffStore := store.NewFakeDiffStore[*k8s.Endpoints]()
 			for _, obj := range tt.upsertedEndpoints {
 				epDiffStore.Upsert(obj)
 			}
 
-			reconciler := NewServiceReconciler(diffstore, epDiffStore).Reconciler.(*ServiceReconciler)
 			serviceAnnouncements := reconciler.getMetadata(testSC)
 
 			for svcKey, cidrs := range tt.advertised {
@@ -2168,7 +2402,10 @@ func TestServiceReconcilerWithExternalIPAndClusterIP(t *testing.T) {
 				}
 			}
 
-			log.Printf("%+v %+v", serviceAnnouncements, tt.updated)
+			log.Debug("debug message",
+				types.ServicesAnnouncementsLogField, serviceAnnouncements,
+				types.ServicesUpdatedLogField, tt.updated,
+			)
 
 			// ensure we see tt.updated in testSC.ServiceAnnouncements
 			for svcKey, cidrs := range tt.updated {
@@ -2202,6 +2439,8 @@ func TestServiceReconcilerWithExternalIPAndClusterIP(t *testing.T) {
 				}
 			}
 
+			// validate that advertised paths match expected metadata
+			validateAdvertisedPrefixesMatch(t, testSC, tt.updated)
 		})
 	}
 }
@@ -2212,4 +2451,39 @@ func containsLbClass(svcs []*slim_corev1.Service) bool {
 		}
 	}
 	return false
+}
+
+func validateAdvertisedPrefixesMatch(t *testing.T, testSC *instance.ServerWithConfig, expectedAdverts map[resource.Key][]string) {
+	expected := sets.New[string]()
+	for _, resourcePaths := range expectedAdverts {
+		for _, path := range resourcePaths {
+			expected.Insert(path)
+		}
+	}
+
+	advertised := sets.New[string]()
+	routes, err := testSC.Server.GetRoutes(context.Background(), &types.GetRoutesRequest{TableType: types.TableTypeLocRIB, Family: types.Family{
+		Afi:  types.AfiIPv4,
+		Safi: types.SafiUnicast,
+	}})
+	require.NoError(t, err)
+	for _, route := range routes.Routes {
+		for _, path := range route.Paths {
+			advertised.Insert(path.NLRI.String())
+		}
+	}
+	routes, _ = testSC.Server.GetRoutes(context.Background(), &types.GetRoutesRequest{TableType: types.TableTypeLocRIB, Family: types.Family{
+		Afi:  types.AfiIPv6,
+		Safi: types.SafiUnicast,
+	}})
+	require.NoError(t, err)
+	for _, route := range routes.Routes {
+		for _, path := range route.Paths {
+			advertised.Insert(path.NLRI.String())
+		}
+	}
+
+	if !advertised.Equal(expected) {
+		t.Fatalf("advertised prefixes do not match expected metadata, expected: %v, got: %v", expected, advertised)
+	}
 }

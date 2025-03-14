@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cilium/hive/cell"
 	"github.com/cilium/stream"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -21,8 +22,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
 	k8smetrics "github.com/cilium/cilium/pkg/k8s/metrics"
+	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/metrics"
@@ -153,12 +154,13 @@ func New[T k8sRuntime.Object](lc cell.Lifecycle, lw cache.ListerWatcher, opts ..
 }
 
 type options struct {
-	transform   cache.TransformFunc      // if non-nil, the object is transformed with this function before storing
-	sourceObj   func() k8sRuntime.Object // prototype for the object before it is transformed
-	indexers    cache.Indexers           // map of the optional custom indexers to be added to the underlying resource informer
-	metricScope string                   // the scope label used when recording metrics for the resource
-	name        string                   // the name label used for the workqueue metrics
-	releasable  bool                     // if true, the underlying informer will be stopped when the last subscriber cancels its subscription
+	transform      cache.TransformFunc             // if non-nil, the object is transformed with this function before storing
+	sourceObj      func() k8sRuntime.Object        // prototype for the object before it is transformed
+	indexers       cache.Indexers                  // map of the optional custom indexers to be added to the underlying resource informer
+	metricScope    string                          // the scope label used when recording metrics for the resource
+	name           string                          // the name label used for the workqueue metrics
+	releasable     bool                            // if true, the underlying informer will be stopped when the last subscriber cancels its subscription
+	crdSyncPromise promise.Promise[synced.CRDSync] // optional promise to wait for
 }
 
 type ResourceOption func(o *options)
@@ -209,6 +211,12 @@ func WithIndexers(indexers cache.Indexers) ResourceOption {
 func WithName(name string) ResourceOption {
 	return func(o *options) {
 		o.name = name
+	}
+}
+
+func WithCRDSync(crdSyncPromise promise.Promise[synced.CRDSync]) ResourceOption {
+	return func(o *options) {
+		o.crdSyncPromise = crdSyncPromise
 	}
 }
 
@@ -354,6 +362,11 @@ func (r *resource[T]) startWhenNeeded() {
 		return
 	}
 
+	// Wait for CRDs to have synced before trying to access (Cilium) k8s resources
+	if r.opts.crdSyncPromise != nil {
+		r.opts.crdSyncPromise.Await(r.ctx)
+	}
+
 	store, informer := r.newInformer()
 	r.storeResolver.Resolve(&typedStore[T]{
 		store:   store,
@@ -393,14 +406,14 @@ func (r *resource[T]) Stop(stopCtx cell.HookContext) error {
 }
 
 type eventsOpts struct {
-	rateLimiter  workqueue.RateLimiter
+	rateLimiter  workqueue.TypedRateLimiter[WorkItem]
 	errorHandler ErrorHandler
 }
 
 type EventsOpt func(*eventsOpts)
 
 // WithRateLimiter sets the rate limiting algorithm to be used when requeueing failed events.
-func WithRateLimiter(r workqueue.RateLimiter) EventsOpt {
+func WithRateLimiter(r workqueue.TypedRateLimiter[WorkItem]) EventsOpt {
 	return func(o *eventsOpts) {
 		o.rateLimiter = r
 	}
@@ -439,7 +452,7 @@ func (r *resource[T]) Events(ctx context.Context, opts ...EventsOpt) <-chan Even
 
 	options := eventsOpts{
 		errorHandler: AlwaysRetry, // Default error handling is to always retry.
-		rateLimiter:  workqueue.DefaultControllerRateLimiter(),
+		rateLimiter:  workqueue.DefaultTypedControllerRateLimiter[WorkItem](),
 	}
 	for _, apply := range opts {
 		apply(&options)
@@ -455,8 +468,8 @@ func (r *resource[T]) Events(ctx context.Context, opts ...EventsOpt) <-chan Even
 		r:         r,
 		options:   options,
 		debugInfo: debugInfo,
-		wq: workqueue.NewRateLimitingQueueWithConfig(options.rateLimiter,
-			workqueue.RateLimitingQueueConfig{Name: r.resourceName()}),
+		wq: workqueue.NewTypedRateLimitingQueueWithConfig[WorkItem](options.rateLimiter,
+			workqueue.TypedRateLimitingQueueConfig[WorkItem]{Name: r.resourceName()}),
 	}
 
 	// Fork a goroutine to process the queued keys and pass them to the subscriber.
@@ -574,7 +587,7 @@ func (r *resource[T]) resourceName() string {
 type subscriber[T k8sRuntime.Object] struct {
 	r         *resource[T]
 	debugInfo string
-	wq        workqueue.RateLimitingInterface
+	wq        workqueue.TypedRateLimitingInterface[WorkItem]
 	options   eventsOpts
 }
 
@@ -680,13 +693,12 @@ loop:
 	}
 }
 
-func (s *subscriber[T]) getWorkItem() (e workItem, shutdown bool) {
-	var raw any
-	raw, shutdown = s.wq.Get()
+func (s *subscriber[T]) getWorkItem() (e WorkItem, shutdown bool) {
+	raw, shutdown := s.wq.Get()
 	if shutdown {
 		return
 	}
-	return raw.(workItem), false
+	return raw, false
 }
 
 func (s *subscriber[T]) enqueueSync() {
@@ -697,7 +709,7 @@ func (s *subscriber[T]) enqueueKey(key Key) {
 	s.wq.Add(keyWorkItem{key})
 }
 
-func (s *subscriber[T]) eventDone(entry workItem, err error) {
+func (s *subscriber[T]) eventDone(entry WorkItem, err error) {
 	// This is based on the example found in k8s.io/client-go/examples/worsueue/main.go.
 
 	// Mark the object as done being processed. If it was marked dirty
@@ -774,13 +786,13 @@ func (l *lastKnownObjects[T]) DeleteByUID(key Key, objToDelete T) {
 	}
 }
 
-// workItem restricts the set of types we use when type-switching over the
+// WorkItem restricts the set of types we use when type-switching over the
 // queue entries, so that we'll get a compiler error on impossible types.
 //
 // The queue entries must be kept comparable and not be pointers as we want
 // to be able to coalesce multiple keyEntry's into a single element in the
 // queue.
-type workItem interface {
+type WorkItem interface {
 	isWorkItem()
 }
 
@@ -837,6 +849,9 @@ func (r *resource[T]) newInformer() (cache.Indexer, cache.Controller) {
 				} else {
 					obj = d.Object
 				}
+
+				// Deduplicate the strings in the object metadata to reduce memory consumption.
+				resources.DedupMetadata(obj)
 
 				// In CI we detect if the objects were modified and panic
 				// (e.g. when KUBE_CACHE_MUTATION_DETECTOR is set)

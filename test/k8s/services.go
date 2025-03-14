@@ -55,6 +55,7 @@ var _ = SkipDescribeIf(helpers.RunsOn54Kernel, "K8sDatapathServicesTest", func()
 
 	JustAfterEach(func() {
 		kubectl.ValidateNoErrorsInLogs(CurrentGinkgoTestDescription().Duration)
+		kubectl.CollectFeatures()
 	})
 
 	AfterAll(func() {
@@ -181,7 +182,7 @@ var _ = SkipDescribeIf(helpers.RunsOn54Kernel, "K8sDatapathServicesTest", func()
 				testExternalTrafficPolicyLocal(kubectl, ni)
 			})
 
-			It("", func() {
+			It("vanilla", func() {
 				testNodePort(kubectl, ni, false, false, 0)
 			})
 		})
@@ -630,7 +631,7 @@ Secondary Interface %s :: IPv4: (%s, %s), IPv6: (%s, %s)`,
 
 			DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, options)
 
-			cmd := fmt.Sprintf("cilium config %s=%s", helpers.OptionConntrackAccounting, helpers.OptionEnabled)
+			cmd := fmt.Sprintf("cilium-dbg config %s=%s", helpers.OptionConntrackAccounting, helpers.OptionEnabled)
 			kubectl.CiliumExecMustSucceedOnAll(context.TODO(), cmd, "Unable to enable ConntrackAccounting option")
 			kubectl.CiliumPreFlightCheck()
 			testIPv4FragmentSupport(kubectl, ni)
@@ -731,8 +732,7 @@ Secondary Interface %s :: IPv4: (%s, %s), IPv6: (%s, %s)`,
 				demoYAML = helpers.ManifestGet(kubectl.BasePath(), "demo_ds.yaml")
 
 				DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, map[string]string{
-					"enableRuntimeDeviceDetection": "true",
-					"devices":                      "",
+					"devices": "",
 				})
 
 				res := kubectl.ApplyDefault(demoYAML)

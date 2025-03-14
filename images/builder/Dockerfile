@@ -1,19 +1,19 @@
 # Copyright Authors of Cilium
 # SPDX-License-Identifier: Apache-2.0
 
-ARG COMPILERS_IMAGE=quay.io/cilium/image-compilers:5569a29cea6b3ad50aeb03102aaf3dc03841197c@sha256:b15dbedb7c49816c74a765e2f6ecdb9359763b8e4e4328d794f48b9cefae9804
-ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:718ae7f39c7c7374371542e7aeffec7e61ab3fe8@sha256:439520d2384f013908cede8388cc40a0eafcc14a864f02fd365c5f3a8c6a15c8
-ARG TESTER_IMAGE=quay.io/cilium/image-tester:dd09c8d3ef349a909fbcdc99279516baef153f22@sha256:c056d064cb47c97acd607343db5457e1d49d9338d6d8a87e93e23cc93f052c73
-ARG GOLANG_IMAGE=docker.io/library/golang:1.22.2@sha256:c4fb952e712efd8f787bcd8e53fd66d1d83b7dc26adabc218e9eac1dbf776bdf
-ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:a8c542efc076b62ba683e7699c0013adb6955f0f@sha256:38e8941107bd19eb30bdde6e478760a22325f38d1f2771dfd1b9af81d74235e7
+ARG COMPILERS_IMAGE=quay.io/cilium/image-compilers:f51ffb467692a59696b144dfe2f1ddeae1bb6bca@sha256:32f5f098d74db46c9d0405e25236828d22b7e3d7006387f9287b4aee48bc85c6
+ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:460f0f4ce8fbd76288df659613f6f32a4a57d4a7@sha256:8e0a59a23a869029421498379399bbf96fb0531a60da302d30c33fb2d94eaff3
+ARG TESTER_IMAGE=quay.io/cilium/image-tester:0a7ee27812441d95926aec83929d97e93ce96aae@sha256:e96542b4f71dbc9cbe77feaf5b1fa9bd5e13122ee6418094731212f1c5667c67
+ARG GOLANG_IMAGE=docker.io/library/golang:1.24.0@sha256:3f7444391c51a11a039bf0359ee81cc64e663c17d787ad0e637a4de1a3f62a71
+ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:1732033893-de666b6@sha256:ee005bd47b20f78a727c06fdf2275861848be7acd242603c82f86ca8faaeda90
 
-FROM ${COMPILERS_IMAGE} as compilers-image
+FROM ${COMPILERS_IMAGE} AS compilers-image
 
-FROM ${GOLANG_IMAGE} as golang-dist
+FROM ${GOLANG_IMAGE} AS golang-dist
 
-FROM ${CILIUM_LLVM_IMAGE} as llvm-dist
+FROM ${CILIUM_LLVM_IMAGE} AS llvm-dist
 
-FROM ${CILIUM_RUNTIME_IMAGE} as rootfs
+FROM ${CILIUM_RUNTIME_IMAGE} AS rootfs
 
 # Change the number to force the generation of a new git-tree SHA. Useful when
 # we want to re-run 'apt-get upgrade' for stale images.
@@ -43,7 +43,8 @@ RUN \
       gcc \
       git \
       libc6-dev \
-      make && \
+      make \
+      ccache && \
     apt-get purge --auto-remove && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
@@ -56,7 +57,7 @@ ENV GOROOT /usr/local/go
 ENV GOPATH /go
 ENV PATH "${GOROOT}/bin:${GOPATH}/bin:${PATH}"
 
-RUN CGO_ENABLED=0 go install github.com/go-delve/delve/cmd/dlv@latest
+RUN GOARCH=${TARGETARCH} CGO_ENABLED=0 go install github.com/go-delve/delve/cmd/dlv@latest
 
 WORKDIR /go/src/github.com/cilium/cilium/images/builder
 RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/builder \
@@ -77,6 +78,11 @@ RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/b
 
 # used to facilitate the verifier tests
 COPY --from=llvm-dist /usr/local/bin/llvm-objcopy /bin/
+
+# Create a cache directory with 777 so that we can run the builder image and
+# compile golang code from any UID.
+RUN mkdir -p /.cache && chmod 777 /.cache && \
+    mkdir -p /go/bin && chmod 777 /go/bin
 
 FROM ${TESTER_IMAGE} as test
 COPY --from=rootfs / /

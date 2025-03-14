@@ -93,13 +93,12 @@ Install Cilium
 
           helm install cilium |CHART_RELEASE| \\
             --namespace kube-system \\
-            --set aksbyocni.enabled=true \\
-            --set nodeinit.enabled=true
-         
-         .. note::
+            --set aksbyocni.enabled=true
 
-            Installing Cilium via helm is supported only for AKS BYOCNI cluster and 
-            not for Azure CNI Powered by Cilium clusters.
+       .. note::
+
+          Installing Cilium via helm is supported only for AKS BYOCNI cluster and
+          not for Azure CNI Powered by Cilium clusters.
 
     .. group-tab:: EKS
 
@@ -124,7 +123,7 @@ Install Cilium
             --namespace kube-system \\
             --set eni.enabled=true \\
             --set ipam.mode=eni \\
-            --set egressMasqueradeInterfaces=eth0 \\
+            --set egressMasqueradeInterfaces=eth+ \\
             --set routingMode=native
 
        .. note::
@@ -163,8 +162,10 @@ Install Cilium
                      && iptables -t nat -F AWS-CONNMARK-CHAIN-1
 
          Some Linux distributions use a different interface naming convention.
-         If you use masquerading with the option ``egressMasqueradeInterfaces=eth0``,
-         remember to replace ``eth0`` with the proper interface name.
+         If you use masquerading with the option ``egressMasqueradeInterfaces=eth+``,
+         remember to replace ``eth+`` with the proper interface name. For
+         reference, Amazon Linux 2 uses ``eth+``, whereas Amazon Linux 2023 uses
+         ``ens+``.
 
     .. group-tab:: OpenShift
 
@@ -220,6 +221,11 @@ Install Cilium
     .. group-tab:: Alibaba ACK
 
         .. include:: ../installation/alibabacloud-eni.rst
+
+.. admonition:: Video
+  :class: attention
+
+  If you'd like to learn more about Cilium Helm values, check out `eCHO episode 117: A Tour of the Cilium Helm Values <https://www.youtube.com/watch?v=ni0Uw4WLHYo>`__.
 
 .. include:: k8s-install-restart-pods.rst
 

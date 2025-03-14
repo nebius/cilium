@@ -77,7 +77,8 @@ to create a Kubernetes cluster locally or using a managed Kubernetes service:
            az aks create \
              --resource-group "${AZURE_RESOURCE_GROUP}" \
              --name "${NAME}" \
-             --network-plugin none
+             --network-plugin none \
+             --generate-ssh-keys
 
            # Get the credentials to access the cluster with kubectl
            az aks get-credentials --resource-group "${AZURE_RESOURCE_GROUP}" --name "${NAME}"
@@ -157,7 +158,7 @@ to create a Kubernetes cluster locally or using a managed Kubernetes service:
        Install Rancher Desktop >= v1.1.0 as per Rancher Desktop documentation:
        `Install Rancher Desktop <https://docs.rancherdesktop.io/getting-started/installation>`_.
 
-       Next you need to configure Rancher Desktop so to disable the builtin CNI so you can install Cilium.
+       Next you need to configure Rancher Desktop to disable the built-in CNI so you can install Cilium.
 
        .. include:: ../installation/rancher-desktop-configure.rst
 

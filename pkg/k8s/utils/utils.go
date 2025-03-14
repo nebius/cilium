@@ -5,7 +5,6 @@ package utils
 
 import (
 	"net"
-	"sort"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -18,6 +17,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/selection"
 	labelsPkg "github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/slices"
 )
 
 const (
@@ -64,12 +64,6 @@ func GetObjNamespaceName(obj NamespaceNameGetter) string {
 	}
 
 	return ns + "/" + obj.GetName()
-}
-
-// PolicyConfiguration is the required configuration for K8s NetworkPolicy
-type PolicyConfiguration interface {
-	// K8sNetworkPolicyEnabled returns true if cilium agent needs to support K8s NetworkPolicy
-	K8sNetworkPolicyEnabled() bool
 }
 
 // GetEndpointSliceListOptionsModifier returns the options modifier for endpointSlice object list.
@@ -149,22 +143,18 @@ func ValidIPs(podStatus slim_corev1.PodStatus) []string {
 	}
 
 	// make it a set first to avoid repeated IP addresses
-	ipsMap := make(map[string]struct{}, 1+len(podStatus.PodIPs))
+	ips := []string{}
 	if podStatus.PodIP != "" {
-		ipsMap[podStatus.PodIP] = struct{}{}
+		ips = append(ips, podStatus.PodIP)
 	}
+
 	for _, podIP := range podStatus.PodIPs {
 		if podIP.IP != "" {
-			ipsMap[podIP.IP] = struct{}{}
+			ips = append(ips, podIP.IP)
 		}
 	}
 
-	ips := make([]string, 0, len(ipsMap))
-	for ipStr := range ipsMap {
-		ips = append(ips, ipStr)
-	}
-	sort.Strings(ips)
-	return ips
+	return slices.SortedUnique(ips)
 }
 
 // IsPodRunning returns true if the pod is considered to be in running state.
@@ -213,8 +203,8 @@ type nameLabelsGetter interface {
 	GetLabels() map[string]string
 }
 
-// filterPodLabels returns a copy of the given labels map, without the labels owned by Cilium.
-func filterPodLabels(labels map[string]string) map[string]string {
+// RemoveCiliumLabels returns a copy of the given labels map, without the labels owned by Cilium.
+func RemoveCiliumLabels(labels map[string]string) map[string]string {
 	res := map[string]string{}
 	for k, v := range labels {
 		if strings.HasPrefix(k, k8sconst.LabelPrefix) {
@@ -228,7 +218,7 @@ func filterPodLabels(labels map[string]string) map[string]string {
 // SanitizePodLabels makes sure that no important pod labels were overridden manually on k8s pod
 // object creation.
 func SanitizePodLabels(podLabels map[string]string, namespace nameLabelsGetter, serviceAccount, clusterName string) map[string]string {
-	sanitizedLabels := filterPodLabels(podLabels)
+	sanitizedLabels := RemoveCiliumLabels(podLabels)
 
 	// Sanitize namespace labels
 	for k, v := range namespace.GetLabels() {
@@ -251,7 +241,7 @@ func SanitizePodLabels(podLabels map[string]string, namespace nameLabelsGetter, 
 // StripPodSpecialLabels strips labels that are not supposed to be coming from a k8s pod object update.
 func StripPodSpecialLabels(labels map[string]string) map[string]string {
 	sanitizedLabels := make(map[string]string)
-	for k, v := range filterPodLabels(labels) {
+	for k, v := range RemoveCiliumLabels(labels) {
 		// If the key contains the prefix for namespace labels then we will
 		// ignore it.
 		if strings.HasPrefix(k, k8sconst.PodNamespaceMetaLabels) {

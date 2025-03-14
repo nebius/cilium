@@ -6,13 +6,12 @@ package ciliumenvoyconfig
 import (
 	"context"
 	"fmt"
-	"io"
 	"maps"
 	"slices"
 	"strings"
 	"testing"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
@@ -20,6 +19,7 @@ import (
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/types"
 )
@@ -309,14 +309,11 @@ func executeForConfigType[T k8sRuntime.Object](t *testing.T,
 ) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			logger := logrus.New()
-			logger.SetOutput(io.Discard)
-
 			manager := &fakeCECManager{
 				shouldFailFor: tc.shouldFailFor,
 			}
 
-			reconciler := newCiliumEnvoyConfigReconciler(logger, manager)
+			reconciler := newCiliumEnvoyConfigReconciler(reconcilerParams{Logger: hivetest.Logger(t), Manager: manager})
 
 			// init current state
 			configs := map[resource.Key]*config{}
@@ -529,14 +526,11 @@ func TestReconcileExistingConfigs(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			logger := logrus.New()
-			logger.SetOutput(io.Discard)
-
 			manager := &fakeCECManager{
 				shouldFailFor: tc.failFor,
 			}
 
-			reconciler := newCiliumEnvoyConfigReconciler(logger, manager)
+			reconciler := newCiliumEnvoyConfigReconciler(reconcilerParams{Logger: hivetest.Logger(t), Manager: manager})
 
 			// init current state
 			reconciler.configs = make(map[resource.Key]*config, len(tc.configs))
@@ -666,14 +660,11 @@ func TestHandleLocalNodeLabels(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			logger := logrus.New()
-			logger.SetOutput(io.Discard)
-
 			manager := &fakeCECManager{
 				shouldFailFor: tc.failFor,
 			}
 
-			reconciler := newCiliumEnvoyConfigReconciler(logger, manager)
+			reconciler := newCiliumEnvoyConfigReconciler(reconcilerParams{Logger: hivetest.Logger(t), Manager: manager})
 
 			// init current state
 			reconciler.configs = make(map[resource.Key]*config, len(tc.configs))
@@ -786,5 +777,9 @@ func (r *fakeCECManager) updateCiliumEnvoyConfig(oldCECObjectMeta metav1.ObjectM
 
 	r.updatedConfigNames = append(r.updatedConfigNames, namespacedName)
 
+	return nil
+}
+
+func (r *fakeCECManager) syncHeadlessService(_ string, _ string, _ loadbalancer.ServiceName, _ []string) error {
 	return nil
 }

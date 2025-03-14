@@ -183,7 +183,7 @@ func detachCgroup(name, cgroupRoot, pinPath string) error {
 func detachAll(attach ebpf.AttachType, cgroupRoot string) error {
 	cg, err := os.Open(cgroupRoot)
 	if err != nil {
-		return fmt.Errorf("open cgroup %s: %w", cg.Name(), err)
+		return fmt.Errorf("open cgroup %s: %w", cgroupRoot, err)
 	}
 	defer cg.Close()
 
@@ -197,6 +197,12 @@ func detachAll(attach ebpf.AttachType, cgroupRoot string) error {
 	// the given attach type is not supported.
 	if errors.Is(err, unix.EINVAL) {
 		err = fmt.Errorf("%w: %w", err, link.ErrNotSupported)
+	}
+	// Even though the cgroup exists, QueryPrograms will return EBADF
+	// on a cgroupv1.
+	if errors.Is(err, unix.EBADF) {
+		log.Debug("The cgroup exists but is a cgroupv1. No detachment necessary")
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("query cgroup %s for type %s: %w", cgroupRoot, attach, err)

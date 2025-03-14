@@ -6,12 +6,13 @@ package cmd
 import (
 	"context"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/loader"
 	"github.com/cilium/cilium/pkg/endpoint"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/time"
@@ -35,7 +36,7 @@ type epBPFProgWatchdogParams struct {
 	Logger        logrus.FieldLogger
 	Lifecycle     cell.Lifecycle
 	DaemonPromise promise.Promise[*Daemon]
-	Scope         cell.Scope
+	Health        cell.Health
 }
 
 var (
@@ -57,7 +58,6 @@ func registerEndpointBPFProgWatchdog(p epBPFProgWatchdogParams) {
 	if p.Config.EndpointBPFProgWatchdogInterval == 0 {
 		return
 	}
-
 	var (
 		ctx, cancel = context.WithCancel(context.Background())
 		mgr         = controller.NewManager()
@@ -67,8 +67,8 @@ func registerEndpointBPFProgWatchdog(p epBPFProgWatchdogParams) {
 			mgr.UpdateController(
 				epBPFProgWatchdog,
 				controller.ControllerParams{
-					Group:          controller.NewGroup(epBPFProgWatchdog),
-					HealthReporter: cell.GetHealthReporter(p.Scope, epBPFProgWatchdog),
+					Group:  controller.NewGroup(epBPFProgWatchdog),
+					Health: p.Health.NewScope(epBPFProgWatchdog),
 					DoFunc: func(ctx context.Context) error {
 						d, err := p.DaemonPromise.Await(ctx)
 						if err != nil {
@@ -106,12 +106,13 @@ func (d *Daemon) checkEndpointBPFPrograms(ctx context.Context, p epBPFProgWatchd
 			// Skip Endpoints without BPF datapath
 			continue
 		}
-		loaded, err = d.datapath.Loader().DeviceHasTCProgramLoaded(ep.HostInterface(), ep.RequireEgressProg())
+		loaded, err = loader.DeviceHasSKBProgramLoaded(ep.HostInterface(), ep.RequireEgressProg())
 		if err != nil {
 			log.WithField(logfields.Endpoint, ep.HostInterface()).
 				WithField(logfields.EndpointID, ep.ID).
+				WithField(logfields.CEPName, ep.GetK8sNamespaceAndCEPName()).
 				WithError(err).
-				Error("Unable to assert if endpoint BPF programs need to be reloaded")
+				Warn("Unable to assert if endpoint BPF programs need to be reloaded")
 			return err
 		}
 		// We've detected missing bpf progs for this endpoint.
@@ -130,11 +131,9 @@ func (d *Daemon) checkEndpointBPFPrograms(ctx context.Context, p epBPFProgWatchd
 				"Consider investigating whether other software running on this machine is removing Cilium's endpoint BPF programs. " +
 				"If endpoint BPF programs are removed, the associated pods will lose connectivity and only reinstating the programs will restore connectivity.",
 		)
-	wg, err := d.TriggerReloadWithoutCompile(epBPFProgWatchdog)
+	err = d.orchestrator.Reinitialize(d.ctx)
 	if err != nil {
 		log.WithError(err).Error("Failed to reload Cilium endpoints BPF programs")
-	} else {
-		wg.Wait()
 	}
 
 	return err

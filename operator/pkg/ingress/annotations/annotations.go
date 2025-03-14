@@ -4,24 +4,28 @@
 package annotations
 
 import (
+	"fmt"
 	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/utils/ptr"
 
-	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/pkg/annotation"
 )
 
 const (
-	LBModeAnnotation           = annotation.IngressPrefix + "/loadbalancer-mode"
-	ServiceTypeAnnotation      = annotation.IngressPrefix + "/service-type"
-	InsecureNodePortAnnotation = annotation.IngressPrefix + "/insecure-node-port"
-	SecureNodePortAnnotation   = annotation.IngressPrefix + "/secure-node-port"
-	TLSPtHostPortAnnotation    = annotation.IngressPrefix + "/tls-passthrough-host-port"
-	HTTPHostPortAnnotation     = annotation.IngressPrefix + "/http-host-port"
-	TLSPassthroughAnnotation   = annotation.IngressPrefix + "/tls-passthrough"
-	ForceHTTPSAnnotation       = annotation.IngressPrefix + "/force-https"
+	LBModeAnnotation                       = annotation.IngressPrefix + "/loadbalancer-mode"
+	LBClassAnnotation                      = annotation.IngressPrefix + "/loadbalancer-class"
+	ServiceTypeAnnotation                  = annotation.IngressPrefix + "/service-type"
+	ServiceExternalTrafficPolicyAnnotation = annotation.IngressPrefix + "/service-external-traffic-policy"
+	InsecureNodePortAnnotation             = annotation.IngressPrefix + "/insecure-node-port"
+	SecureNodePortAnnotation               = annotation.IngressPrefix + "/secure-node-port"
+	HostListenerPortAnnotation             = annotation.IngressPrefix + "/host-listener-port"
+	TLSPassthroughAnnotation               = annotation.IngressPrefix + "/tls-passthrough"
+	ForceHTTPSAnnotation                   = annotation.IngressPrefix + "/force-https"
+	RequestTimeoutAnnotation               = annotation.IngressPrefix + "/request-timeout"
 
 	LBModeAnnotationAlias           = annotation.Prefix + ".ingress" + "/loadbalancer-mode"
 	ServiceTypeAnnotationAlias      = annotation.Prefix + ".ingress" + "/service-type"
@@ -31,13 +35,8 @@ const (
 )
 
 const (
-	enabled                          = "enabled"
-	disabled                         = "disabled"
-	defaultTCPKeepAliveEnabled       = 1  // 1 - Enabled, 0 - Disabled
-	defaultTCPKeepAliveInitialIdle   = 10 // in seconds
-	defaultTCPKeepAliveProbeInterval = 5  // in seconds
-	defaultTCPKeepAliveMaxProbeCount = 10
-	defaultWebsocketEnabled          = 0 // 1 - Enabled, 0 - Disabled
+	enabled  = "enabled"
+	disabled = "disabled"
 )
 
 const (
@@ -51,6 +50,16 @@ func GetAnnotationIngressLoadbalancerMode(ingress *networkingv1.Ingress) string 
 	return value
 }
 
+// GetAnnotationLoadBalancerClass returns the loadbalancer class from the ingress if possible.
+// Defaults to nil
+func GetAnnotationLoadBalancerClass(ingress *networkingv1.Ingress) *string {
+	val, exists := annotation.Get(ingress, LBClassAnnotation)
+	if !exists {
+		return nil
+	}
+	return &val
+}
+
 // GetAnnotationServiceType returns the service type for the ingress if possible.
 // Defaults to LoadBalancer
 func GetAnnotationServiceType(ingress *networkingv1.Ingress) string {
@@ -59,6 +68,36 @@ func GetAnnotationServiceType(ingress *networkingv1.Ingress) string {
 		return string(corev1.ServiceTypeLoadBalancer)
 	}
 	return val
+}
+
+// GetAnnotationServiceExternalTrafficPolicy returns the service externalTrafficPolicy for the ingress.
+func GetAnnotationServiceExternalTrafficPolicy(ingress *networkingv1.Ingress) (string, error) {
+	val, exists := annotation.Get(ingress, ServiceExternalTrafficPolicyAnnotation)
+	if !exists {
+		return string(corev1.ServiceExternalTrafficPolicyCluster), nil
+	}
+
+	switch val {
+	case string(corev1.ServiceExternalTrafficPolicyCluster), string(corev1.ServiceExternalTrafficPolicyLocal):
+		return val, nil
+	default:
+		return string(corev1.ServiceExternalTrafficPolicyCluster), fmt.Errorf("invalid value for externalTrafficPolicy %q", val)
+	}
+}
+
+// GetAnnotationRequestTimeout retrieves the RequestTimeout annotation's value.
+func GetAnnotationRequestTimeout(ingress *networkingv1.Ingress) (*time.Duration, error) {
+	val, exists := annotation.Get(ingress, RequestTimeoutAnnotation)
+	if !exists {
+		return nil, nil
+	}
+
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse duration %q: %w", val, err)
+	}
+
+	return &d, nil
 }
 
 // GetAnnotationSecureNodePort returns the secure node port for the ingress if possible.
@@ -89,23 +128,9 @@ func GetAnnotationInsecureNodePort(ingress *networkingv1.Ingress) (*uint32, erro
 	return &res, nil
 }
 
-// GetAnnotationHTTPHostPort returns the HTTP host port for the ingress if possible.
-func GetAnnotationHTTPHostPort(ingress *networkingv1.Ingress) (*uint32, error) {
-	val, exists := annotation.Get(ingress, HTTPHostPortAnnotation)
-	if !exists {
-		return nil, nil
-	}
-	intVal, err := strconv.ParseInt(val, 10, 32)
-	if err != nil {
-		return nil, err
-	}
-	res := uint32(intVal)
-	return &res, nil
-}
-
-// GetAnnotationTLSHostPort returns the TLS host port for the ingress if possible.
-func GetAnnotationTLSHostPort(ingress *networkingv1.Ingress) (*uint32, error) {
-	val, exists := annotation.Get(ingress, TLSPtHostPortAnnotation)
+// GetAnnotationHostListenerPort returns the host listener port for the ingress if possible.
+func GetAnnotationHostListenerPort(ingress *networkingv1.Ingress) (*uint32, error) {
+	val, exists := annotation.Get(ingress, HostListenerPortAnnotation)
 	if !exists {
 		return nil, nil
 	}
@@ -160,11 +185,11 @@ func GetAnnotationForceHTTPSEnabled(ingress *networkingv1.Ingress) *bool {
 	}
 
 	if val == enabled {
-		return model.AddressOf(true)
+		return ptr.To(true)
 	}
 
 	if val == disabled {
-		return model.AddressOf(false)
+		return ptr.To(false)
 	}
 
 	boolVal, err := strconv.ParseBool(val)
@@ -173,8 +198,8 @@ func GetAnnotationForceHTTPSEnabled(ingress *networkingv1.Ingress) *bool {
 	}
 
 	if boolVal {
-		return model.AddressOf(true)
+		return ptr.To(true)
 	}
 
-	return model.AddressOf(false)
+	return ptr.To(false)
 }

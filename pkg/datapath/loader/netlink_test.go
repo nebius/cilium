@@ -6,12 +6,12 @@
 package loader
 
 import (
-	"fmt"
 	"net"
 	"testing"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
@@ -24,22 +24,10 @@ import (
 	"github.com/cilium/cilium/pkg/testutils/netns"
 )
 
-func mustTCProgram(t *testing.T) *ebpf.Program {
-	p, err := ebpf.NewProgram(&ebpf.ProgramSpec{
-		Type: ebpf.SchedCLS,
-		Instructions: asm.Instructions{
-			asm.Mov.Imm(asm.R0, 0),
-			asm.Return(),
-		},
-		License: "Apache-2.0",
-	})
-	if err != nil {
-		t.Skipf("tc programs not supported: %s", err)
-	}
-	t.Cleanup(func() {
-		p.Close()
-	})
-	return p
+// lo accesses the default loopback interface present in the current netns.
+var lo = &netlink.GenericLink{
+	LinkAttrs: netlink.LinkAttrs{Name: "lo", Index: 1},
+	LinkType:  "loopback",
 }
 
 func mustXDPProgram(t *testing.T, name string) *ebpf.Program {
@@ -90,24 +78,24 @@ func TestSetupDev(t *testing.T) {
 		err = enableForwarding(sysctl, dummy)
 		require.NoError(t, err)
 
-		enabledSettings := []string{
-			fmt.Sprintf("net.ipv6.conf.%s.forwarding", ifName),
-			fmt.Sprintf("net.ipv4.conf.%s.forwarding", ifName),
-			fmt.Sprintf("net.ipv4.conf.%s.accept_local", ifName),
+		enabledSettings := [][]string{
+			{"net", "ipv6", "conf", ifName, "forwarding"},
+			{"net", "ipv4", "conf", ifName, "forwarding"},
+			{"net", "ipv4", "conf", ifName, "accept_local"},
 		}
-		disabledSettings := []string{
-			fmt.Sprintf("net.ipv4.conf.%s.rp_filter", ifName),
-			fmt.Sprintf("net.ipv4.conf.%s.send_redirects", ifName),
+		disabledSettings := [][]string{
+			{"net", "ipv4", "conf", ifName, "rp_filter"},
+			{"net", "ipv4", "conf", ifName, "send_redirects"},
 		}
 		for _, setting := range enabledSettings {
 			s, err := sysctl.Read(setting)
 			require.NoError(t, err)
-			require.Equal(t, s, "1")
+			require.Equal(t, "1", s)
 		}
 		for _, setting := range disabledSettings {
 			s, err := sysctl.Read(setting)
 			require.NoError(t, err)
-			require.Equal(t, s, "0")
+			require.Equal(t, "0", s)
 		}
 
 		err = netlink.LinkDel(dummy)
@@ -127,7 +115,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 		ns := netns.NewNetNS(t)
 
 		ns.Do(func() error {
-			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, mtu)
+			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, 0, 0, mtu)
 			require.NoError(t, err)
 
 			link, err := netlink.LinkByName(defaults.GeneveDevice)
@@ -136,7 +124,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			geneve, ok := link.(*netlink.Geneve)
 			require.True(t, ok)
 			require.True(t, geneve.FlowBased)
-			require.EqualValues(t, geneve.Dport, defaults.TunnelPortGeneve)
+			require.EqualValues(t, defaults.TunnelPortGeneve, geneve.Dport)
 
 			err = netlink.LinkDel(link)
 			require.NoError(t, err)
@@ -149,10 +137,10 @@ func TestSetupTunnelDevice(t *testing.T) {
 		ns := netns.NewNetNS(t)
 
 		ns.Do(func() error {
-			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, mtu)
+			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, 0, 0, mtu)
 			require.NoError(t, err)
 
-			err = setupTunnelDevice(sysctl, tunnel.Geneve, 12345, mtu)
+			err = setupTunnelDevice(sysctl, tunnel.Geneve, 12345, 0, 0, mtu)
 			require.NoError(t, err)
 
 			link, err := netlink.LinkByName(defaults.GeneveDevice)
@@ -161,7 +149,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			geneve, ok := link.(*netlink.Geneve)
 			require.True(t, ok)
 			require.True(t, geneve.FlowBased)
-			require.EqualValues(t, geneve.Dport, 12345)
+			require.EqualValues(t, 12345, geneve.Dport)
 
 			err = netlink.LinkDel(link)
 			require.NoError(t, err)
@@ -174,7 +162,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 		ns := netns.NewNetNS(t)
 
 		ns.Do(func() error {
-			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, mtu)
+			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, 0, 0, mtu)
 			require.NoError(t, err)
 
 			link, err := netlink.LinkByName(defaults.GeneveDevice)
@@ -183,7 +171,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			// Ensure the ifindex does not change when specifying a different MTU.
 			ifindex := link.Attrs().Index
 
-			err = setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, mtu-1)
+			err = setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, 0, 0, mtu-1)
 			require.NoError(t, err)
 
 			link, err = netlink.LinkByName(defaults.GeneveDevice)
@@ -191,6 +179,9 @@ func TestSetupTunnelDevice(t *testing.T) {
 
 			require.Equal(t, ifindex, link.Attrs().Index, "ifindex must not change when changing MTU")
 			require.Equal(t, mtu-1, link.Attrs().MTU)
+
+			err = netlink.LinkDel(link)
+			require.NoError(t, err)
 
 			return nil
 		})
@@ -200,7 +191,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 		ns := netns.NewNetNS(t)
 
 		ns.Do(func() error {
-			err := setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, mtu)
+			err := setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, 0, 0, mtu)
 			require.NoError(t, err)
 
 			link, err := netlink.LinkByName(defaults.VxlanDevice)
@@ -209,7 +200,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			vxlan, ok := link.(*netlink.Vxlan)
 			require.True(t, ok)
 			require.True(t, vxlan.FlowBased)
-			require.EqualValues(t, vxlan.Port, defaults.TunnelPortVXLAN)
+			require.EqualValues(t, defaults.TunnelPortVXLAN, vxlan.Port)
 
 			err = netlink.LinkDel(link)
 			require.NoError(t, err)
@@ -222,10 +213,10 @@ func TestSetupTunnelDevice(t *testing.T) {
 		ns := netns.NewNetNS(t)
 
 		ns.Do(func() error {
-			err := setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, mtu)
+			err := setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, 0, 0, mtu)
 			require.NoError(t, err)
 
-			err = setupTunnelDevice(sysctl, tunnel.VXLAN, 12345, mtu)
+			err = setupTunnelDevice(sysctl, tunnel.VXLAN, 12345, 0, 0, mtu)
 			require.NoError(t, err)
 
 			link, err := netlink.LinkByName(defaults.VxlanDevice)
@@ -234,7 +225,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			vxlan, ok := link.(*netlink.Vxlan)
 			require.True(t, ok)
 			require.True(t, vxlan.FlowBased)
-			require.EqualValues(t, vxlan.Port, 12345)
+			require.EqualValues(t, 12345, vxlan.Port)
 
 			err = netlink.LinkDel(link)
 			require.NoError(t, err)
@@ -247,7 +238,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 		ns := netns.NewNetNS(t)
 
 		ns.Do(func() error {
-			err := setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, mtu)
+			err := setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, 0, 0, mtu)
 			require.NoError(t, err)
 
 			link, err := netlink.LinkByName(defaults.VxlanDevice)
@@ -256,7 +247,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			// Ensure the ifindex does not change when specifying a different MTU.
 			ifindex := link.Attrs().Index
 
-			err = setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, mtu-1)
+			err = setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, 0, 0, mtu-1)
 			require.NoError(t, err)
 
 			link, err = netlink.LinkByName(defaults.VxlanDevice)
@@ -264,6 +255,73 @@ func TestSetupTunnelDevice(t *testing.T) {
 
 			require.Equal(t, ifindex, link.Attrs().Index, "ifindex must not change when changing MTU")
 			require.Equal(t, mtu-1, link.Attrs().MTU)
+
+			err = netlink.LinkDel(link)
+			require.NoError(t, err)
+
+			return nil
+		})
+	})
+
+	t.Run("VxlanSrcPortRange", func(t *testing.T) {
+		ns := netns.NewNetNS(t)
+
+		ns.Do(func() error {
+			srcMin := uint16(1000)
+			srcMax := uint16(2000)
+
+			err := setupTunnelDevice(sysctl, tunnel.VXLAN, 4567, srcMin, srcMax, mtu)
+			require.NoError(t, err)
+
+			link, err := netlink.LinkByName(defaults.VxlanDevice)
+			require.NoError(t, err)
+
+			vxlan, ok := link.(*netlink.Vxlan)
+			require.True(t, ok)
+			require.True(t, vxlan.FlowBased)
+			require.EqualValues(t, 4567, vxlan.Port)
+			require.EqualValues(t, srcMin, vxlan.PortLow)
+			require.EqualValues(t, srcMax, vxlan.PortHigh)
+
+			err = netlink.LinkDel(link)
+			require.NoError(t, err)
+
+			return nil
+		})
+	})
+
+	t.Run("VxlanSrcPortRangeExistingDev", func(t *testing.T) {
+		ns := netns.NewNetNS(t)
+
+		ns.Do(func() error {
+			srcMin := uint16(1000)
+			srcMax := uint16(2000)
+
+			err := setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, 0, 0, mtu)
+			require.NoError(t, err)
+
+			link, err := netlink.LinkByName(defaults.VxlanDevice)
+			require.NoError(t, err)
+
+			vxlan, ok := link.(*netlink.Vxlan)
+			require.True(t, ok)
+			require.EqualValues(t, 0, vxlan.PortLow)
+			require.EqualValues(t, 0, vxlan.PortHigh)
+
+			err = setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, srcMin, srcMax, mtu)
+			require.NoError(t, err)
+
+			link, err = netlink.LinkByName(defaults.VxlanDevice)
+			require.NoError(t, err)
+
+			// On existing device the port range should not change.
+			vxlan, ok = link.(*netlink.Vxlan)
+			require.True(t, ok)
+			require.EqualValues(t, 0, vxlan.PortLow)
+			require.EqualValues(t, 0, vxlan.PortHigh)
+
+			err = netlink.LinkDel(link)
+			require.NoError(t, err)
 
 			return nil
 		})
@@ -274,7 +332,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 
 		ns.Do(func() error {
 			// Start with a Geneve tunnel.
-			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, mtu)
+			err := setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, 0, 0, mtu)
 			require.NoError(t, err)
 			_, err = netlink.LinkByName(defaults.GeneveDevice)
 			require.NoError(t, err)
@@ -282,7 +340,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			require.Error(t, err)
 
 			// Switch to vxlan mode.
-			err = setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, mtu)
+			err = setupTunnelDevice(sysctl, tunnel.VXLAN, defaults.TunnelPortVXLAN, 0, 0, mtu)
 			require.NoError(t, err)
 			_, err = netlink.LinkByName(defaults.GeneveDevice)
 			require.Error(t, err)
@@ -290,7 +348,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			require.NoError(t, err)
 
 			// Switch back to Geneve.
-			err = setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, mtu)
+			err = setupTunnelDevice(sysctl, tunnel.Geneve, defaults.TunnelPortGeneve, 0, 0, mtu)
 			require.NoError(t, err)
 			_, err = netlink.LinkByName(defaults.GeneveDevice)
 			require.NoError(t, err)
@@ -298,7 +356,7 @@ func TestSetupTunnelDevice(t *testing.T) {
 			require.Error(t, err)
 
 			// Disable tunneling.
-			err = setupTunnelDevice(sysctl, tunnel.Disabled, 0, mtu)
+			err = setupTunnelDevice(sysctl, tunnel.Disabled, 0, 0, 0, mtu)
 			require.NoError(t, err)
 			_, err = netlink.LinkByName(defaults.VxlanDevice)
 			require.Error(t, err)
@@ -344,47 +402,8 @@ func TestAddHostDeviceAddr(t *testing.T) {
 				foundIPv6 = true
 			}
 		}
-		require.Equal(t, foundIPv4, true)
-		require.Equal(t, foundIPv6, true)
-
-		err = netlink.LinkDel(dummy)
-		require.NoError(t, err)
-
-		return nil
-	})
-}
-
-func TestAttachRemoveTCProgram(t *testing.T) {
-	testutils.PrivilegedTest(t)
-
-	ns := netns.NewNetNS(t)
-
-	ns.Do(func() error {
-		ifName := "dummy0"
-		dummy := &netlink.Dummy{
-			LinkAttrs: netlink.LinkAttrs{
-				Name: ifName,
-			},
-		}
-		err := netlink.LinkAdd(dummy)
-		require.NoError(t, err)
-
-		prog := mustTCProgram(t)
-
-		bpffs := testutils.TempBPFFS(t)
-		err = attachTCProgram(dummy, prog, "test", bpffsDeviceLinksDir(bpffs, dummy), directionToParent(dirEgress))
-		require.NoError(t, err)
-
-		filters, err := netlink.FilterList(dummy, directionToParent(dirEgress))
-		require.NoError(t, err)
-		require.NotEmpty(t, filters)
-
-		err = removeTCFilters(dummy.Attrs().Name, directionToParent(dirEgress))
-		require.NoError(t, err)
-
-		filters, err = netlink.FilterList(dummy, directionToParent(dirEgress))
-		require.NoError(t, err)
-		require.Empty(t, filters)
+		require.True(t, foundIPv4)
+		require.True(t, foundIPv6)
 
 		err = netlink.LinkDel(dummy)
 		require.NoError(t, err)

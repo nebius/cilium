@@ -9,10 +9,10 @@ import (
 	"net/netip"
 	"unsafe"
 
+	"github.com/cilium/hive/cell"
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/ebpf"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/types"
 )
 
@@ -30,7 +30,7 @@ type Map interface {
 	IterateWithCallback(cb IterateCallback) error
 }
 
-func NewMap(lifecycle cell.Lifecycle) (Map, error) {
+func NewMap(lifecycle cell.Lifecycle) Map {
 	return newMap(lifecycle, DefaultMaxEntries)
 }
 
@@ -38,7 +38,7 @@ type l2ResponderMap struct {
 	*ebpf.Map
 }
 
-func newMap(lifecycle cell.Lifecycle, maxEntries int) (*l2ResponderMap, error) {
+func newMap(lifecycle cell.Lifecycle, maxEntries int) *l2ResponderMap {
 	outerMap := &l2ResponderMap{}
 
 	lifecycle.Append(cell.Hook{
@@ -69,7 +69,7 @@ func newMap(lifecycle cell.Lifecycle, maxEntries int) (*l2ResponderMap, error) {
 		},
 	})
 
-	return outerMap, nil
+	return outerMap
 }
 
 // Create creates a new entry for the given IP and IfIndex tuple.

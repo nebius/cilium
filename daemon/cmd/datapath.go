@@ -5,7 +5,9 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -15,11 +17,13 @@ import (
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
+	"github.com/cilium/cilium/pkg/maps/encrypt"
 	"github.com/cilium/cilium/pkg/maps/fragmap"
 	ipcachemap "github.com/cilium/cilium/pkg/maps/ipcache"
 	"github.com/cilium/cilium/pkg/maps/ipmasq"
@@ -29,25 +33,18 @@ import (
 	"github.com/cilium/cilium/pkg/maps/nat"
 	"github.com/cilium/cilium/pkg/maps/neighborsmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
-	"github.com/cilium/cilium/pkg/maps/srv6map"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmap"
 	"github.com/cilium/cilium/pkg/maps/tunnel"
 	"github.com/cilium/cilium/pkg/maps/vtep"
-	"github.com/cilium/cilium/pkg/maps/worldcidrsmap"
 	"github.com/cilium/cilium/pkg/mtu"
 	"github.com/cilium/cilium/pkg/option"
 )
-
-// LocalConfig returns the local configuration of the daemon's nodediscovery.
-func (d *Daemon) LocalConfig() *datapath.LocalNodeConfiguration {
-	d.nodeDiscovery.WaitForLocalNodeInit()
-	return &d.nodeDiscovery.LocalConfig
-}
 
 // listFilterIfs returns a map of interfaces based on the given filter.
 // The filter should take a link and, if found, return the index of that
 // interface, if not found return -1.
 func listFilterIfs(filter func(netlink.Link) int) (map[int]netlink.Link, error) {
-	ifs, err := netlink.LinkList()
+	ifs, err := safenetlink.LinkList()
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +69,6 @@ func clearCiliumVeths() error {
 		}
 		return -1
 	})
-
 	if err != nil {
 		return fmt.Errorf("unable to retrieve host network interfaces: %w", err)
 	}
@@ -104,11 +100,6 @@ func clearCiliumVeths() error {
 		}
 	}
 	return nil
-}
-
-// SetPrefilter sets the preftiler for the given daemon.
-func (d *Daemon) SetPrefilter(preFilter datapath.PreFilter) {
-	d.preFilter = preFilter
 }
 
 // EndpointMapManager is a wrapper around an endpointmanager as well as the
@@ -163,19 +154,20 @@ func (d *Daemon) initMaps() error {
 		return fmt.Errorf("initializing metrics map: %w", err)
 	}
 
+	if err := ratelimitmap.InitMaps(); err != nil {
+		return fmt.Errorf("initializing ratelimit maps: %w", err)
+	}
+
 	if option.Config.TunnelingEnabled() {
 		if err := tunnel.TunnelMap().Recreate(); err != nil {
 			return fmt.Errorf("initializing tunnel map: %w", err)
 		}
-	}
-
-	if option.Config.EnableSRv6 {
-		srv6map.CreateMaps()
-	}
-
-	if option.Config.EnableHighScaleIPcache {
-		if err := worldcidrsmap.InitWorldCIDRsMap(); err != nil {
-			return fmt.Errorf("initializing world CIDRs map: %w", err)
+	} else {
+		// Make sure that the tunnel map gets unpinned when running in native
+		// routing mode, to prevent stale leftover entries when changing mode.
+		err := tunnel.TunnelMap().Unpin()
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("removing tunnel map: %w", err)
 		}
 	}
 
@@ -188,10 +180,6 @@ func (d *Daemon) initMaps() error {
 	if err := d.svc.InitMaps(option.Config.EnableIPv6, option.Config.EnableIPv4,
 		option.Config.EnableSocketLB, option.Config.RestoreState); err != nil {
 		log.WithError(err).Fatal("Unable to initialize service maps")
-	}
-
-	if err := policymap.InitCallMaps(option.Config.EnableEnvoyConfig); err != nil {
-		return fmt.Errorf("initializing policy map: %w", err)
 	}
 
 	for _, ep := range d.endpointManager.GetEndpoints() {
@@ -234,6 +222,10 @@ func (d *Daemon) initMaps() error {
 			option.Config.EnableIPv6); err != nil {
 			return fmt.Errorf("initializing neighbors map: %w", err)
 		}
+		if err := nat.CreateRetriesMaps(option.Config.EnableIPv4,
+			option.Config.EnableIPv6); err != nil {
+			return fmt.Errorf("initializing NAT retries map: %w", err)
+		}
 	}
 
 	if option.Config.EnableIPv4FragmentsTracking {
@@ -252,6 +244,12 @@ func (d *Daemon) initMaps() error {
 			if err := ipmasq.IPMasq6Map().OpenOrCreate(); err != nil {
 				return fmt.Errorf("initializing IPv6 masquerading map: %w", err)
 			}
+		}
+	}
+
+	if option.Config.EnableIPSec {
+		if err := encrypt.MapCreate(); err != nil {
+			return fmt.Errorf("initializing IPsec map: %w", err)
 		}
 	}
 
@@ -290,10 +288,20 @@ func (d *Daemon) initMaps() error {
 		}
 	}
 
-	if option.Config.NodePortAlg == option.NodePortAlgMaglev {
-		if err := lbmap.InitMaglevMaps(option.Config.EnableIPv4, option.Config.EnableIPv6, uint32(option.Config.MaglevTableSize)); err != nil {
+	if !d.explbConfig.EnableExperimentalLB &&
+		(option.Config.NodePortAlg == option.NodePortAlgMaglev ||
+			option.Config.LoadBalancerAlgorithmAnnotation) {
+		if err := lbmap.InitMaglevMaps(option.Config.EnableIPv4, option.Config.EnableIPv6, uint32(d.maglevConfig.MaglevTableSize)); err != nil {
 			return fmt.Errorf("initializing maglev maps: %w", err)
 		}
+	}
+
+	skiplbmap, err := lbmap.NewSkipLBMap()
+	if err == nil {
+		err = skiplbmap.OpenOrCreate()
+	}
+	if err != nil {
+		return fmt.Errorf("initializing local redirect policy maps: %w", err)
 	}
 
 	return nil
@@ -334,7 +342,7 @@ func setupRouteToVtepCidr() error {
 		Table: linux_defaults.RouteTableVtep,
 	}
 
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
+	routes, err := safenetlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return fmt.Errorf("failed to list routes: %w", err)
 	}
@@ -414,7 +422,21 @@ func setupRouteToVtepCidr() error {
 	return nil
 }
 
-// Datapath returns a reference to the datapath implementation.
-func (d *Daemon) Datapath() datapath.Datapath {
-	return d.datapath
+// Loader returns a reference to the loader implementation.
+func (d *Daemon) Loader() datapath.Loader {
+	return d.loader
+}
+
+// Orchestrator returns a reference to the orchestrator implementation.
+func (d *Daemon) Orchestrator() datapath.Orchestrator {
+	return d.orchestrator
+}
+
+// BandwidthManager returns a reference to the bandwidth manager implementation.
+func (d *Daemon) BandwidthManager() datapath.BandwidthManager {
+	return d.bwManager
+}
+
+func (d *Daemon) IPTablesManager() datapath.IptablesManager {
+	return d.iptablesManager
 }

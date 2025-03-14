@@ -24,6 +24,9 @@ import (
 // swagger:model StatusResponse
 type StatusResponse struct {
 
+	// Status of core datapath attachment mode
+	AttachMode AttachMode `json:"attach-mode,omitempty"`
+
 	// Status of Mutual Authentication certificate provider
 	AuthCertificateProvider *Status `json:"auth-certificate-provider,omitempty"`
 
@@ -63,14 +66,14 @@ type StatusResponse struct {
 	// Status of all endpoint controllers
 	Controllers ControllerStatuses `json:"controllers,omitempty"`
 
+	// Status of datapath mode
+	DatapathMode DatapathMode `json:"datapath-mode,omitempty"`
+
 	// Status of transparent encryption
 	Encryption *EncryptionStatus `json:"encryption,omitempty"`
 
 	// Status of the host firewall
 	HostFirewall *HostFirewall `json:"host-firewall,omitempty"`
-
-	// Status of host routing
-	HostRouting *HostRouting `json:"host-routing,omitempty"`
 
 	// Status of Hubble server
 	Hubble *HubbleStatus `json:"hubble,omitempty"`
@@ -105,6 +108,9 @@ type StatusResponse struct {
 	// Status of proxy
 	Proxy *ProxyStatus `json:"proxy,omitempty"`
 
+	// Status of routing
+	Routing *Routing `json:"routing,omitempty"`
+
 	// Status of SRv6
 	Srv6 *Srv6 `json:"srv6,omitempty"`
 
@@ -115,6 +121,10 @@ type StatusResponse struct {
 // Validate validates this status response
 func (m *StatusResponse) Validate(formats strfmt.Registry) error {
 	var res []error
+
+	if err := m.validateAttachMode(formats); err != nil {
+		res = append(res, err)
+	}
 
 	if err := m.validateAuthCertificateProvider(formats); err != nil {
 		res = append(res, err)
@@ -160,15 +170,15 @@ func (m *StatusResponse) Validate(formats strfmt.Registry) error {
 		res = append(res, err)
 	}
 
+	if err := m.validateDatapathMode(formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.validateEncryption(formats); err != nil {
 		res = append(res, err)
 	}
 
 	if err := m.validateHostFirewall(formats); err != nil {
-		res = append(res, err)
-	}
-
-	if err := m.validateHostRouting(formats); err != nil {
 		res = append(res, err)
 	}
 
@@ -216,6 +226,10 @@ func (m *StatusResponse) Validate(formats strfmt.Registry) error {
 		res = append(res, err)
 	}
 
+	if err := m.validateRouting(formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.validateSrv6(formats); err != nil {
 		res = append(res, err)
 	}
@@ -227,6 +241,23 @@ func (m *StatusResponse) Validate(formats strfmt.Registry) error {
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
+	return nil
+}
+
+func (m *StatusResponse) validateAttachMode(formats strfmt.Registry) error {
+	if swag.IsZero(m.AttachMode) { // not required
+		return nil
+	}
+
+	if err := m.AttachMode.Validate(formats); err != nil {
+		if ve, ok := err.(*errors.Validation); ok {
+			return ve.ValidateName("attach-mode")
+		} else if ce, ok := err.(*errors.CompositeError); ok {
+			return ce.ValidateName("attach-mode")
+		}
+		return err
+	}
+
 	return nil
 }
 
@@ -437,6 +468,23 @@ func (m *StatusResponse) validateControllers(formats strfmt.Registry) error {
 	return nil
 }
 
+func (m *StatusResponse) validateDatapathMode(formats strfmt.Registry) error {
+	if swag.IsZero(m.DatapathMode) { // not required
+		return nil
+	}
+
+	if err := m.DatapathMode.Validate(formats); err != nil {
+		if ve, ok := err.(*errors.Validation); ok {
+			return ve.ValidateName("datapath-mode")
+		} else if ce, ok := err.(*errors.CompositeError); ok {
+			return ce.ValidateName("datapath-mode")
+		}
+		return err
+	}
+
+	return nil
+}
+
 func (m *StatusResponse) validateEncryption(formats strfmt.Registry) error {
 	if swag.IsZero(m.Encryption) { // not required
 		return nil
@@ -467,25 +515,6 @@ func (m *StatusResponse) validateHostFirewall(formats strfmt.Registry) error {
 				return ve.ValidateName("host-firewall")
 			} else if ce, ok := err.(*errors.CompositeError); ok {
 				return ce.ValidateName("host-firewall")
-			}
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (m *StatusResponse) validateHostRouting(formats strfmt.Registry) error {
-	if swag.IsZero(m.HostRouting) { // not required
-		return nil
-	}
-
-	if m.HostRouting != nil {
-		if err := m.HostRouting.Validate(formats); err != nil {
-			if ve, ok := err.(*errors.Validation); ok {
-				return ve.ValidateName("host-routing")
-			} else if ce, ok := err.(*errors.CompositeError); ok {
-				return ce.ValidateName("host-routing")
 			}
 			return err
 		}
@@ -703,6 +732,25 @@ func (m *StatusResponse) validateProxy(formats strfmt.Registry) error {
 	return nil
 }
 
+func (m *StatusResponse) validateRouting(formats strfmt.Registry) error {
+	if swag.IsZero(m.Routing) { // not required
+		return nil
+	}
+
+	if m.Routing != nil {
+		if err := m.Routing.Validate(formats); err != nil {
+			if ve, ok := err.(*errors.Validation); ok {
+				return ve.ValidateName("routing")
+			} else if ce, ok := err.(*errors.CompositeError); ok {
+				return ce.ValidateName("routing")
+			}
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (m *StatusResponse) validateSrv6(formats strfmt.Registry) error {
 	if swag.IsZero(m.Srv6) { // not required
 		return nil
@@ -741,6 +789,10 @@ func (m *StatusResponse) validateStale(formats strfmt.Registry) error {
 // ContextValidate validate this status response based on the context it is used
 func (m *StatusResponse) ContextValidate(ctx context.Context, formats strfmt.Registry) error {
 	var res []error
+
+	if err := m.contextValidateAttachMode(ctx, formats); err != nil {
+		res = append(res, err)
+	}
 
 	if err := m.contextValidateAuthCertificateProvider(ctx, formats); err != nil {
 		res = append(res, err)
@@ -786,15 +838,15 @@ func (m *StatusResponse) ContextValidate(ctx context.Context, formats strfmt.Reg
 		res = append(res, err)
 	}
 
+	if err := m.contextValidateDatapathMode(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.contextValidateEncryption(ctx, formats); err != nil {
 		res = append(res, err)
 	}
 
 	if err := m.contextValidateHostFirewall(ctx, formats); err != nil {
-		res = append(res, err)
-	}
-
-	if err := m.contextValidateHostRouting(ctx, formats); err != nil {
 		res = append(res, err)
 	}
 
@@ -842,6 +894,10 @@ func (m *StatusResponse) ContextValidate(ctx context.Context, formats strfmt.Reg
 		res = append(res, err)
 	}
 
+	if err := m.contextValidateRouting(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.contextValidateSrv6(ctx, formats); err != nil {
 		res = append(res, err)
 	}
@@ -849,6 +905,24 @@ func (m *StatusResponse) ContextValidate(ctx context.Context, formats strfmt.Reg
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
+	return nil
+}
+
+func (m *StatusResponse) contextValidateAttachMode(ctx context.Context, formats strfmt.Registry) error {
+
+	if swag.IsZero(m.AttachMode) { // not required
+		return nil
+	}
+
+	if err := m.AttachMode.ContextValidate(ctx, formats); err != nil {
+		if ve, ok := err.(*errors.Validation); ok {
+			return ve.ValidateName("attach-mode")
+		} else if ce, ok := err.(*errors.CompositeError); ok {
+			return ce.ValidateName("attach-mode")
+		}
+		return err
+	}
+
 	return nil
 }
 
@@ -1076,6 +1150,24 @@ func (m *StatusResponse) contextValidateControllers(ctx context.Context, formats
 	return nil
 }
 
+func (m *StatusResponse) contextValidateDatapathMode(ctx context.Context, formats strfmt.Registry) error {
+
+	if swag.IsZero(m.DatapathMode) { // not required
+		return nil
+	}
+
+	if err := m.DatapathMode.ContextValidate(ctx, formats); err != nil {
+		if ve, ok := err.(*errors.Validation); ok {
+			return ve.ValidateName("datapath-mode")
+		} else if ce, ok := err.(*errors.CompositeError); ok {
+			return ce.ValidateName("datapath-mode")
+		}
+		return err
+	}
+
+	return nil
+}
+
 func (m *StatusResponse) contextValidateEncryption(ctx context.Context, formats strfmt.Registry) error {
 
 	if m.Encryption != nil {
@@ -1110,27 +1202,6 @@ func (m *StatusResponse) contextValidateHostFirewall(ctx context.Context, format
 				return ve.ValidateName("host-firewall")
 			} else if ce, ok := err.(*errors.CompositeError); ok {
 				return ce.ValidateName("host-firewall")
-			}
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (m *StatusResponse) contextValidateHostRouting(ctx context.Context, formats strfmt.Registry) error {
-
-	if m.HostRouting != nil {
-
-		if swag.IsZero(m.HostRouting) { // not required
-			return nil
-		}
-
-		if err := m.HostRouting.ContextValidate(ctx, formats); err != nil {
-			if ve, ok := err.(*errors.Validation); ok {
-				return ve.ValidateName("host-routing")
-			} else if ce, ok := err.(*errors.CompositeError); ok {
-				return ce.ValidateName("host-routing")
 			}
 			return err
 		}
@@ -1362,6 +1433,27 @@ func (m *StatusResponse) contextValidateProxy(ctx context.Context, formats strfm
 				return ve.ValidateName("proxy")
 			} else if ce, ok := err.(*errors.CompositeError); ok {
 				return ce.ValidateName("proxy")
+			}
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *StatusResponse) contextValidateRouting(ctx context.Context, formats strfmt.Registry) error {
+
+	if m.Routing != nil {
+
+		if swag.IsZero(m.Routing) { // not required
+			return nil
+		}
+
+		if err := m.Routing.ContextValidate(ctx, formats); err != nil {
+			if ve, ok := err.(*errors.Validation); ok {
+				return ve.ValidateName("routing")
+			} else if ce, ok := err.(*errors.CompositeError); ok {
+				return ce.ValidateName("routing")
 			}
 			return err
 		}

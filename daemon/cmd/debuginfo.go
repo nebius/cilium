@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/cilium/hive/cell"
 	"github.com/go-openapi/runtime/middleware"
 	"github.com/spf13/cast"
 
@@ -14,8 +15,8 @@ import (
 	restapi "github.com/cilium/cilium/api/v1/server/restapi/daemon"
 	"github.com/cilium/cilium/api/v1/server/restapi/endpoint"
 	"github.com/cilium/cilium/pkg/debug"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/service"
 	"github.com/cilium/cilium/pkg/version"
 )
 
@@ -29,7 +30,7 @@ func getDebugInfoHandler(d *Daemon, params restapi.GetDebuginfoParams) middlewar
 		dr.KernelVersion = kver.String()
 	}
 
-	status := d.getStatus(false)
+	status := d.getStatus(false, true)
 	dr.CiliumStatus = &status
 
 	var p endpoint.GetEndpointParams
@@ -44,11 +45,11 @@ func getDebugInfoHandler(d *Daemon, params restapi.GetDebuginfoParams) middlewar
 		dr.EnvironmentVariables = append(dr.EnvironmentVariables, k+":"+v)
 	}
 
-	dr.ServiceList = getServiceList(d.svc)
+	dr.ServiceList = service.GetServiceModelList(d.svc)
 
 	dr.Encryption = &models.DebugInfoEncryption{}
 	if option.Config.EnableWireguard {
-		if wgStatus, err := d.datapath.WireguardAgent().Status(true); err == nil {
+		if wgStatus, err := d.wireguardAgent.Status(true); err == nil {
 			dr.Encryption.Wireguard = wgStatus
 		}
 	}

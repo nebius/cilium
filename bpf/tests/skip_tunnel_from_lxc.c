@@ -30,7 +30,6 @@
  * Now include testing defaults
  */
 #define ROUTER_IP
-#include "config_replacement.h"
 #undef ROUTER_IP
 #include "node_config.h"
 
@@ -102,7 +101,7 @@ setup(struct __ctx_buff *ctx, bool flag_skip_tunnel, bool v4)
 	key.reason = REASON_FORWARDED;
 	key.dir = METRIC_EGRESS;
 
-	map_delete_elem(&METRICS_MAP, &key);
+	map_delete_elem(&cilium_metrics, &key);
 
 	policy_add_egress_allow_all_entry();
 
@@ -152,7 +151,7 @@ check_ctx(const struct __ctx_buff *ctx, __u32 expected_result, bool v4)
 	key.reason = REASON_FORWARDED;
 	key.dir = METRIC_EGRESS;
 
-	entry = map_lookup_elem(&METRICS_MAP, &key);
+	entry = map_lookup_elem(&cilium_metrics, &key);
 	if (!entry)
 		test_fatal("metrics entry not found")
 
@@ -191,6 +190,9 @@ check_ctx(const struct __ctx_buff *ctx, __u32 expected_result, bool v4)
 
 		if (l3->daddr != DST_IPV4)
 			test_fatal("dest IP was changed");
+
+		if (l3->check != bpf_htons(0xf968))
+			test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
 		l4 = (void *)l3 + sizeof(struct iphdr);
 	} else {

@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -19,8 +18,9 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/build"
 	"github.com/cilium/cilium/pkg/hubble/observer"
 	poolTypes "github.com/cilium/cilium/pkg/hubble/relay/pool/types"
-	"github.com/cilium/cilium/pkg/inctimer"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // numUnavailableNodesReportMax represents the maximum number of unavailable
@@ -84,11 +84,9 @@ func (s *Server) GetFlows(req *observerpb.GetFlowsRequest, stream observerpb.Obs
 
 	if req.GetFollow() {
 		go func() {
-			updateTimer, updateTimerDone := inctimer.New()
-			defer updateTimerDone()
 			for {
 				select {
-				case <-updateTimer.After(s.opts.peerUpdateInterval):
+				case <-time.After(s.opts.peerUpdateInterval):
 					peers := s.peers.List()
 					_, _ = fc.collect(gctx, g, peers, flows)
 				case <-gctx.Done():
@@ -163,8 +161,10 @@ func (s *Server) GetNodes(ctx context.Context, req *observerpb.GetNodesRequest) 
 		nodes = append(nodes, n)
 		if !isAvailable(p.Conn) {
 			n.State = relaypb.NodeState_NODE_UNAVAILABLE
-			s.opts.log.WithField("address", p.Address).Infof(
-				"No connection to peer %s, skipping", p.Name,
+			s.opts.log.Info(
+				"No connection to peer, skipping",
+				logfields.Address, p.Address,
+				logfields.Peer, p.Name,
 			)
 			continue
 		}
@@ -175,10 +175,11 @@ func (s *Server) GetNodes(ctx context.Context, req *observerpb.GetNodesRequest) 
 			status, err := client.ServerStatus(ctx, &observerpb.ServerStatusRequest{})
 			if err != nil {
 				n.State = relaypb.NodeState_NODE_ERROR
-				s.opts.log.WithFields(logrus.Fields{
-					"error": err,
-					"peer":  p,
-				}).Warning("Failed to retrieve server status")
+				s.opts.log.Warn(
+					"Failed to retrieve server status",
+					logfields.Error, err,
+					logfields.Peer, p.Name,
+				)
 				return nil
 			}
 			n.Version = status.GetVersion()
@@ -208,8 +209,10 @@ func (s *Server) GetNamespaces(ctx context.Context, req *observerpb.GetNamespace
 
 	for _, p := range s.peers.List() {
 		if !isAvailable(p.Conn) {
-			s.opts.log.WithField("address", p.Address).Infof(
-				"No connection to peer %s, skipping", p.Name,
+			s.opts.log.Info(
+				"No connection to peer, skipping",
+				logfields.Address, p.Address,
+				logfields.Peer, p.Name,
 			)
 			continue
 		}
@@ -218,10 +221,11 @@ func (s *Server) GetNamespaces(ctx context.Context, req *observerpb.GetNamespace
 			client := s.opts.ocb.observerClient(&p)
 			nsResp, err := client.GetNamespaces(ctx, req)
 			if err != nil {
-				s.opts.log.WithFields(logrus.Fields{
-					"error": err,
-					"peer":  p,
-				}).Warning("Failed to retrieve namespaces")
+				s.opts.log.Warn(
+					"Failed to retrieve namespaces",
+					logfields.Error, err,
+					logfields.Peer, p.Name,
+				)
 				return nil
 			}
 			for _, ns := range nsResp.GetNamespaces() {
@@ -260,8 +264,10 @@ func (s *Server) ServerStatus(ctx context.Context, req *observerpb.ServerStatusR
 	statuses := make(chan *observerpb.ServerStatusResponse, len(peers))
 	for _, p := range peers {
 		if !isAvailable(p.Conn) {
-			s.opts.log.WithField("address", p.Address).Infof(
-				"No connection to peer %s, skipping", p.Name,
+			s.opts.log.Info(
+				"No connection to peer, skipping",
+				logfields.Address, p.Address,
+				logfields.Peer, p.Name,
 			)
 			mu.Lock()
 			numUnavailableNodes++
@@ -276,10 +282,11 @@ func (s *Server) ServerStatus(ctx context.Context, req *observerpb.ServerStatusR
 			client := s.opts.ocb.observerClient(&p)
 			status, err := client.ServerStatus(ctx, req)
 			if err != nil {
-				s.opts.log.WithFields(logrus.Fields{
-					"error": err,
-					"peer":  p,
-				}).Warning("Failed to retrieve server status")
+				s.opts.log.Warn(
+					"Failed to retrieve server status",
+					logfields.Error, err,
+					logfields.Peer, p.Name,
+				)
 				mu.Lock()
 				numUnavailableNodes++
 				if len(unavailableNodes) < numUnavailableNodesReportMax {

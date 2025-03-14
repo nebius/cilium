@@ -4,6 +4,7 @@
 package informer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	utilRuntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
@@ -22,7 +24,7 @@ var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "k8s")
 func init() {
 	utilRuntime.PanicHandlers = append(
 		utilRuntime.PanicHandlers,
-		func(r interface{}) {
+		func(_ context.Context, r interface{}) {
 			// from k8s library
 			if err, ok := r.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 				// honor the http.ErrAbortHandler sentinel panic value:
@@ -113,6 +115,9 @@ func NewInformerWithStore(
 				} else {
 					obj = d.Object
 				}
+
+				// Deduplicate the strings in the object metadata to reduce memory consumption.
+				resources.DedupMetadata(obj)
 
 				// In CI we detect if the objects were modified and panic
 				// this is a no-op in production environments.

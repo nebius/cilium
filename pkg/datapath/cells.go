@@ -4,10 +4,15 @@
 package datapath
 
 import (
-	"log"
+	"fmt"
+	"log/slog"
 	"path/filepath"
 
-	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+
+	"github.com/cilium/cilium/pkg/act"
 	"github.com/cilium/cilium/pkg/datapath/agentliveness"
 	"github.com/cilium/cilium/pkg/datapath/garp"
 	"github.com/cilium/cilium/pkg/datapath/ipcache"
@@ -19,22 +24,24 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
 	dpcfg "github.com/cilium/cilium/pkg/datapath/linux/config"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
-	"github.com/cilium/cilium/pkg/datapath/linux/modules"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/linux/utime"
 	"github.com/cilium/cilium/pkg/datapath/loader"
-	loaderTypes "github.com/cilium/cilium/pkg/datapath/loader/types"
+	"github.com/cilium/cilium/pkg/datapath/node"
+	"github.com/cilium/cilium/pkg/datapath/orchestrator"
+	"github.com/cilium/cilium/pkg/datapath/prefilter"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/datapath/types"
-	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/datapath/xdp"
+	"github.com/cilium/cilium/pkg/loadbalancer/experimental"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/maglev"
 	"github.com/cilium/cilium/pkg/maps"
 	"github.com/cilium/cilium/pkg/maps/eventsmap"
-	"github.com/cilium/cilium/pkg/maps/nodemap"
+	"github.com/cilium/cilium/pkg/maps/lbmap"
 	monitorAgent "github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/mtu"
-	nodeManager "github.com/cilium/cilium/pkg/node/manager"
 	"github.com/cilium/cilium/pkg/option"
 	wg "github.com/cilium/cilium/pkg/wireguard/agent"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
@@ -64,22 +71,29 @@ var Cell = cell.Module(
 	// The sysctl reconciler to read and write kernel sysctl parameters.
 	sysctl.Cell,
 
-	// The modules manager to search and load kernel modules.
-	modules.Cell,
-
 	// Manages Cilium-specific iptables rules.
 	iptables.Cell,
 
-	cell.Provide(
-		newWireguardAgent,
-		newDatapath,
-	),
+	cell.Invoke(initDatapath),
+
+	cell.Provide(newWireguardAgent),
+
+	cell.Provide(func(expConfig experimental.Config, maglev *maglev.Maglev) types.LBMap {
+		if expConfig.EnableExperimentalLB {
+			// The experimental control-plane comes with its own LBMap implementation.
+			return nil
+		}
+		return lbmap.New(maglev)
+	}),
 
 	// Provides the Table[NodeAddress] and the controller that populates it from Table[*Device]
 	tables.NodeAddressCell,
 
 	// Provides the legacy accessor for the above, the NodeAddressing interface.
-	tables.NodeAddressingCell,
+	NodeAddressingCell,
+
+	// Provides the DirectRoutingDevice selection logic.
+	tables.DirectRoutingDeviceCell,
 
 	// This cell periodically updates the agent liveness value in configmap.Map to inform
 	// the datapath of the liveness of the agent.
@@ -110,49 +124,52 @@ var Cell = cell.Module(
 	// MTU provides the MTU configuration of the node.
 	mtu.Cell,
 
-	cell.Provide(func(dp types.Datapath) types.NodeIDHandler {
-		return dp.NodeIDs()
-	}),
+	orchestrator.Cell,
 
 	// DevicesController manages the devices and routes tables
 	linuxdatapath.DevicesControllerCell,
-	cell.Provide(func(cfg *option.DaemonConfig) linuxdatapath.DevicesConfig {
-		// Provide the configured devices to the devices controller.
-		// This is temporary until DevicesController takes ownership of the
-		// device-related configuration options.
-		return linuxdatapath.DevicesConfig{
-			Devices: cfg.GetDevices(),
-		}
-	}),
 
 	// Synchronizes the userspace ipcache with the corresponding BPF map.
 	ipcache.Cell,
 
 	// Provides the loader, which compiles and loads the datapath programs.
 	loader.Cell,
+
+	// Provides prefilter, a means of configuring XDP pre-filters for DDoS-mitigation.
+	prefilter.Cell,
+
+	// XDP cell provides modularized XDP enablement.
+	xdp.Cell,
+
+	// Provides node handler, which handles node events.
+	cell.Provide(linuxdatapath.NewNodeHandler),
+	cell.Provide(node.NewNodeIDApiHandler),
+
+	// Provides Active Connection Tracking metrics based on counts of
+	// opened (from BPF ACT map), closed (from BPF ACT map), and failed
+	// connections (from ctmap's GC).
+	act.Cell,
 )
 
-func newWireguardAgent(lc cell.Lifecycle, sysctl sysctl.Sysctl) *wg.Agent {
+func newWireguardAgent(rootLogger *slog.Logger, lc cell.Lifecycle, sysctl sysctl.Sysctl, health cell.Health, registry job.Registry, db *statedb.DB, mtuTable statedb.Table[mtu.RouteMTU]) *wg.Agent {
 	var wgAgent *wg.Agent
 	if option.Config.EnableWireguard {
 		if option.Config.EnableIPSec {
-			log.Fatalf("WireGuard (--%s) cannot be used with IPsec (--%s)",
-				option.EnableWireguard, option.EnableIPSecName)
+			logging.Fatal(rootLogger, fmt.Sprintf("WireGuard (--%s) cannot be used with IPsec (--%s)",
+				option.EnableWireguard, option.EnableIPSecName))
 		}
+
+		jobGroup := registry.NewGroup(health)
+		lc.Append(jobGroup)
 
 		var err error
 		privateKeyPath := filepath.Join(option.Config.StateDir, wgTypes.PrivKeyFilename)
-		wgAgent, err = wg.NewAgent(privateKeyPath, sysctl)
+		wgAgent, err = wg.NewAgent(rootLogger, privateKeyPath, sysctl, jobGroup, db, mtuTable)
 		if err != nil {
-			log.Fatalf("failed to initialize WireGuard: %s", err)
+			logging.Fatal(rootLogger, fmt.Sprintf("failed to initialize WireGuard: %s", err))
 		}
 
-		lc.Append(cell.Hook{
-			OnStop: func(cell.HookContext) error {
-				wgAgent.Close()
-				return nil
-			},
-		})
+		lc.Append(wgAgent)
 	} else {
 		// Delete WireGuard device from previous run (if such exists)
 		link.DeleteByName(wgTypes.IfaceName)
@@ -160,63 +177,14 @@ func newWireguardAgent(lc cell.Lifecycle, sysctl sysctl.Sysctl) *wg.Agent {
 	return wgAgent
 }
 
-func newDatapath(params datapathParams) types.Datapath {
-	datapathConfig := linuxdatapath.DatapathConfiguration{
-		HostDevice:   defaults.HostDevice,
-		TunnelDevice: params.TunnelConfig.DeviceName(),
-	}
-
-	datapath := linuxdatapath.NewDatapath(linuxdatapath.DatapathParams{
-		ConfigWriter:   params.ConfigWriter,
-		RuleManager:    params.IptablesManager,
-		WGAgent:        params.WgAgent,
-		NodeMap:        params.NodeMap,
-		NodeAddressing: params.NodeAddressing,
-		BWManager:      params.BandwidthManager,
-		Loader:         params.Loader,
-		NodeManager:    params.NodeManager,
-	}, datapathConfig)
-
-	params.LC.Append(cell.Hook{
+func initDatapath(rootLogger *slog.Logger, lifecycle cell.Lifecycle) {
+	lifecycle.Append(cell.Hook{
 		OnStart: func(cell.HookContext) error {
-			datapath.NodeIDs().RestoreNodeIDs()
+			if err := linuxdatapath.CheckRequirements(rootLogger); err != nil {
+				return fmt.Errorf("requirements failed: %w", err)
+			}
+
 			return nil
 		},
 	})
-
-	return datapath
-}
-
-type datapathParams struct {
-	cell.In
-
-	LC      cell.Lifecycle
-	WgAgent *wg.Agent
-
-	// Force map initialisation before loader. You should not use these otherwise.
-	// Some of the entries in this slice may be nil.
-	BpfMaps []bpf.BpfMap `group:"bpf-maps"`
-
-	NodeMap nodemap.MapV2
-
-	NodeAddressing types.NodeAddressing
-
-	// Depend on DeviceManager to ensure devices have been resolved.
-	// This is required until option.Config.GetDevices() has been removed and
-	// uses of it converted to Table[Device].
-	DeviceManager *linuxdatapath.DeviceManager
-
-	BandwidthManager types.BandwidthManager
-
-	ModulesManager *modules.Manager
-
-	IptablesManager *iptables.Manager
-
-	ConfigWriter types.ConfigWriter
-
-	TunnelConfig tunnel.Config
-
-	Loader loaderTypes.Loader
-
-	NodeManager nodeManager.NodeManager
 }

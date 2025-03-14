@@ -6,11 +6,10 @@ package nodediscovery
 import (
 	"context"
 	"errors"
-	"fmt"
-	"maps"
 	"slices"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/cilium/stream"
 	"github.com/sirupsen/logrus"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -24,12 +23,11 @@ import (
 	"github.com/cilium/cilium/pkg/aws/metadata"
 	azureTypes "github.com/cilium/cilium/pkg/azure/types"
 	"github.com/cilium/cilium/pkg/controller"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/identity"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
@@ -42,11 +40,9 @@ import (
 )
 
 const (
-	// AutoCIDR indicates that a CIDR should be allocated
-	AutoCIDR = "auto"
-
 	nodeDiscoverySubsys = "nodediscovery"
 	maxRetryCount       = 10
+	backoffDuration     = 500 * time.Millisecond
 )
 
 var (
@@ -66,7 +62,6 @@ type GetNodeAddresses interface {
 // NodeDiscovery represents a node discovery action
 type NodeDiscovery struct {
 	Manager               nodemanager.NodeManager
-	LocalConfig           datapath.LocalNodeConfiguration
 	Registrar             nodestore.NodeRegistrar
 	Registered            chan struct{}
 	localStateInitialized chan struct{}
@@ -82,73 +77,19 @@ func NewNodeDiscovery(
 	manager nodemanager.NodeManager,
 	clientset client.Clientset,
 	lns *node.LocalNodeStore,
-	localConfig datapath.LocalNodeConfiguration,
 	cniConfigManager cni.CNIConfigManager,
+	k8sNodeWatcher *watchers.K8sCiliumNodeWatcher,
 ) *NodeDiscovery {
 	return &NodeDiscovery{
 		Manager:               manager,
-		LocalConfig:           localConfig,
 		localNodeStore:        lns,
 		Registered:            make(chan struct{}),
 		localStateInitialized: make(chan struct{}),
 		cniConfigManager:      cniConfigManager,
 		clientset:             clientset,
 		ctrlmgr:               controller.NewManager(),
+		k8sGetters:            k8sNodeWatcher,
 	}
-}
-
-// JoinCluster passes the node name to the kvstore and updates the local configuration on response.
-// This allows cluster configuration to override local configuration.
-// Must be called on agent startup after IPAM is configured, but before the configuration is used.
-// nodeName is the name to be used in the local agent.
-func (n *NodeDiscovery) JoinCluster(nodeName string) error {
-	var resp *nodeTypes.Node
-	maxRetryCount := 50
-	retryCount := 0
-	for retryCount < maxRetryCount {
-		log.WithFields(
-			logrus.Fields{
-				logfields.Node: nodeName,
-			}).Info("Joining local node to cluster")
-
-		var err error
-		if resp, err = n.Registrar.JoinCluster(nodeName); err != nil || resp == nil {
-			if retryCount >= maxRetryCount {
-				log.Fatalf("Unable to join cluster")
-			}
-			retryCount++
-			log.WithError(err).Error("Unable to initialize local node. Retrying...")
-			time.Sleep(time.Second)
-		} else {
-			break
-		}
-	}
-
-	if option.Config.ClusterID != resp.ClusterID {
-		return fmt.Errorf("remote ClusterID (%d) does not match the locally configured one (%d)", resp.ClusterID, option.Config.ClusterID)
-	}
-
-	if option.Config.ClusterName != resp.Cluster {
-		return fmt.Errorf("remote ClusterName (%s) does not match the locally configured one (%s)", resp.Cluster, option.Config.ClusterName)
-	}
-
-	n.localNodeStore.Update(func(ln *node.LocalNode) {
-		ln.Labels = maps.Clone(ln.Labels)
-		maps.Copy(ln.Labels, resp.Labels)
-
-		if resp.IPv4AllocCIDR != nil {
-			ln.IPv4AllocCIDR = resp.IPv4AllocCIDR
-		}
-		if resp.IPv6AllocCIDR != nil {
-			ln.IPv6AllocCIDR = resp.IPv6AllocCIDR
-		}
-
-		ln.NodeIdentity = resp.NodeIdentity
-	})
-
-	identity.SetLocalNodeID(resp.NodeIdentity)
-
-	return nil
 }
 
 // start configures the local node and starts node discovery. This is called on
@@ -213,8 +154,19 @@ func (n *NodeDiscovery) WaitForLocalNodeInit() {
 	<-n.localStateInitialized
 }
 
+// WaitForKVStoreSync blocks until kvstore synchronization of node information
+// completed. It returns immediately in CRD mode.
+func (n *NodeDiscovery) WaitForKVStoreSync(ctx context.Context) error {
+	select {
+	case <-n.Registered:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (n *NodeDiscovery) updateLocalNode(ln *node.LocalNode) {
-	if option.Config.KVStore != "" && !option.Config.JoinCluster {
+	if option.Config.KVStore != "" {
 		n.ctrlmgr.UpdateController(
 			"propagating local node change to kv-store",
 			controller.ControllerParams{
@@ -301,6 +253,8 @@ func (n *NodeDiscovery) updateCiliumNodeResource(ln *node.LocalNode) {
 			if _, err := n.clientset.CiliumV2().CiliumNodes().Update(context.TODO(), nodeResource, metav1.UpdateOptions{}); err != nil {
 				if k8serrors.IsConflict(err) {
 					log.WithError(err).Warn("Unable to update CiliumNode resource, will retry")
+					// Backoff before retrying
+					time.Sleep(backoffDuration)
 					continue
 				}
 				log.WithError(err).Fatal("Unable to update CiliumNode resource")
@@ -312,7 +266,7 @@ func (n *NodeDiscovery) updateCiliumNodeResource(ln *node.LocalNode) {
 				if k8serrors.IsConflict(err) || k8serrors.IsAlreadyExists(err) {
 					log.WithError(err).Warn("Unable to create CiliumNode resource, will retry")
 					// Backoff before retrying
-					time.Sleep(500 * time.Millisecond)
+					time.Sleep(backoffDuration)
 					continue
 				}
 				log.WithError(err).Fatal("Unable to create CiliumNode resource")
@@ -349,9 +303,9 @@ func (n *NodeDiscovery) mutateNodeResource(nodeResource *ciliumv2.CiliumNode, ln
 			// b) the LocalNode store contains an IP address which we can use instead
 			switch net.IPFamilyOfString(address.IP) {
 			case net.IPv4:
-				return !n.LocalConfig.EnableIPv4 || ln.GetCiliumInternalIP(false) != nil
+				return !option.Config.EnableIPv4 || ln.GetCiliumInternalIP(false) != nil
 			case net.IPv6:
-				return !n.LocalConfig.EnableIPv6 || ln.GetCiliumInternalIP(true) != nil
+				return !option.Config.EnableIPv6 || ln.GetCiliumInternalIP(true) != nil
 			}
 		}
 
@@ -431,9 +385,9 @@ func (n *NodeDiscovery) mutateNodeResource(nodeResource *ciliumv2.CiliumNode, ln
 		// are not conflicting with each other, we must have similar logic to
 		// determine the appropriate value to place inside the resource.
 		nodeResource.Spec.ENI.VpcID = vpcID
-		nodeResource.Spec.ENI.FirstInterfaceIndex = getInt(defaults.ENIFirstInterfaceIndex)
-		nodeResource.Spec.ENI.UsePrimaryAddress = getBool(defaults.UseENIPrimaryAddress)
-		nodeResource.Spec.ENI.DisablePrefixDelegation = getBool(defaults.ENIDisableNodeLevelPD)
+		nodeResource.Spec.ENI.FirstInterfaceIndex = aws.Int(defaults.ENIFirstInterfaceIndex)
+		nodeResource.Spec.ENI.UsePrimaryAddress = aws.Bool(defaults.UseENIPrimaryAddress)
+		nodeResource.Spec.ENI.DisablePrefixDelegation = aws.Bool(defaults.ENIDisableNodeLevelPD)
 
 		if c := n.cniConfigManager.GetCustomNetConf(); c != nil {
 			if c.IPAM.MinAllocate != 0 {
@@ -442,6 +396,10 @@ func (n *NodeDiscovery) mutateNodeResource(nodeResource *ciliumv2.CiliumNode, ln
 
 			if c.IPAM.PreAllocate != 0 {
 				nodeResource.Spec.IPAM.PreAllocate = c.IPAM.PreAllocate
+			}
+
+			if len(c.IPAM.StaticIPTags) > 0 {
+				nodeResource.Spec.IPAM.StaticIPTags = c.IPAM.StaticIPTags
 			}
 
 			if c.ENI.FirstInterfaceIndex != nil {
@@ -509,6 +467,9 @@ func (n *NodeDiscovery) mutateNodeResource(nodeResource *ciliumv2.CiliumNode, ln
 			if c.IPAM.PreAllocate != 0 {
 				nodeResource.Spec.IPAM.PreAllocate = c.IPAM.PreAllocate
 			}
+			if len(c.IPAM.StaticIPTags) > 0 {
+				nodeResource.Spec.IPAM.StaticIPTags = c.IPAM.StaticIPTags
+			}
 			if c.Azure.InterfaceName != "" {
 				nodeResource.Spec.Azure.InterfaceName = c.Azure.InterfaceName
 			}
@@ -575,20 +536,12 @@ func (n *NodeDiscovery) mutateNodeResource(nodeResource *ciliumv2.CiliumNode, ln
 			if c.IPAM.PreAllocate != 0 {
 				nodeResource.Spec.IPAM.PreAllocate = c.IPAM.PreAllocate
 			}
+
+			if len(c.IPAM.StaticIPTags) > 0 {
+				nodeResource.Spec.IPAM.StaticIPTags = c.IPAM.StaticIPTags
+			}
 		}
 	}
 
 	return nil
-}
-
-func (n *NodeDiscovery) RegisterK8sGetters(k8sGetters k8sGetters) {
-	n.k8sGetters = k8sGetters
-}
-
-func getInt(i int) *int {
-	return &i
-}
-
-func getBool(b bool) *bool {
-	return &b
 }

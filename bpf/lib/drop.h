@@ -11,16 +11,16 @@
  * If DROP_NOTIFY is not defined, the API will be compiled in as a NOP.
  */
 
-#ifndef __LIB_DROP__
-#define __LIB_DROP__
+#pragma once
 
+#include "maps.h"
 #include "dbg.h"
 #include "events.h"
 #include "common.h"
 #include "utils.h"
 #include "metrics.h"
+#include "ratelimit.h"
 
-#ifdef DROP_NOTIFY
 struct drop_notify {
 	NOTIFY_CAPTURE_HDR
 	__u32		src_label;
@@ -32,6 +32,7 @@ struct drop_notify {
 	__u32		ifindex;
 };
 
+#ifdef DROP_NOTIFY
 /*
  * We pass information in the meta area as follows:
  *
@@ -60,11 +61,24 @@ int __send_drop_notify(struct __ctx_buff *ctx)
 	__u16 line = (__u16)(meta4 >> 16);
 	__u8 file = (__u8)(meta4 >> 8);
 	__u8 exitcode = (__u8)meta4;
+	struct ratelimit_key rkey = {
+		.usage = RATELIMIT_USAGE_EVENTS_MAP,
+	};
+	struct ratelimit_settings settings = {
+		.topup_interval_ns = NSEC_PER_SEC,
+	};
 	struct drop_notify msg;
+
+	if (EVENTS_MAP_RATE_LIMIT > 0) {
+		settings.bucket_size = EVENTS_MAP_BURST_LIMIT;
+		settings.tokens_per_topup = EVENTS_MAP_RATE_LIMIT;
+		if (!ratelimit_check_and_take(&rkey, &settings))
+			return exitcode;
+	}
 
 	msg = (typeof(msg)) {
 		__notify_common_hdr(CILIUM_NOTIFY_DROP, (__u8)error),
-		__notify_pktcap_hdr(ctx_len, (__u16)cap_len),
+		__notify_pktcap_hdr((__u32)ctx_len, (__u16)cap_len, NOTIFY_CAPTURE_VER),
 		.src_label	= ctx_load_meta(ctx, 0),
 		.dst_label	= ctx_load_meta(ctx, 1),
 		.dst_id		= ctx_load_meta(ctx, 3),
@@ -74,7 +88,7 @@ int __send_drop_notify(struct __ctx_buff *ctx)
 		.ifindex        = ctx_get_ifindex(ctx),
 	};
 
-	ctx_event_output(ctx, &EVENTS_MAP,
+	ctx_event_output(ctx, &cilium_events,
 			 (cap_len << 32) | BPF_F_CURRENT_CPU,
 			 &msg, sizeof(msg));
 
@@ -163,20 +177,22 @@ int _send_drop_notify(__u8 file __maybe_unused, __u16 line __maybe_unused,
 	__DROP_REASON(err) | ((__u8)(__ext_err < -128 ? 0 : __ext_err) << 8); \
 })
 
-#define send_drop_notify(ctx, src, dst, dst_id, reason, exitcode, direction) \
+#define send_drop_notify(ctx, src, dst, dst_id, reason, direction) \
 	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, dst, dst_id, \
-			  __DROP_REASON(reason), exitcode, direction)
+			  __DROP_REASON(reason), CTX_ACT_DROP, direction)
 
-#define send_drop_notify_error(ctx, src, reason, exitcode, direction) \
+#define send_drop_notify_error(ctx, src, reason, direction) \
 	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, 0, 0, \
-			  __DROP_REASON(reason), exitcode, direction)
+			  __DROP_REASON(reason), CTX_ACT_DROP, direction)
 
-#define send_drop_notify_ext(ctx, src, dst, dst_id, reason, ext_err, exitcode, direction) \
+#define send_drop_notify_ext(ctx, src, dst, dst_id, reason, ext_err, direction) \
 	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, dst, dst_id, \
-			  __DROP_REASON_EXT(reason, ext_err), exitcode, direction)
+			  __DROP_REASON_EXT(reason, ext_err), CTX_ACT_DROP, direction)
 
-#define send_drop_notify_error_ext(ctx, src, reason, ext_err, exitcode, direction) \
+#define send_drop_notify_error_ext(ctx, src, reason, ext_err, direction) \
+	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, 0, 0, \
+			  __DROP_REASON_EXT(reason, ext_err), CTX_ACT_DROP, direction)
+
+#define send_drop_notify_error_with_exitcode_ext(ctx, src, reason, ext_err, exitcode, direction) \
 	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, 0, 0, \
 			  __DROP_REASON_EXT(reason, ext_err), exitcode, direction)
-
-#endif /* __LIB_DROP__ */

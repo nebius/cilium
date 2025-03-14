@@ -4,16 +4,13 @@
 #include "common.h"
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
-#define ROUTER_IP
-#include "config_replacement.h"
-#undef ROUTER_IP
 
 #define NODE_ID 2333
+#define TUNNEL_ID 0x1234
 #define ENCRYPT_KEY 3
 #define ENABLE_IPV4
 #define ENABLE_IPV6
 #define ENABLE_IPSEC
-#define SECCTX_FROM_IPCACHE 1
 
 #define ENCAP_IFINDEX 4
 #define skb_set_tunnel_key mock_skb_set_tunnel_key
@@ -24,8 +21,7 @@ int mock_skb_set_tunnel_key(__maybe_unused struct __sk_buff *skb,
 			    __maybe_unused __u32 size,
 			    __maybe_unused __u32 flags)
 {
-	/* 0xfffff is the default SECLABEL */
-	if (from->tunnel_id != 0xfffff)
+	if (from->tunnel_id != TUNNEL_ID)
 		return -1;
 	if (from->local_ipv4 != 0)
 		return -2;
@@ -44,6 +40,9 @@ int mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused, int ifindex, _
 }
 
 #include "bpf_host.c"
+
+ASSIGN_CONFIG(__u32, host_secctx_from_ipcache, 1)
+ASSIGN_CONFIG(__u32, security_label, TUNNEL_ID)
 
 #include "lib/ipcache.h"
 
@@ -137,10 +136,6 @@ int ipv4_ipsec_from_host_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	assert(ctx->mark == 0);
 
-#ifdef CHECK_CB_ENCRYPT_IDENTITY
-	assert(ctx_load_meta(ctx, CB_ENCRYPT_IDENTITY) == 0);
-#endif
-
 	l2 = data + sizeof(*status_code);
 
 	if ((void *)l2 + sizeof(struct ethhdr) > data_end)
@@ -165,6 +160,9 @@ int ipv4_ipsec_from_host_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	if (l3->daddr != v4_pod_two)
 		test_fatal("dest IP was changed");
+
+	if (l3->check != bpf_htons(0xf948))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
 	l4 = (void *)l3 + sizeof(struct iphdr);
 
@@ -255,10 +253,6 @@ int ipv6_ipsec_from_host_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	status_code = data;
 	assert(*status_code == EXPECTED_STATUS_CODE);
-
-#ifdef CHECK_CB_ENCRYPT_IDENTITY
-	assert(ctx_load_meta(ctx, CB_ENCRYPT_IDENTITY) == 0);
-#endif
 
 	assert(ctx->mark == 0);
 

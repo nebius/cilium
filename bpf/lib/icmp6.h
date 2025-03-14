@@ -17,6 +17,7 @@
 #define ICMP6_ND_OPTS (sizeof(struct ipv6hdr) + sizeof(struct icmp6hdr) + sizeof(struct in6_addr))
 
 #define ICMP6_UNREACH_MSG_TYPE		1
+#define ICMP6_TIME_EXCEEDED_TYPE	3
 #define ICMP6_PARAM_ERR_MSG_TYPE	4
 #define ICMP6_ECHO_REQUEST_MSG_TYPE	128
 #define ICMP6_ECHO_REPLY_MSG_TYPE	129
@@ -47,7 +48,7 @@ static __always_inline int icmp6_load_type(struct __ctx_buff *ctx, int l4_off, _
 
 static __always_inline int icmp6_send_reply(struct __ctx_buff *ctx, int nh_off)
 {
-	union macaddr smac, dmac = NODE_MAC;
+	union macaddr smac, dmac = THIS_INTERFACE_MAC;
 	const int csum_off = nh_off + ICMP6_CSUM_OFFSET;
 	union v6addr sip, dip, router_ip;
 	__be32 sum;
@@ -109,7 +110,7 @@ send_icmp6_ndisc_adv(struct __ctx_buff *ctx, int nh_off,
 		return DROP_INVALID;
 
 	/* fill icmp6hdr */
-	icmp6hdr.icmp6_type = 136;
+	icmp6hdr.icmp6_type = ICMP6_NA_MSG_TYPE;
 	icmp6hdr.icmp6_code = 0;
 	icmp6hdr.icmp6_cksum = icmp6hdr_old.icmp6_cksum;
 	icmp6hdr.icmp6_dataun.un_data32[0] = 0;
@@ -191,7 +192,7 @@ static __always_inline int __icmp6_send_time_exceeded(struct __ctx_buff *ctx,
 	upper = (data + 48);
 
 	/* fill icmp6hdr */
-	icmp6hoplim->icmp6_type = 3;
+	icmp6hoplim->icmp6_type = ICMP6_TIME_EXCEEDED_TYPE;
 	icmp6hoplim->icmp6_code = 0;
 	icmp6hoplim->icmp6_cksum = 0;
 	icmp6hoplim->icmp6_dataun.un_data32[0] = 0;
@@ -218,7 +219,7 @@ static __always_inline int __icmp6_send_time_exceeded(struct __ctx_buff *ctx,
 		sum = compute_icmp6_csum(data, 56, ipv6hdr);
 		payload_len = bpf_htons(56);
 		trimlen = 56 - bpf_ntohs(ipv6hdr->payload_len);
-		if (ctx_change_tail(ctx, ctx_full_len(ctx) + trimlen, 0) < 0)
+		if (ctx_change_tail(ctx, (__u32)(ctx_full_len(ctx) + trimlen), 0) < 0)
 			return DROP_WRITE_ERROR;
 		/* trim or expand buffer and copy data buffer after ipv6 header */
 		if (ctx_store_bytes(ctx, nh_off + sizeof(struct ipv6hdr),
@@ -237,7 +238,7 @@ static __always_inline int __icmp6_send_time_exceeded(struct __ctx_buff *ctx,
 		payload_len = bpf_htons(68);
 		/* trim or expand buffer and copy data buffer after ipv6 header */
 		trimlen = 68 - bpf_ntohs(ipv6hdr->payload_len);
-		if (ctx_change_tail(ctx, ctx_full_len(ctx) + trimlen, 0) < 0)
+		if (ctx_change_tail(ctx, (__u32)(ctx_full_len(ctx) + trimlen), 0) < 0)
 			return DROP_WRITE_ERROR;
 		if (ctx_store_bytes(ctx, nh_off + sizeof(struct ipv6hdr),
 				    data, 68, 0) < 0)
@@ -265,8 +266,7 @@ int tail_icmp6_send_time_exceeded(struct __ctx_buff *ctx __maybe_unused)
 
 	ret = __icmp6_send_time_exceeded(ctx, nh_off);
 	if (IS_ERR(ret))
-		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP,
-					      direction);
+		return send_drop_notify_error(ctx, UNKNOWN_ID, ret, direction);
 	return ret;
 }
 
@@ -293,7 +293,7 @@ static __always_inline int __icmp6_handle_ns(struct __ctx_buff *ctx, int nh_off)
 {
 	union v6addr target, router;
 	struct endpoint_info *ep;
-	union macaddr router_mac = NODE_MAC;
+	union macaddr router_mac = THIS_INTERFACE_MAC;
 
 	if (ctx_load_bytes(ctx, nh_off + ICMP6_ND_TARGET_OFFSET, target.addr,
 			   sizeof(((struct ipv6hdr *)NULL)->saddr)) < 0)
@@ -341,7 +341,7 @@ int tail_icmp6_handle_ns(struct __ctx_buff *ctx)
 
 	ret = __icmp6_handle_ns(ctx, nh_off);
 	if (IS_ERR(ret))
-		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP, direction);
+		return send_drop_notify_error(ctx, UNKNOWN_ID, ret, direction);
 	return ret;
 }
 #endif
@@ -372,11 +372,13 @@ is_icmp6_ndp(struct __ctx_buff *ctx, const struct ipv6hdr *ip6, int nh_off)
 {
 	__u8 type;
 
+	if (ip6->nexthdr != IPPROTO_ICMPV6)
+		return false;
+
 	if (icmp6_load_type(ctx, nh_off + sizeof(struct ipv6hdr), &type) < 0)
 		return false;
 
-	return ip6->nexthdr == IPPROTO_ICMPV6 &&
-	       (type == ICMP6_NS_MSG_TYPE || type == ICMP6_NA_MSG_TYPE);
+	return (type == ICMP6_NS_MSG_TYPE || type == ICMP6_NA_MSG_TYPE);
 }
 
 static __always_inline int icmp6_ndp_handle(struct __ctx_buff *ctx, int nh_off,

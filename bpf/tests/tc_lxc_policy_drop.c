@@ -6,12 +6,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 
-#define LXC_IPV4 (__be32)v4_pod_one
-#include "config_replacement.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV4
 
@@ -23,12 +17,12 @@
 
 #define NODE_IP			v4_node_one
 
-#define SECCTX_FROM_IPCACHE 1
-
 static volatile const __u8 *client_mac = mac_one;
 static volatile const __u8 *server_mac = mac_two;
 
 #include "bpf_lxc.c"
+
+ASSIGN_CONFIG(__u32, endpoint_ipv4, v4_pod_one)
 
 #include "lib/policy.h"
 

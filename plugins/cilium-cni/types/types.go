@@ -100,6 +100,7 @@ type ArgsSpec struct {
 	cniTypes.CommonArgs
 	K8S_POD_NAME      cniTypes.UnmarshallableString
 	K8S_POD_NAMESPACE cniTypes.UnmarshallableString
+	K8S_POD_UID       cniTypes.UnmarshallableString
 }
 
 // Args contains arbitrary information a scheduler
@@ -109,6 +110,7 @@ type Args struct{}
 // CNI error codes
 // (error codes 100+ are allowed for plugin use)
 const (
-	CniErrHealthzGet uint = 100
-	CniErrUnhealthy       = iota
+	CniErrHealthzGet uint = 100 + iota
+	CniErrUnhealthy
 )
+const CniErrPluginNotAvailable uint = 50

@@ -12,17 +12,20 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/spf13/afero"
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	healthDefaults "github.com/cilium/cilium/pkg/health/defaults"
 	"github.com/cilium/cilium/pkg/health/probe"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipam"
@@ -31,6 +34,8 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/launcher"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/maps/ctmap"
+	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/mtu"
 	"github.com/cilium/cilium/pkg/netns"
@@ -45,19 +50,15 @@ const (
 	ciliumHealth = "cilium-health"
 	binaryName   = "cilium-health-responder"
 
-	// vethName is the host-side veth link device name for cilium-health EP
-	// (veth mode only).
-	vethName = "lxc_health"
+	// healthName is the host-side virtual device name for cilium-health EP
+	healthName = "lxc_health"
 
-	// legacyVethName is the host-side cilium-health EP device name used in
+	// legacyHealthName is the host-side cilium-health EP device name used in
 	// older Cilium versions. Used for removal only.
-	legacyVethName = "cilium_health"
+	legacyHealthName = "cilium_health"
 
 	// epIfaceName is the endpoint-side link device name for cilium-health.
 	epIfaceName = "cilium"
-
-	// PidfilePath
-	PidfilePath = "health-endpoint.pid"
 
 	// LaunchTime is the expected time within which the health endpoint
 	// should be able to be successfully run and its BPF program attached.
@@ -108,17 +109,19 @@ func configureHealthRouting(routes []route.Route, dev string) error {
 }
 
 // configureHealthInterface is meant to be run inside the health service netns
-func configureHealthInterface(ifName string, ip4Addr, ip6Addr *net.IPNet, sysctl sysctl.Sysctl) error {
-	link, err := netlink.LinkByName(ifName)
+func configureHealthInterface(ifName string, ip4Addr, ip6Addr *net.IPNet) error {
+	link, err := safenetlink.LinkByName(ifName)
 	if err != nil {
 		return err
 	}
 
 	if ip6Addr == nil {
-		name := fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", ifName)
+		// Use the direct sysctl without reconciliation of errors since we're in a different
+		// network namespace and thus can't use the normal sysctl API.
+		sysctl := sysctl.NewDirectSysctl(afero.NewOsFs(), option.Config.ProcFs)
 		// Ignore the error; if IPv6 is completely disabled
 		// then it's okay if we can't write the sysctl.
-		_ = sysctl.Enable(name)
+		_ = sysctl.Enable([]string{"net", "ipv6", "conf", ifName, "disable_ipv6"})
 	} else {
 		if err = netlink.AddrAdd(link, &netlink.Addr{IPNet: ip6Addr}); err != nil {
 			return err
@@ -135,7 +138,7 @@ func configureHealthInterface(ifName string, ip4Addr, ip6Addr *net.IPNet, sysctl
 		return err
 	}
 
-	lo, err := netlink.LinkByName("lo")
+	lo, err := safenetlink.LinkByName("lo")
 	if err != nil {
 		return err
 	}
@@ -168,7 +171,7 @@ func (c *Client) PingEndpoint() error {
 //   - The health endpoint crashed during the current run of the Cilium agent
 //     and needs to be cleaned up before it is restarted.
 func KillEndpoint() {
-	path := filepath.Join(option.Config.StateDir, PidfilePath)
+	path := filepath.Join(option.Config.StateDir, healthDefaults.PidfilePath)
 	scopedLog := log.WithField(logfields.PIDFile, path)
 	scopedLog.Debug("Killing old health endpoint process")
 	pid, err := pidfile.Kill(path)
@@ -190,13 +193,14 @@ func CleanupEndpoint() {
 	// Explicit removal is performed to ensure that everything referencing the network namespace
 	// the endpoint process is executed under is disposed, so that the network namespace itself is properly disposed.
 	switch option.Config.DatapathMode {
-	case datapathOption.DatapathModeVeth:
-		for _, iface := range []string{legacyVethName, vethName} {
-			scopedLog := log.WithField(logfields.Veth, iface)
-			if link, err := netlink.LinkByName(iface); err == nil {
+	case datapathOption.DatapathModeVeth, datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2:
+		for _, iface := range []string{legacyHealthName, healthName} {
+			scopedLog := log.WithField(logfields.Interface, iface)
+			if link, err := safenetlink.LinkByName(iface); err == nil {
 				err = netlink.LinkDel(link)
 				if err != nil {
-					scopedLog.WithError(err).Info("Couldn't delete cilium-health veth device")
+					scopedLog.WithError(err).Infof("Couldn't delete cilium-health %s device",
+						option.Config.DatapathMode)
 				}
 			} else {
 				scopedLog.WithError(err).Debug("Didn't find existing device")
@@ -207,7 +211,7 @@ func CleanupEndpoint() {
 
 // EndpointAdder is any type which adds an endpoint to be managed by Cilium.
 type EndpointAdder interface {
-	AddEndpoint(owner regeneration.Owner, ep *endpoint.Endpoint, reason string) error
+	AddEndpoint(owner regeneration.Owner, ep *endpoint.Endpoint) error
 }
 
 // LaunchAsEndpoint launches the cilium-health agent in a nested network
@@ -218,14 +222,15 @@ type EndpointAdder interface {
 // cleanup of prior cilium-health endpoint instances.
 func LaunchAsEndpoint(baseCtx context.Context,
 	owner regeneration.Owner,
+	policyMapFactory policymap.Factory,
 	policyGetter policyRepoGetter,
 	ipcache *ipcache.IPCache,
 	mtuConfig mtu.MTU,
 	bigTCPConfig *bigtcp.Configuration,
 	epMgr EndpointAdder,
-	proxy endpoint.EndpointProxy,
 	allocator cache.IdentityAllocator,
 	routingConfig routingConfigurer,
+	ctMapGC ctmap.GCRunner,
 	sysctl sysctl.Sysctl,
 ) (*Client, error) {
 
@@ -270,26 +275,37 @@ func LaunchAsEndpoint(baseCtx context.Context,
 
 	switch option.Config.DatapathMode {
 	case datapathOption.DatapathModeVeth:
-		_, epLink, err := connector.SetupVethWithNames(vethName, epIfaceName, mtuConfig.GetDeviceMTU(),
+		_, epLink, err := connector.SetupVethWithNames(healthName, epIfaceName, mtuConfig.GetDeviceMTU(),
 			bigTCPConfig.GetGROIPv6MaxSize(), bigTCPConfig.GetGSOIPv6MaxSize(),
 			bigTCPConfig.GetGROIPv4MaxSize(), bigTCPConfig.GetGSOIPv4MaxSize(),
 			info, sysctl)
 		if err != nil {
 			return nil, fmt.Errorf("Error while creating veth: %w", err)
 		}
-
+		if err = netlink.LinkSetNsFd(epLink, int(ns.FD())); err != nil {
+			return nil, fmt.Errorf("failed to move device %q to health namespace: %w", epIfaceName, err)
+		}
+	case datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2:
+		l2Mode := option.Config.DatapathMode == datapathOption.DatapathModeNetkitL2
+		_, epLink, err := connector.SetupNetkitWithNames(healthName, epIfaceName, mtuConfig.GetDeviceMTU(),
+			bigTCPConfig.GetGROIPv6MaxSize(), bigTCPConfig.GetGSOIPv6MaxSize(),
+			bigTCPConfig.GetGROIPv4MaxSize(), bigTCPConfig.GetGSOIPv4MaxSize(), l2Mode,
+			info, sysctl)
+		if err != nil {
+			return nil, fmt.Errorf("Error while creating netkit: %w", err)
+		}
 		if err = netlink.LinkSetNsFd(epLink, int(ns.FD())); err != nil {
 			return nil, fmt.Errorf("failed to move device %q to health namespace: %w", epIfaceName, err)
 		}
 	}
 
 	if err := ns.Do(func() error {
-		return configureHealthInterface(epIfaceName, ip4Address, ip6Address, sysctl)
+		return configureHealthInterface(epIfaceName, ip4Address, ip6Address)
 	}); err != nil {
 		return nil, fmt.Errorf("failed configure health interface %q: %w", epIfaceName, err)
 	}
 
-	pidfile := filepath.Join(option.Config.StateDir, PidfilePath)
+	pidfile := filepath.Join(option.Config.StateDir, healthDefaults.PidfilePath)
 	args := []string{"--listen", strconv.Itoa(option.Config.ClusterHealthPort), "--pidfile", pidfile}
 	cmd.SetTarget(binaryName)
 	cmd.SetArgs(args)
@@ -305,7 +321,7 @@ func LaunchAsEndpoint(baseCtx context.Context,
 	}
 
 	// Create the endpoint
-	ep, err := endpoint.NewEndpointFromChangeModel(baseCtx, owner, policyGetter, ipcache, proxy, allocator, info)
+	ep, err := endpoint.NewEndpointFromChangeModel(baseCtx, owner, policyMapFactory, policyGetter, ipcache, nil, allocator, ctMapGC, info)
 	if err != nil {
 		return nil, fmt.Errorf("Error while creating endpoint model: %w", err)
 	}
@@ -349,7 +365,7 @@ func LaunchAsEndpoint(baseCtx context.Context,
 		}
 	}
 
-	if err := epMgr.AddEndpoint(owner, ep, "Create cilium-health endpoint"); err != nil {
+	if err := epMgr.AddEndpoint(owner, ep); err != nil {
 		return nil, fmt.Errorf("Error while adding endpoint: %w", err)
 	}
 
@@ -366,7 +382,7 @@ func LaunchAsEndpoint(baseCtx context.Context,
 }
 
 type policyRepoGetter interface {
-	GetPolicyRepository() *policy.Repository
+	GetPolicyRepository() policy.PolicyRepository
 }
 
 type routingConfigurer interface {

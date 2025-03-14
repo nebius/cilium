@@ -4,28 +4,35 @@
 package bgpv2
 
 import (
-	"github.com/spf13/pflag"
+	"github.com/cilium/hive/cell"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
-)
-
-const (
-	// BGPv2Enabled is the name of the flag that enables BGPv2 APIs in Cilium.
-	BGPv2Enabled = "bgp-v2-api-enabled"
+	"github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/k8s/resource"
+	slim_core_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	"github.com/cilium/cilium/pkg/k8s/utils"
+	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 var Cell = cell.Module(
 	"bgp-cp-operator",
 	"BGP Control Plane Operator",
-	cell.Config(Config{}),
+	cell.ProvidePrivate(newSecretResource),
 	cell.Invoke(registerBGPResourceManager),
+	cell.Invoke(registerPeerConfigStatusReconciler),
+	metrics.Metric(NewBGPOperatorMetrics),
 )
 
-type Config struct {
-	BGPv2Enabled bool `mapstructure:"bgp-v2-api-enabled"`
-}
-
-// Flags implements cell.Flagger interface.
-func (cfg Config) Flags(flags *pflag.FlagSet) {
-	flags.Bool(BGPv2Enabled, cfg.BGPv2Enabled, "Enables BGPv2 APIs in Cilium")
+func newSecretResource(lc cell.Lifecycle, c client.Clientset, dc *option.DaemonConfig) resource.Resource[*slim_core_v1.Secret] {
+	// Secret is only used for status reporting (MissingAuthSecret condition)
+	if !c.IsEnabled() || !dc.BGPControlPlaneEnabled() || !dc.EnableBGPControlPlaneStatusReport {
+		return nil
+	}
+	if dc.BGPSecretsNamespace == "" {
+		return nil
+	}
+	return resource.New[*slim_core_v1.Secret](
+		lc, utils.ListerWatcherFromTyped[*slim_core_v1.SecretList](
+			c.Slim().CoreV1().Secrets(dc.BGPSecretsNamespace),
+		))
 }

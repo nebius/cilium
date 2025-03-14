@@ -44,26 +44,10 @@ of the Cilium organization.
 
 Depending on the PR target branch, a specific set of jobs is marked as required,
 as per the `Cilium CI matrix`_. They will be automatically featured in PR checks
-directly on the PR page. The following trigger phrases may be used to trigger
-them all at once:
+directly on the PR page. The ``/test`` trigger phrase may be used to trigger
+them all at once.
 
-+------------------+--------------------------+
-| PR target branch | Trigger required PR jobs |
-+==================+==========================+
-| main             | /test                    |
-+------------------+--------------------------+
-| v1.15            | /test-backport-1.15      |
-+------------------+--------------------------+
-| v1.14            | /test-backport-1.14      |
-+------------------+--------------------------+
-| v1.13            | /test-backport-1.13      |
-+------------------+--------------------------+
-| v1.12            | /test-backport-1.12      |
-+------------------+--------------------------+
-
-Pull requests submitted against older stable branches such as v1.13 may also be
-subject to Jenkins CI jobs. For more information, see
-`v1.13 CI <https://docs.cilium.io/en/v1.13/contributing/testing/ci/#ci-jenkins>`__.
+More triggers can be found in `ariane-config.yaml <https://github.com/cilium/cilium/blob/main/.github/ariane-config.yaml>`_
 
 For a full list of GHA, see `GitHub Actions Page <https://github.com/cilium/cilium/actions>`_
 

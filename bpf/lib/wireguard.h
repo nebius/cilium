@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifdef ENABLE_WIREGUARD
+#pragma once
 
-#ifndef __WIREGUARD_H_
-#define __WIREGUARD_H_
+#ifdef ENABLE_WIREGUARD
 
 #include <bpf/ctx/ctx.h>
 #include <bpf/api.h>
@@ -15,20 +14,59 @@
 #include "identity.h"
 
 #include "lib/proxy.h"
+#include "lib/l4.h"
+
+/* ctx_is_wireguard is used to check whether ctx is a WireGuard network packet.
+ * This function returns true in case all the following conditions are satisfied:
+ *
+ * - ctx is a UDP packet;
+ * - L4 dport == WG_PORT;
+ * - L4 sport == dport;
+ * - valid identity in cluster.
+ */
+static __always_inline bool
+ctx_is_wireguard(struct __ctx_buff *ctx, int l4_off, __u8 protocol, __u32 identity)
+{
+	struct {
+		__be16 sport;
+		__be16 dport;
+	} l4;
+
+	/* Non-UDP packets. */
+	if (protocol != IPPROTO_UDP)
+		return false;
+
+	/* Unable to retrieve L4 ports. */
+	if (l4_load_ports(ctx, l4_off + UDP_SPORT_OFF, &l4.sport) < 0)
+		return false;
+
+	/* Packet is not for cilium@WireGuard.*/
+	if (l4.dport != bpf_htons(WG_PORT))
+		return false;
+
+	/* Packet does not come from cilium@WireGuard. */
+	if (l4.sport != l4.dport)
+		return false;
+
+	/* Identity not in cluster. */
+	if (!identity_is_cluster(identity))
+		return false;
+
+	/* Cilium-related WireGuard packet to be traced as encrypted. */
+	return true;
+}
 
 static __always_inline int
-wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx)
+wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto)
 {
 	struct remote_endpoint_info *dst = NULL;
 	struct remote_endpoint_info __maybe_unused *src = NULL;
 	void *data, *data_end;
-	__u16 proto = 0;
 	struct ipv6hdr __maybe_unused *ip6;
 	struct iphdr __maybe_unused *ip4;
-	bool from_tunnel __maybe_unused = false;
 	__u32 magic __maybe_unused = 0;
 
-	if (!validate_ethertype(ctx, &proto))
+	if (!eth_is_supported_ethertype(proto))
 		return DROP_UNSUPPORTED_L2;
 
 	switch (proto) {
@@ -65,34 +103,17 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx)
 	case bpf_htons(ETH_P_IP):
 		if (!revalidate_data(ctx, &data, &data_end, &ip4))
 			return DROP_INVALID;
-# if defined(TUNNEL_MODE)
-		/* A rudimentary check (inspired by is_enap()) whether a pkt
-		 * is coming from tunnel device. In tunneling mode WG needs to
-		 * encrypt such pkts, so that src sec ID can be transferred.
+# if defined(HAVE_ENCAP)
+		/* In tunneling mode WG needs to encrypt tunnel traffic,
+		 * so that src sec ID can be transferred.
 		 *
 		 * This also handles IPv6, as IPv6 pkts are encapsulated w/
 		 * IPv4 tunneling.
-		 *
-		 * TODO: in v1.17, we can trust that to-overlay will mark all
-		 * traffic. Then replace this with ctx_is_overlay().
 		 */
-		if (ip4->protocol == IPPROTO_UDP) {
-			int l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
-			__be16 dport;
+		if (ctx_is_overlay(ctx))
+			goto overlay_encrypt;
+# endif /* HAVE_ENCAP */
 
-			if (l4_load_port(ctx, l4_off + UDP_DPORT_OFF, &dport) < 0) {
-				/* IP fragmentation is not expected after the
-				 * encap. So this is non-Cilium's pkt.
-				 */
-				break;
-			}
-
-			if (dport == bpf_htons(TUNNEL_PORT)) {
-				from_tunnel = true;
-				break;
-			}
-		}
-# endif /* TUNNEL_MODE */
 		dst = lookup_ip4_remote_endpoint(ip4->daddr, 0);
 		src = lookup_ip4_remote_endpoint(ip4->saddr, 0);
 		break;
@@ -100,11 +121,6 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx)
 	default:
 		goto out;
 	}
-
-#if defined(TUNNEL_MODE)
-	if (from_tunnel)
-		goto encrypt;
-#endif /* TUNNEL_MODE */
 
 #ifndef ENABLE_NODE_ENCRYPTION
 	/* A pkt coming from L7 proxy (i.e., Envoy or the DNS proxy on behalf of
@@ -135,10 +151,7 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx)
 #endif /* !ENABLE_NODE_ENCRYPTION */
 
 	/* We don't want to encrypt any traffic that originates from outside
-	 * the cluster.
-	 * Without this check, that may happen for the egress gateway, when
-	 * reply traffic arrives from the cluster-external server and goes to
-	 * the client pod.
+	 * the cluster. This check excludes DSR traffic from the LB node to a remote backend.
 	 */
 	if (!src || !identity_is_cluster(src->sec_identity))
 		goto out;
@@ -154,7 +167,9 @@ maybe_encrypt: __maybe_unused
 	 * required.
 	 */
 	if (dst && dst->key) {
-encrypt: __maybe_unused
+		if (src)
+			set_identity_mark(ctx, src->sec_identity, MARK_MAGIC_IDENTITY);
+overlay_encrypt: __maybe_unused
 		return ctx_redirect(ctx, WG_IFINDEX, 0);
 	}
 
@@ -166,17 +181,13 @@ out:
 
 /* strict_allow checks whether the packet is allowed to pass through the strict mode. */
 static __always_inline bool
-strict_allow(struct __ctx_buff *ctx) {
+strict_allow(struct __ctx_buff *ctx, __be16 proto) {
 	struct remote_endpoint_info __maybe_unused *dest_info, __maybe_unused *src_info;
 	bool __maybe_unused in_strict_cidr = false;
 	void *data, *data_end;
 #ifdef ENABLE_IPV4
 	struct iphdr *ip4;
 #endif
-	__u16 proto = 0;
-
-	if (!validate_ethertype(ctx, &proto))
-		return true;
 
 	switch (proto) {
 #ifdef ENABLE_IPV4
@@ -213,7 +224,5 @@ strict_allow(struct __ctx_buff *ctx) {
 }
 
 #endif /* ENCRYPTION_STRICT_MODE */
-
-#endif /* __WIREGUARD_H_ */
 
 #endif /* ENABLE_WIREGUARD */

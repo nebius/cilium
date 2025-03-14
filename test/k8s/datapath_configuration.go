@@ -15,17 +15,12 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/test/config"
 	. "github.com/cilium/cilium/test/ginkgo-ext"
 	"github.com/cilium/cilium/test/helpers"
 )
 
 var _ = Describe("K8sDatapathConfig", func() {
-	const (
-		bpffsDir string = defaults.BPFFSRoot + "/" + defaults.TCGlobalsPath + "/"
-	)
-
 	var (
 		kubectl    *helpers.Kubectl
 		monitorLog = "monitor-aggregation.log"
@@ -55,6 +50,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 
 	JustAfterEach(func() {
 		kubectl.ValidateNoErrorsInLogs(CurrentGinkgoTestDescription().Duration)
+		kubectl.CollectFeatures()
 	})
 
 	Context("MonitorAggregation", func() {
@@ -63,9 +59,6 @@ var _ = Describe("K8sDatapathConfig", func() {
 				"bpf.monitorAggregation": "medium",
 				"bpf.monitorInterval":    "60s",
 				"bpf.monitorFlags":       "syn",
-				// Need to disable the host firewall for now due to complexity issue.
-				// See #14552 for details.
-				"hostFirewall.enabled": "false",
 			}, DeployCiliumOptionsAndDNS)
 
 			monitorRes, monitorCancel, targetIP := monitorConnectivityAcrossNodes(kubectl)
@@ -505,7 +498,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 			// IPs to be present on both nodes before performing the test
 			waitForAllowedIP := func(ciliumPod, ip string) {
 				jsonpath := fmt.Sprintf(`{.encryption.wireguard.interfaces[*].peers[*].allowed-ips[?(@=='%s')]}`, ip)
-				ciliumCmd := fmt.Sprintf(`cilium debuginfo --output jsonpath="%s"`, jsonpath)
+				ciliumCmd := fmt.Sprintf(`cilium-dbg debuginfo --output jsonpath="%s"`, jsonpath)
 				expected := fmt.Sprintf("jsonpath=%s", ip)
 				err := kubectl.CiliumExecUntilMatch(ciliumPod, ciliumCmd, expected)
 				Expect(err).To(BeNil(), "ip %q not in allowedIPs of pod %q", ip, ciliumPod)
@@ -654,55 +647,6 @@ var _ = Describe("K8sDatapathConfig", func() {
 			}
 			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
 			testHostFirewall(kubectl)
-		})
-	})
-
-	SkipContextIf(func() bool {
-		return helpers.SkipQuarantined() || helpers.DoesNotRunOnNetNextKernel()
-	}, "High-scale IPcache", func() {
-		const hsIPcacheFile = "high-scale-ipcache.yaml"
-
-		AfterEach(func() {
-			hsIPcacheYAML := helpers.ManifestGet(kubectl.BasePath(), hsIPcacheFile)
-			_ = kubectl.Delete(hsIPcacheYAML)
-		})
-
-		testHighScaleIPcache := func(tunnelProto string, epRoutesConfig string) {
-			options := map[string]string{
-				"highScaleIPcache.enabled":    "true",
-				"routingMode":                 "native",
-				"bpf.monitorAggregation":      "none",
-				"ipv6.enabled":                "false",
-				"wellKnownIdentities.enabled": "true",
-				"tunnelProtocol":              tunnelProto,
-				"endpointRoutes.enabled":      epRoutesConfig,
-			}
-			if !helpers.RunsOnGKE() {
-				options["autoDirectNodeRoutes"] = "true"
-			}
-			if helpers.RunsWithKubeProxy() {
-				options["kubeProxyReplacement"] = "false"
-			}
-			deploymentManager.DeployCilium(options, DeployCiliumOptionsAndDNS)
-
-			cmd := fmt.Sprintf("bpftool map update pinned %scilium_world_cidrs4 key 0 0 0 0 0 0 0 0 value 1", bpffsDir)
-			kubectl.CiliumExecMustSucceedOnAll(context.TODO(), cmd)
-
-			hsIPcacheYAML := helpers.ManifestGet(kubectl.BasePath(), hsIPcacheFile)
-			kubectl.Create(hsIPcacheYAML).ExpectSuccess("Unable to create resource %q", hsIPcacheYAML)
-
-			// We need a longer timeout here because of the larger number of
-			// pods that need to be deployed.
-			err := kubectl.WaitforPods(helpers.DefaultNamespace, "-l type=client", 2*helpers.HelperTimeout)
-			Expect(err).ToNot(HaveOccurred(), "Client pods not ready after timeout")
-		}
-
-		It("Test ingress policy enforcement with VXLAN and no endpoint routes", func() {
-			testHighScaleIPcache("vxlan", "false")
-		})
-
-		It("Test ingress policy enforcement with GENEVE and endpoint routes", func() {
-			testHighScaleIPcache("geneve", "true")
 		})
 	})
 

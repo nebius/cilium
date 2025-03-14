@@ -27,6 +27,9 @@ const (
 	Array      = ciliumebpf.Array
 	HashOfMaps = ciliumebpf.HashOfMaps
 	LPMTrie    = ciliumebpf.LPMTrie
+	LRUHash    = ciliumebpf.LRUHash
+	LRUCPUHash = ciliumebpf.LRUCPUHash
+	RingBuf    = ciliumebpf.RingBuf
 
 	PinNone   = ciliumebpf.PinNone
 	PinByName = ciliumebpf.PinByName
@@ -205,4 +208,11 @@ func (m *Map) GetModel() *models.BPFMap {
 	// TODO: handle map cache. See pkg/bpf/map_linux.go:GetModel()
 
 	return mapModel
+}
+
+func (m *Map) IsEmpty() bool {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	var key, value interface{}
+	return !m.Iterate().Next(key, value)
 }

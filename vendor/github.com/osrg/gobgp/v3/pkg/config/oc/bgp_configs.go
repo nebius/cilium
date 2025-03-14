@@ -1811,6 +1811,9 @@ type PeerGroupConfig struct {
 	// original -> bgp:peer-group-name
 	// Name of the BGP peer-group.
 	PeerGroupName string `mapstructure:"peer-group-name" json:"peer-group-name,omitempty"`
+	// original -> gobgp:send-software-version
+	// gobgp:send-software-version's original type is boolean.
+	SendSoftwareVersion bool `mapstructure:"send-software-version" json:"send-software-version,omitempty"`
 }
 
 func (lhs *PeerGroupConfig) Equal(rhs *PeerGroupConfig) bool {
@@ -1842,6 +1845,9 @@ func (lhs *PeerGroupConfig) Equal(rhs *PeerGroupConfig) bool {
 		return false
 	}
 	if lhs.PeerGroupName != rhs.PeerGroupName {
+		return false
+	}
+	if lhs.SendSoftwareVersion != rhs.SendSoftwareVersion {
 		return false
 	}
 	return true
@@ -2210,6 +2216,13 @@ type AsPathOptionsState struct {
 	// Replace occurrences of the peer's AS in the AS_PATH
 	// with the local autonomous system number.
 	ReplacePeerAs bool `mapstructure:"replace-peer-as" json:"replace-peer-as,omitempty"`
+	// original -> gobgp:allow-as-path-loop-local
+	// gobgp:allow-as-path-loop-local's original type is boolean.
+	// Bypasses as-path loop detection on locally sourced (static) routes
+	// when exporting towards iBGP neighbors. This is needed in some environments
+	// where gobgp is functioning as a route injector. Non-local routes
+	// are still checked for as-path loops.
+	AllowAsPathLoopLocal bool `mapstructure:"allow-as-path-loop-local" json:"allow-as-path-loop-local,omitempty"`
 }
 
 // struct for container bgp:config.
@@ -2225,6 +2238,13 @@ type AsPathOptionsConfig struct {
 	// Replace occurrences of the peer's AS in the AS_PATH
 	// with the local autonomous system number.
 	ReplacePeerAs bool `mapstructure:"replace-peer-as" json:"replace-peer-as,omitempty"`
+	// original -> gobgp:allow-as-path-loop-local
+	// gobgp:allow-as-path-loop-local's original type is boolean.
+	// Bypasses as-path loop detection on locally sourced (static) routes
+	// when exporting towards iBGP neighbors. This is needed in some environments
+	// where gobgp is functioning as a route injector. Non-local routes
+	// are still checked for as-path loops.
+	AllowAsPathLoopLocal bool `mapstructure:"allow-as-path-loop-local" json:"allow-as-path-loop-local,omitempty"`
 }
 
 func (lhs *AsPathOptionsConfig) Equal(rhs *AsPathOptionsConfig) bool {
@@ -2235,6 +2255,9 @@ func (lhs *AsPathOptionsConfig) Equal(rhs *AsPathOptionsConfig) bool {
 		return false
 	}
 	if lhs.ReplacePeerAs != rhs.ReplacePeerAs {
+		return false
+	}
+	if lhs.AllowAsPathLoopLocal != rhs.AllowAsPathLoopLocal {
 		return false
 	}
 	return true

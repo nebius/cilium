@@ -5,9 +5,11 @@ package heartbeat
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/promise"
 )
@@ -18,7 +20,7 @@ var Cell = cell.Module(
 	"kvstore-heartbeat-updater",
 	"KVStore Heartbeat Updater",
 
-	cell.Invoke(func(lc cell.Lifecycle, backendPromise promise.Promise[kvstore.BackendOperations]) {
+	cell.Invoke(func(logger *slog.Logger, lc cell.Lifecycle, backendPromise promise.Promise[kvstore.BackendOperations]) {
 		ctx, cancel := context.WithCancel(context.Background())
 		var wg sync.WaitGroup
 
@@ -35,7 +37,7 @@ var Cell = cell.Module(
 						return
 					}
 
-					Heartbeat(ctx, backend)
+					Heartbeat(ctx, logger, backend)
 				}()
 				return nil
 			},

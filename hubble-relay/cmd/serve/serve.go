@@ -31,7 +31,6 @@ const (
 	keyPprofPort               = "pprof-port"
 	keyGops                    = "gops"
 	keyGopsPort                = "gops-port"
-	keyDialTimeout             = "dial-timeout"
 	keyRetryTimeout            = "retry-timeout"
 	keyListenAddress           = "listen-address"
 	keyHealthListenAddress     = "health-listen-address"
@@ -84,10 +83,6 @@ func New(vp *viper.Viper) *cobra.Command {
 		keyGopsPort,
 		defaults.GopsPort,
 		"Port for gops server to listen on")
-	flags.Duration(
-		keyDialTimeout,
-		defaults.DialTimeout,
-		"Dial timeout when connecting to hubble peers")
 	flags.Duration(
 		keyRetryTimeout,
 		defaults.RetryTimeout,
@@ -189,11 +184,10 @@ func runServe(vp *viper.Viper) error {
 	if vp.GetBool("debug") {
 		logging.SetLogLevelToDebug()
 	}
-	logger := logging.DefaultLogger.WithField(logfields.LogSubsys, "hubble-relay")
+	logger := logging.DefaultSlogLogger.With(logfields.LogSubsys, "hubble-relay")
 
 	opts := []server.Option{
 		server.WithLocalClusterName(vp.GetString(keyClusterName)),
-		server.WithDialTimeout(vp.GetDuration(keyDialTimeout)),
 		server.WithPeerTarget(vp.GetString(keyPeerService)),
 		server.WithListenAddress(vp.GetString(keyListenAddress)),
 		server.WithHealthListenAddress(vp.GetString(keyHealthListenAddress)),
@@ -221,7 +215,7 @@ func runServe(vp *viper.Viper) error {
 		opts = append(opts, server.WithInsecureClient())
 	} else {
 		tlsClientConfig, err := certloader.NewWatchedClientConfig(
-			logger.WithField("config", "tls-to-hubble"),
+			logger.With(logfields.Config, "tls-to-hubble"),
 			vp.GetStringSlice(keyTLSHubbleServerCAFiles),
 			hubbleClientCertFile(vp),
 			hubbleClientKeyFile(vp),
@@ -238,7 +232,7 @@ func runServe(vp *viper.Viper) error {
 		opts = append(opts, server.WithInsecureServer())
 	} else {
 		tlsServerConfig, err := certloader.NewWatchedServerConfig(
-			logger.WithField("config", "tls-server"),
+			logger.With(logfields.Config, "tls-server"),
 			vp.GetStringSlice(keyTLSRelayClientCAFiles),
 			relayServerCertFile(vp),
 			relayServerKeyFile(vp),

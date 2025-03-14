@@ -1,17 +1,20 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_HOST_FIREWALL_H_
-#define __LIB_HOST_FIREWALL_H_
+#pragma once
+
+#if defined(IS_BPF_HOST)
+
+#include "policy_log.h"
 
 /* Only compile in if host firewall is enabled and file is included from
  * bpf_host.
  */
-#if defined(ENABLE_HOST_FIREWALL) && defined(IS_BPF_HOST)
+#if defined(ENABLE_HOST_FIREWALL)
 
 #include "auth.h"
 #include "policy.h"
-#include "policy_log.h"
+#include "proxy.h"
 #include "trace.h"
 
 # ifdef ENABLE_IPV6
@@ -31,7 +34,7 @@ ipv6_whitelist_snated_egress_connections(struct __ctx_buff *ctx, struct ipv6_ct_
 	 * HOST_ID, but the actual srcid (derived from the packet mark) isn't.
 	 */
 	if (ct_ret == CT_NEW) {
-		int ret = ct_create6(get_ct_map6(tuple), &CT_MAP_ANY6,
+		int ret = ct_create6(get_ct_map6(tuple), &cilium_ct_any6_global,
 				     tuple, ctx, CT_EGRESS, NULL, ext_err);
 		if (unlikely(ret < 0))
 			return ret;
@@ -70,7 +73,7 @@ ipv6_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_sec_identity,
 	}
 	ct_buffer->l4_off = l3_off + hdrlen;
 	ct_buffer->ret = ct_lookup6(get_ct_map6(tuple), tuple, ctx, ct_buffer->l4_off,
-				    CT_EGRESS, NULL, &ct_buffer->monitor);
+				    CT_EGRESS, SCOPE_BIDIR, NULL, &ct_buffer->monitor);
 	return true;
 }
 
@@ -114,7 +117,7 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id __maybe_unused
 		return CTX_ACT_OK;
 
 	/* Perform policy lookup. */
-	verdict = policy_can_egress6(ctx, &POLICY_MAP, tuple, ct_buffer->l4_off, HOST_ID,
+	verdict = policy_can_egress6(ctx, &cilium_policy_v2, tuple, ct_buffer->l4_off, HOST_ID,
 				     dst_sec_identity, &policy_match_type, &audited, ext_err,
 				     &proxy_port);
 	if (verdict == DROP_POLICY_AUTH_REQUIRED) {
@@ -135,18 +138,27 @@ __ipv6_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id __maybe_unused
 		 * case, it's OK to return ext_err from ct_create6 along with
 		 * its error code.
 		 */
-		ret = ct_create6(get_ct_map6(tuple), &CT_MAP_ANY6, tuple,
+		ret = ct_create6(get_ct_map6(tuple), &cilium_ct_any6_global, tuple,
 				 ctx, CT_EGRESS, &ct_state_new, ext_err);
 		if (IS_ERR(ret))
 			return ret;
 	}
 
-	/* Emit verdict if drop or if allow for CT_NEW or CT_REOPENED. */
+	/* Emit verdict if drop or if allow for CT_NEW. */
 	if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
 		send_policy_verdict_notify(ctx, dst_sec_identity, tuple->dport,
 					   tuple->nexthdr, POLICY_EGRESS, 1,
 					   verdict, proxy_port, policy_match_type, audited,
 					   auth_type);
+
+	if (proxy_port > 0 && (ret == CT_NEW || ret == CT_ESTABLISHED)) {
+		/* Trace the packet before it is forwarded to proxy */
+		send_trace_notify(ctx, TRACE_TO_PROXY, SECLABEL_IPV6, UNKNOWN_ID,
+				  bpf_ntohs(proxy_port), TRACE_IFINDEX_UNKNOWN,
+				  trace->reason, trace->monitor);
+		return ctx_redirect_to_proxy_host_egress(ctx, proxy_port);
+	}
+
 	return verdict;
 }
 
@@ -197,7 +209,7 @@ ipv6_host_policy_ingress_lookup(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 	}
 	ct_buffer->l4_off = ETH_HLEN + hdrlen;
 	ct_buffer->ret = ct_lookup6(get_ct_map6(tuple), tuple, ctx, ct_buffer->l4_off,
-				    CT_INGRESS, NULL, &ct_buffer->monitor);
+				    CT_INGRESS, SCOPE_BIDIR, NULL, &ct_buffer->monitor);
 
 	return true;
 }
@@ -234,7 +246,7 @@ __ipv6_host_policy_ingress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 		goto out;
 
 	/* Perform policy lookup */
-	verdict = policy_can_ingress6(ctx, &POLICY_MAP, tuple, ct_buffer->l4_off,
+	verdict = policy_can_ingress6(ctx, &cilium_policy_v2, tuple, ct_buffer->l4_off,
 				      *src_sec_identity, HOST_ID, &policy_match_type, &audited,
 				      ext_err, &proxy_port);
 	if (verdict == DROP_POLICY_AUTH_REQUIRED) {
@@ -256,13 +268,13 @@ __ipv6_host_policy_ingress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
 		 * case, it's OK to return ext_err from ct_create6 along with
 		 * its error code.
 		 */
-		ret = ct_create6(get_ct_map6(tuple), &CT_MAP_ANY6, tuple,
+		ret = ct_create6(get_ct_map6(tuple), &cilium_ct_any6_global, tuple,
 				 ctx, CT_INGRESS, &ct_state_new, ext_err);
 		if (IS_ERR(ret))
 			return ret;
 	}
 
-	/* Emit verdict if drop or if allow for CT_NEW or CT_REOPENED. */
+	/* Emit verdict if drop or if allow for CT_NEW. */
 	if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
 		send_policy_verdict_notify(ctx, *src_sec_identity, tuple->dport,
 					   tuple->nexthdr, POLICY_INGRESS, 1,
@@ -313,7 +325,7 @@ ipv4_whitelist_snated_egress_connections(struct __ctx_buff *ctx, struct ipv4_ct_
 	 * HOST_ID, but the actual srcid (derived from the packet mark) isn't.
 	 */
 	if (ct_ret == CT_NEW) {
-		int ret = ct_create4(get_ct_map4(tuple), &CT_MAP_ANY4,
+		int ret = ct_create4(get_ct_map4(tuple), &cilium_ct_any4_global,
 				     tuple, ctx, CT_EGRESS, NULL, ext_err);
 		if (unlikely(ret < 0))
 			return ret;
@@ -346,7 +358,7 @@ ipv4_host_policy_egress_lookup(struct __ctx_buff *ctx, __u32 src_sec_identity,
 	tuple->saddr = ip4->saddr;
 	ct_buffer->l4_off = l3_off + ipv4_hdrlen(ip4);
 	ct_buffer->ret = ct_lookup4(get_ct_map4(tuple), tuple, ctx, ip4, ct_buffer->l4_off,
-				    CT_EGRESS, NULL, &ct_buffer->monitor);
+				    CT_EGRESS, SCOPE_BIDIR, NULL, &ct_buffer->monitor);
 	return true;
 }
 
@@ -390,7 +402,7 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id __maybe_unused
 		return CTX_ACT_OK;
 
 	/* Perform policy lookup. */
-	verdict = policy_can_egress4(ctx, &POLICY_MAP, tuple, ct_buffer->l4_off, HOST_ID,
+	verdict = policy_can_egress4(ctx, &cilium_policy_v2, tuple, ct_buffer->l4_off, HOST_ID,
 				     dst_sec_identity, &policy_match_type,
 				     &audited, ext_err, &proxy_port);
 	if (verdict == DROP_POLICY_AUTH_REQUIRED) {
@@ -411,18 +423,27 @@ __ipv4_host_policy_egress(struct __ctx_buff *ctx, bool is_host_id __maybe_unused
 		 * case, it's OK to return ext_err from ct_create4 along with
 		 * its error code.
 		 */
-		ret = ct_create4(get_ct_map4(tuple), &CT_MAP_ANY4, tuple,
+		ret = ct_create4(get_ct_map4(tuple), &cilium_ct_any4_global, tuple,
 				 ctx, CT_EGRESS, &ct_state_new, ext_err);
 		if (IS_ERR(ret))
 			return ret;
 	}
 
-	/* Emit verdict if drop or if allow for CT_NEW or CT_REOPENED. */
+	/* Emit verdict if drop or if allow for CT_NEW. */
 	if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
 		send_policy_verdict_notify(ctx, dst_sec_identity, tuple->dport,
 					   tuple->nexthdr, POLICY_EGRESS, 0,
 					   verdict, proxy_port, policy_match_type, audited,
 					   auth_type);
+
+	if (proxy_port > 0 && (ret == CT_NEW || ret == CT_ESTABLISHED)) {
+		/* Trace the packet before it is forwarded to proxy */
+		send_trace_notify(ctx, TRACE_TO_PROXY, SECLABEL_IPV4, UNKNOWN_ID,
+				  bpf_ntohs(proxy_port), TRACE_IFINDEX_UNKNOWN,
+				  trace->reason, trace->monitor);
+		return ctx_redirect_to_proxy_host_egress(ctx, proxy_port);
+	}
+
 	return verdict;
 }
 
@@ -467,7 +488,7 @@ ipv4_host_policy_ingress_lookup(struct __ctx_buff *ctx, struct iphdr *ip4,
 	tuple->saddr = ip4->saddr;
 	ct_buffer->l4_off = l3_off + ipv4_hdrlen(ip4);
 	ct_buffer->ret = ct_lookup4(get_ct_map4(tuple), tuple, ctx, ip4, ct_buffer->l4_off,
-				    CT_INGRESS, NULL, &ct_buffer->monitor);
+				    CT_INGRESS, SCOPE_BIDIR, NULL, &ct_buffer->monitor);
 
 	return true;
 }
@@ -512,7 +533,7 @@ __ipv4_host_policy_ingress(struct __ctx_buff *ctx, struct iphdr *ip4,
 #  endif
 
 	/* Perform policy lookup */
-	verdict = policy_can_ingress4(ctx, &POLICY_MAP, tuple, ct_buffer->l4_off,
+	verdict = policy_can_ingress4(ctx, &cilium_policy_v2, tuple, ct_buffer->l4_off,
 				      is_untracked_fragment, *src_sec_identity, HOST_ID,
 				      &policy_match_type, &audited, ext_err, &proxy_port);
 	if (verdict == DROP_POLICY_AUTH_REQUIRED) {
@@ -534,13 +555,13 @@ __ipv4_host_policy_ingress(struct __ctx_buff *ctx, struct iphdr *ip4,
 		 * case, it's OK to return ext_err from ct_create4 along with
 		 * its error code.
 		 */
-		ret = ct_create4(get_ct_map4(tuple), &CT_MAP_ANY4, tuple,
+		ret = ct_create4(get_ct_map4(tuple), &cilium_ct_any4_global, tuple,
 				 ctx, CT_INGRESS, &ct_state_new, ext_err);
 		if (IS_ERR(ret))
 			return ret;
 	}
 
-	/* Emit verdict if drop or if allow for CT_NEW or CT_REOPENED. */
+	/* Emit verdict if drop or if allow for CT_NEW. */
 	if (verdict != CTX_ACT_OK || ret != CT_ESTABLISHED)
 		send_policy_verdict_notify(ctx, *src_sec_identity, tuple->dport,
 					   tuple->nexthdr, POLICY_INGRESS, 0,
@@ -572,6 +593,6 @@ ipv4_host_policy_ingress(struct __ctx_buff *ctx, __u32 *src_sec_identity,
 
 	return __ipv4_host_policy_ingress(ctx, ip4, &ct_buffer, src_sec_identity, trace, ext_err);
 }
-# endif /* ENABLE_IPV4 */
-#endif /* ENABLE_HOST_FIREWALL && IS_BPF_HOST */
-#endif /* __LIB_HOST_FIREWALL_H_ */
+#  endif /* ENABLE_IPV4 */
+# endif /* ENABLE_HOST_FIREWALL */
+#endif /* IS_BPF_HOST */

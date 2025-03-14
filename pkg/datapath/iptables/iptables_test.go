@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type expectation struct {
@@ -344,7 +346,7 @@ func TestAddProxyRulesv4(t *testing.T) {
 	}
 }
 
-func TestGetProxyPort(t *testing.T) {
+func TestGetProxyPorts(t *testing.T) {
 	mockIp4tables := &mockIptables{t: t, prog: "iptables"}
 	mockIp4tables.expectations = []expectation{
 		{
@@ -362,9 +364,9 @@ TPROXY     udp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd7a90
 	}
 
 	// Finds the latest port number if multiple rules for the same proxy name
-	port := mockManager.doGetProxyPort(mockIp4tables, "cilium-dns-egress")
-	if port != uint16(43479) {
-		t.Fatalf("expected port number %d, got %d", uint16(43479), port)
+	portMap := mockManager.doGetProxyPorts(mockIp4tables)
+	if len(portMap) != 1 || portMap["cilium-dns-egress"] != uint16(43479) {
+		t.Fatalf("expected port number %d, got %d, portMap: %v", uint16(43479), portMap["cilium-dns-egress"], portMap)
 	}
 	if err := mockIp4tables.checkExpectations(); err != nil {
 		t.Fatal(err)
@@ -379,17 +381,17 @@ TPROXY     udp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd7a90
 				`Chain CILIUM_PRE_mangle (1 references)
 target     prot opt source               destination
 MARK       all  --  0.0.0.0/0            0.0.0.0/0            socket --transparent /* cilium: any->pod redirect proxied traffic to host proxy */ MARK set 0x200
-TPROXY     tcp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd5a90200 /* cilium: TPROXY to host cilium-random-proxy proxy */ TPROXY redirect 0.0.0.0:43477 mark 0x200/0xffffffff
-TPROXY     udp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd5a90200 /* cilium: TPROXY to host cilium-random-proxy proxy */ TPROXY redirect 0.0.0.0:43477 mark 0x200/0xffffffff
-TPROXY     tcp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd7a90200 /* cilium: TPROXY to host cilium-random-proxy proxy */ TPROXY redirect 0.0.0.0:43479 mark 0x200/0xffffffff
-TPROXY     udp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd7a90200 /* cilium: TPROXY to host cilium-random-proxy proxy */ TPROXY redirect 0.0.0.0:43479 mark 0x200/0xffffffff
+TPROXY     tcp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd5a90200 /* cilium: TPROXY to host cilium-random-ingress proxy */ TPROXY redirect 0.0.0.0:43477 mark 0x200/0xffffffff
+TPROXY     udp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd5a90200 /* cilium: TPROXY to host cilium-random-ingress proxy */ TPROXY redirect 0.0.0.0:43477 mark 0x200/0xffffffff
+TPROXY     tcp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd7a90200 /* cilium: TPROXY to host cilium-random-ingress proxy */ TPROXY redirect 0.0.0.0:43479 mark 0x200/0xffffffff
+TPROXY     udp  --  0.0.0.0/0            0.0.0.0/0            mark match 0xd7a90200 /* cilium: TPROXY to host cilium-random-ingress proxy */ TPROXY redirect 0.0.0.0:43479 mark 0x200/0xffffffff
 `),
 		},
 	}
 
-	port = mockManager.doGetProxyPort(mockIp4tables, "cilium-random-proxy")
-	if port != uint16(43479) {
-		t.Fatalf("expected port number %d, got %d", uint16(43479), port)
+	portMap = mockManager.doGetProxyPorts(mockIp4tables)
+	if len(portMap) != 1 || portMap["cilium-random-ingress"] != uint16(43479) {
+		t.Fatalf("expected port number %d, got %d, portMap: %v", uint16(43479), portMap["cilium-random-ingress"], portMap)
 	}
 	if err := mockIp4tables.checkExpectations(); err != nil {
 		t.Fatal(err)
@@ -609,5 +611,186 @@ func TestRemoveCiliumRulesv6(t *testing.T) {
 	err := mockIp6tables.checkExpectations()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNodeIpsetNATCmds(t *testing.T) {
+	allocRange := "10.0.0.0/16"
+	ipset := "1.1.1.1"
+	tests := []struct {
+		masqueradeInterfaces []string
+		expected             [][]string
+	}{
+		{
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat",
+					"-s", "10.0.0.0/16",
+					"-m", "set",
+					"--match-set", "1.1.1.1", "dst",
+					"-m", "comment",
+					"--comment", "exclude traffic to cluster nodes from masquerade",
+					"-j", "ACCEPT",
+				},
+			},
+		},
+		{
+			masqueradeInterfaces: []string{"eth+"},
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat",
+					"-o", "eth+",
+					"-m", "set",
+					"--match-set", "1.1.1.1", "dst",
+					"-m", "comment",
+					"--comment", "exclude traffic to cluster nodes from masquerade",
+					"-j", "ACCEPT",
+				},
+			},
+		},
+		{
+			masqueradeInterfaces: []string{"eth+", "ens+"},
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat",
+					"-o", "eth+",
+					"-m", "set",
+					"--match-set", "1.1.1.1", "dst",
+					"-m", "comment",
+					"--comment", "exclude traffic to cluster nodes from masquerade",
+					"-j", "ACCEPT",
+				},
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat",
+					"-o", "ens+",
+					"-m", "set",
+					"--match-set", "1.1.1.1", "dst",
+					"-m", "comment",
+					"--comment", "exclude traffic to cluster nodes from masquerade",
+					"-j", "ACCEPT",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		actual := nodeIpsetNATCmds(allocRange, ipset, tt.masqueradeInterfaces)
+
+		assert.Equal(t, tt.expected, actual)
+	}
+}
+
+func TestAllEgressMasqueradeCmds(t *testing.T) {
+	allocRange := "10.0.0.0/16"
+	snatDstExclusionCIDR := "192.168.0.0/16"
+	tests := []struct {
+		masqueradeInterfaces []string
+		iptablesRandomFull   bool
+		expected             [][]string
+	}{
+		{
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat", "!",
+					"-d", "192.168.0.0/16",
+					"-s", "10.0.0.0/16", "!",
+					"-o", "cilium_+",
+					"-m", "comment",
+					"--comment", "cilium masquerade non-cluster",
+					"-j", "MASQUERADE",
+				},
+			},
+		},
+		{
+			iptablesRandomFull: true,
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat", "!",
+					"-d", "192.168.0.0/16",
+					"-s", "10.0.0.0/16", "!",
+					"-o", "cilium_+",
+					"-m", "comment",
+					"--comment", "cilium masquerade non-cluster",
+					"-j", "MASQUERADE",
+					"--random-fully",
+				},
+			},
+		},
+		{
+			masqueradeInterfaces: []string{"eth+"},
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat", "!",
+					"-d", "192.168.0.0/16",
+					"-o", "eth+",
+					"-m", "comment",
+					"--comment", "cilium masquerade non-cluster",
+					"-j", "MASQUERADE",
+				},
+			},
+		},
+		{
+			masqueradeInterfaces: []string{"eth+", "ens+"},
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat", "!",
+					"-d", "192.168.0.0/16",
+					"-o", "eth+",
+					"-m", "comment",
+					"--comment", "cilium masquerade non-cluster",
+					"-j", "MASQUERADE",
+				},
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat", "!",
+					"-d", "192.168.0.0/16",
+					"-o", "ens+",
+					"-m", "comment",
+					"--comment", "cilium masquerade non-cluster",
+					"-j", "MASQUERADE",
+				},
+			},
+		},
+		{
+			masqueradeInterfaces: []string{"eth+", "ens+"},
+			iptablesRandomFull:   true,
+			expected: [][]string{
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat", "!",
+					"-d", "192.168.0.0/16",
+					"-o", "eth+",
+					"-m", "comment",
+					"--comment", "cilium masquerade non-cluster",
+					"-j", "MASQUERADE",
+					"--random-fully",
+				},
+				{
+					"-t", "nat",
+					"-A", "CILIUM_POST_nat", "!",
+					"-d", "192.168.0.0/16",
+					"-o", "ens+",
+					"-m", "comment",
+					"--comment", "cilium masquerade non-cluster",
+					"-j", "MASQUERADE",
+					"--random-fully",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		actual := allEgressMasqueradeCmds(allocRange, snatDstExclusionCIDR, tt.masqueradeInterfaces,
+			tt.iptablesRandomFull)
+
+		assert.Equal(t, tt.expected, actual)
 	}
 }

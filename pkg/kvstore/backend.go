@@ -5,9 +5,13 @@ package kvstore
 
 import (
 	"context"
+	"log/slog"
 
 	"google.golang.org/grpc"
 
+	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -84,7 +88,7 @@ type backendModule interface {
 
 	// setConfig must configure the backend with the specified options.
 	// This function is called once before newClient().
-	setConfig(opts map[string]string) error
+	setConfig(logger *slog.Logger, opts map[string]string) error
 
 	// setExtraConfig sets more options in the kvstore that are not able to
 	// be set by strings.
@@ -99,7 +103,7 @@ type backendModule interface {
 
 	// newClient must initializes the backend and create a new kvstore
 	// client which implements the BackendOperations interface
-	newClient(ctx context.Context, opts *ExtraOptions) (BackendOperations, chan error)
+	newClient(ctx context.Context, logger *slog.Logger, opts *ExtraOptions) (BackendOperations, chan error)
 
 	// createInstance creates a new instance of the module
 	createInstance() backendModule
@@ -114,7 +118,7 @@ var (
 // registerBackend must be called by kvstore backends to register themselves
 func registerBackend(name string, module backendModule) {
 	if _, ok := registeredBackends[name]; ok {
-		log.Panicf("backend with name '%s' already registered", name)
+		logging.Panic(logging.DefaultSlogLogger, "backend already registered", logfields.Name, name)
 	}
 
 	registeredBackends[name] = module
@@ -141,9 +145,8 @@ type BackendOperations interface {
 	// client is not connected to the kvstore server. (Only implemented for etcd)
 	Disconnected() <-chan struct{}
 
-	// Status returns the status of the kvstore client including an
-	// eventual error
-	Status() (string, error)
+	// Status returns the status of the kvstore client
+	Status() *models.Status
 
 	// StatusCheckErrors returns a channel which receives status check
 	// errors
@@ -191,21 +194,14 @@ type BackendOperations interface {
 	ListPrefixIfLocked(ctx context.Context, prefix string, lock KVLocker) (KeyValuePairs, error)
 
 	// Close closes the kvstore client
-	Close(ctx context.Context)
-
-	// Encodes a binary slice into a character set that the backend
-	// supports
-	Encode(in []byte) string
-
-	// Decodes a key previously encoded back into the original binary slice
-	Decode(in string) ([]byte, error)
+	Close()
 
 	// ListAndWatch creates a new watcher which will watch the specified
 	// prefix for changes. Before doing this, it will list the current keys
 	// matching the prefix and report them as new keys. The Events channel is
-	// created with the specified sizes. Upon every change observed, a
-	// KeyValueEvent will be sent to the Events channel
-	ListAndWatch(ctx context.Context, prefix string, chanSize int) *Watcher
+	// unbuffered. Upon every change observed, a KeyValueEvent will be sent
+	// to the Events channel
+	ListAndWatch(ctx context.Context, prefix string) EventChan
 
 	// RegisterLeaseExpiredObserver registers a function which is executed when
 	// the lease associated with a key having the given prefix is detected as expired.

@@ -6,16 +6,20 @@ package node
 import (
 	"context"
 	"io"
+	"net"
 	"sync"
 
+	"github.com/cilium/hive/cell"
 	"github.com/cilium/stream"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/node/types"
+	"github.com/cilium/cilium/pkg/source"
 )
 
+// +deepequal-gen=true
 type LocalNode struct {
 	types.Node
 	// OptOutNodeEncryption will make the local node opt-out of node-to-node
@@ -26,6 +30,11 @@ type LocalNode struct {
 	UID k8stypes.UID
 	// ID of the node assigned by the cloud provider.
 	ProviderID string
+	// v4 CIDR in which pod IPs are routable
+	IPv4NativeRoutingCIDR *cidr.CIDR
+	// v6 CIDR in which pod IPs are routable
+	IPv6NativeRoutingCIDR *cidr.CIDR
+	IPv4Loopback          net.IP
 }
 
 // LocalNodeSynchronizer specifies how to build, and keep synchronized the local
@@ -107,6 +116,7 @@ func NewLocalNodeStore(params LocalNodeStoreParams) (*LocalNodeStore, error) {
 			// we don't need to always check for nil values.
 			Labels:      make(map[string]string),
 			Annotations: make(map[string]string),
+			Source:      source.Unspec,
 		}},
 		hasValue: hasValue,
 	}

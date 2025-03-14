@@ -6,9 +6,6 @@
 #include <bpf/ctx/xdp.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
@@ -25,9 +22,8 @@
 
 #define DISABLE_LOOPBACK_LB
 
-/* Skip ingress policy checks, not needed to validate hairpin flow */
+/* Skip ingress policy checks */
 #define USE_BPF_PROG_FOR_INGRESS_POLICY
-#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -141,12 +137,12 @@ int nodeport_geneve_dsr_lb_xdp1_local_backend_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
 
-	lb_v4_add_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, 1, revnat_id);
+	lb_v4_add_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 	lb_v4_add_backend(FRONTEND_IP_LOCAL, FRONTEND_PORT, 1, 124,
 			  BACKEND_IP_LOCAL, BACKEND_PORT, IPPROTO_TCP, 0);
 
 	/* add local backend */
-	endpoint_v4_add_entry(BACKEND_IP_LOCAL, 0, 0, 0,
+	endpoint_v4_add_entry(BACKEND_IP_LOCAL, 0, 0, 0, 0, 0,
 			      (__u8 *)local_backend_mac, (__u8 *)node_mac);
 
 	ipcache_v4_add_entry(BACKEND_IP_LOCAL, 0, 112233, 0, 0);
@@ -207,11 +203,17 @@ int nodeport_geneve_dsr_lb_xdp1_local_backend_check(const struct __ctx_buff *ctx
 	if (l3->daddr != BACKEND_IP_LOCAL)
 		test_fatal("dst IP hasn't been NATed to local backend IP");
 
+	if (l3->check != bpf_htons(0x4112))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst TCP port hasn't been NATed to backend port");
+
+	if (l4->check != bpf_htons(0xd7d0))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }
@@ -254,7 +256,7 @@ int nodeport_geneve_dsr_lb_xdp2_fwd_setup(struct __ctx_buff *ctx)
 	__u32 backend_id = 125;
 	__u16 revnat_id = 2;
 
-	lb_v4_add_service(FRONTEND_IP_REMOTE, FRONTEND_PORT, 1, revnat_id);
+	lb_v4_add_service(FRONTEND_IP_REMOTE, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 	lb_v4_add_backend(FRONTEND_IP_REMOTE, FRONTEND_PORT, 1, backend_id,
 			  BACKEND_IP_REMOTE, BACKEND_PORT, IPPROTO_TCP, 0);
 
@@ -341,6 +343,9 @@ int nodeport_geneve_dsr_lb_xdp_fwd_check(__maybe_unused const struct __ctx_buff 
 	if (l3->daddr != BACKEND_NODE_IP)
 		test_fatal("outerDstIP is not correct");
 
+	if (l3->check != bpf_htons(0x5371))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (udp->dest != bpf_htons(TUNNEL_PORT))
 		test_fatal("outerDstPort is not tunnel port");
 
@@ -376,11 +381,17 @@ int nodeport_geneve_dsr_lb_xdp_fwd_check(__maybe_unused const struct __ctx_buff 
 	if (inner_l3->daddr != BACKEND_IP_REMOTE)
 		test_fatal("innerDstIP hasn't been NATed to remote backend IP");
 
+	if (inner_l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(inner_l3->check));
+
 	if (tcp_inner->source != CLIENT_PORT)
 		test_fatal("innerSrcPort has changed");
 
 	if (tcp_inner->dest != BACKEND_PORT)
 		test_fatal("innerDstPort hasn't been NATed to backend port");
+
+	if (tcp_inner->check != bpf_htons(0xd7cf))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(tcp_inner->check));
 
 	test_finish();
 }

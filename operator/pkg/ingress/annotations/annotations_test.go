@@ -6,11 +6,11 @@ package annotations
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/cilium/cilium/operator/pkg/model"
+	"k8s.io/utils/ptr"
 )
 
 func TestGetAnnotationServiceType(t *testing.T) {
@@ -60,6 +60,140 @@ func TestGetAnnotationServiceType(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := GetAnnotationServiceType(tt.args.ingress); got != tt.want {
 				t.Errorf("GetAnnotationServiceType() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetAnnotationServiceExternalTrafficPolicy(t *testing.T) {
+	type args struct {
+		ingress *networkingv1.Ingress
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "no externalTrafficPolicy annotation",
+			args: args{
+				ingress: &networkingv1.Ingress{},
+			},
+			want: "Cluster",
+		},
+		{
+			name: "externalTrafficPolicy as Cluster",
+			args: args{
+				ingress: &networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							"ingress.cilium.io/service-external-traffic-policy": "Cluster",
+						},
+					},
+				},
+			},
+			want: "Cluster",
+		},
+		{
+			name: "externalTrafficPolicy as Local",
+			args: args{
+				ingress: &networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							"ingress.cilium.io/service-external-traffic-policy": "Local",
+						},
+					},
+				},
+			},
+			want: "Local",
+		},
+		{
+			name: "externalTrafficPolicy set to invalid value",
+			args: args{
+				ingress: &networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							"ingress.cilium.io/service-external-traffic-policy": "invalid-value",
+						},
+					},
+				},
+			},
+			want:    "Cluster",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetAnnotationServiceExternalTrafficPolicy(tt.args.ingress)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetAnnotationServiceExternalTrafficPolicy() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetAnnotationServiceExternalTrafficPolicy() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetAnnotationRequestTimeout(t *testing.T) {
+	type args struct {
+		ingress *networkingv1.Ingress
+	}
+
+	tests := []struct {
+		name    string
+		args    args
+		want    *time.Duration
+		wantErr bool
+	}{
+		{
+			name: "no request timeout annotation",
+			args: args{
+				ingress: &networkingv1.Ingress{},
+			},
+			want: nil,
+		},
+		{
+			name: "request timeout annotation with valid value",
+			args: args{
+				ingress: &networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							RequestTimeoutAnnotation: "10s",
+						},
+					},
+				},
+			},
+			want: ptr.To(time.Second * 10),
+		},
+		{
+			name: "request timeout annotation with invalid value",
+			args: args{
+				ingress: &networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							RequestTimeoutAnnotation: "invalid",
+						},
+					},
+				},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetAnnotationRequestTimeout(tt.args.ingress)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetAnnotationRequestTimeout() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetAnnotationRequestTimeout() got = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -184,7 +318,7 @@ func TestGetAnnotationInsecureNodePort(t *testing.T) {
 	}
 }
 
-func TestGetAnnotationTLSHostPort(t *testing.T) {
+func TestGetAnnotationHostListenerPort(t *testing.T) {
 	type args struct {
 		ingress *networkingv1.Ingress
 	}
@@ -195,19 +329,19 @@ func TestGetAnnotationTLSHostPort(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "no TLS host port annotation",
+			name: "no host listener port annotation",
 			args: args{
 				ingress: &networkingv1.Ingress{},
 			},
 			want: nil,
 		},
 		{
-			name: "TLS host port annotation with valid value",
+			name: "host listener port annotation with valid value",
 			args: args{
 				ingress: &networkingv1.Ingress{
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							"ingress.cilium.io/tls-passthrough-host-port": "1000",
+							"ingress.cilium.io/host-listener-port": "1000",
 						},
 					},
 				},
@@ -215,12 +349,12 @@ func TestGetAnnotationTLSHostPort(t *testing.T) {
 			want: uint32p(1000),
 		},
 		{
-			name: "TLS host port annotation with invalid non-numeric value",
+			name: "host listener port annotation with invalid non-numeric value",
 			args: args{
 				ingress: &networkingv1.Ingress{
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							"ingress.cilium.io/tls-passthrough-host-port": "invalid-numeric-value",
+							"ingress.cilium.io/host-listener-port": "invalid-numeric-value",
 						},
 					},
 				},
@@ -232,73 +366,13 @@ func TestGetAnnotationTLSHostPort(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := GetAnnotationTLSHostPort(tt.args.ingress)
+			got, err := GetAnnotationHostListenerPort(tt.args.ingress)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("GetAnnotationTLSHostPort() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("GetAnnotationHostListenerPort() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("GetAnnotationTLSHostPort() got = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestGetAnnotationHTTPHostPort(t *testing.T) {
-	type args struct {
-		ingress *networkingv1.Ingress
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    *uint32
-		wantErr bool
-	}{
-		{
-			name: "no HTTP host port annotation",
-			args: args{
-				ingress: &networkingv1.Ingress{},
-			},
-			want: nil,
-		},
-		{
-			name: "HTTP host port annotation with valid value",
-			args: args{
-				ingress: &networkingv1.Ingress{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							"ingress.cilium.io/http-host-port": "1000",
-						},
-					},
-				},
-			},
-			want: uint32p(1000),
-		},
-		{
-			name: "HTTP host port annotation with invalid non-numeric value",
-			args: args{
-				ingress: &networkingv1.Ingress{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							"ingress.cilium.io/http-host-port": "invalid-numeric-value",
-						},
-					},
-				},
-			},
-			want:    nil,
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := GetAnnotationHTTPHostPort(tt.args.ingress)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("GetAnnotationHTTPHostPort() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("GetAnnotationHTTPHostPort() got = %v, want %v", got, tt.want)
+				t.Errorf("GetAnnotationHostListenerPort() got = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -425,7 +499,7 @@ func TestGetAnnotationEnforceHTTPSEnabled(t *testing.T) {
 					},
 				},
 			},
-			want: model.AddressOf(true),
+			want: ptr.To(true),
 		},
 		{
 			name: "SSL Passthrough annotation present and disabled",
@@ -438,7 +512,7 @@ func TestGetAnnotationEnforceHTTPSEnabled(t *testing.T) {
 					},
 				},
 			},
-			want: model.AddressOf(false),
+			want: ptr.To(false),
 		},
 		{
 			name: "SSL Passthrough annotation present and true",
@@ -451,7 +525,7 @@ func TestGetAnnotationEnforceHTTPSEnabled(t *testing.T) {
 					},
 				},
 			},
-			want: model.AddressOf(true),
+			want: ptr.To(true),
 		},
 		{
 			name: "SSL Passthrough annotation present and false",
@@ -464,7 +538,7 @@ func TestGetAnnotationEnforceHTTPSEnabled(t *testing.T) {
 					},
 				},
 			},
-			want: model.AddressOf(false),
+			want: ptr.To(false),
 		},
 		{
 			name: "SSL Passthrough annotation present and invalid",
@@ -490,6 +564,60 @@ func TestGetAnnotationEnforceHTTPSEnabled(t *testing.T) {
 	}
 }
 
+func TestGetAnnotationLoadBalancerClass(t *testing.T) {
+	type args struct {
+		ingress *networkingv1.Ingress
+	}
+	tests := []struct {
+		name string
+		args args
+		want *string
+	}{
+		{
+			name: "no load balancer class annotation",
+			args: args{
+				ingress: &networkingv1.Ingress{},
+			},
+			want: nil,
+		},
+		{
+			name: "load balancer class annotation present",
+			args: args{
+				ingress: &networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							"ingress.cilium.io/loadbalancer-class": "foo",
+						},
+					},
+				},
+			},
+			want: stringp("foo"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetAnnotationLoadBalancerClass(tt.args.ingress)
+			if !isStringpEqual(got, tt.want) {
+				t.Errorf("GetAnnotationLoadBalancerClass() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func uint32p(u uint32) *uint32 {
 	return &u
+}
+
+func stringp(s string) *string {
+	return &s
+}
+
+func isStringpEqual(a, b *string) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }

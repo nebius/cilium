@@ -6,11 +6,12 @@ package spire
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
@@ -23,8 +24,8 @@ import (
 
 	"github.com/cilium/cilium/operator/auth/identity"
 	"github.com/cilium/cilium/pkg/backoff"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
@@ -45,6 +46,7 @@ var defaultSelectors = []*types.Selector{
 var Cell = cell.Module(
 	"spire-client",
 	"Spire Server API Client",
+	cell.Config(defaultMutualAuthConfig),
 	cell.Config(ClientConfig{}),
 	cell.Provide(NewClient),
 )
@@ -52,13 +54,29 @@ var Cell = cell.Module(
 var FakeCellClient = cell.Module(
 	"fake-spire-client",
 	"Fake Spire Server API Client",
+	cell.Config(defaultMutualAuthConfig),
 	cell.Config(ClientConfig{}),
 	cell.Provide(NewFakeClient),
 )
 
+// MutualAuthConfig contains general configuration for mutual authentication.
+type MutualAuthConfig struct {
+	Enabled bool `mapstructure:"mesh-auth-mutual-enabled"`
+}
+
+var defaultMutualAuthConfig = MutualAuthConfig{
+	Enabled: false,
+}
+
+// Flags adds the flags used by ClientConfig.
+func (cfg MutualAuthConfig) Flags(flags *pflag.FlagSet) {
+	flags.Bool("mesh-auth-mutual-enabled",
+		cfg.Enabled,
+		"The flag to enable mutual authentication for the SPIRE server (beta).")
+}
+
 // ClientConfig contains the configuration for the SPIRE client.
 type ClientConfig struct {
-	MutualAuthEnabled            bool          `mapstructure:"mesh-auth-mutual-enabled"`
 	SpireAgentSocketPath         string        `mapstructure:"mesh-auth-spire-agent-socket"`
 	SpireServerAddress           string        `mapstructure:"mesh-auth-spire-server-address"`
 	SpireServerConnectionTimeout time.Duration `mapstructure:"mesh-auth-spire-server-connection-timeout"`
@@ -67,10 +85,6 @@ type ClientConfig struct {
 
 // Flags adds the flags used by ClientConfig.
 func (cfg ClientConfig) Flags(flags *pflag.FlagSet) {
-	flags.BoolVar(&cfg.MutualAuthEnabled,
-		"mesh-auth-mutual-enabled",
-		false,
-		"The flag to enable mutual authentication for the SPIRE server (beta).")
 	flags.StringVar(&cfg.SpireAgentSocketPath,
 		"mesh-auth-spire-agent-socket",
 		"/run/spire/sockets/agent/agent.sock",
@@ -96,23 +110,23 @@ type params struct {
 }
 
 type Client struct {
-	cfg   ClientConfig
-	log   logrus.FieldLogger
-	entry entryv1.EntryClient
-
-	k8sClient k8sClient.Clientset
+	cfg        ClientConfig
+	log        *slog.Logger
+	entry      entryv1.EntryClient
+	entryMutex lock.RWMutex
+	k8sClient  k8sClient.Clientset
 }
 
 // NewClient creates a new SPIRE client.
 // If the mutual authentication is not enabled, it returns a noop client.
-func NewClient(params params, lc cell.Lifecycle, cfg ClientConfig, log logrus.FieldLogger) identity.Provider {
-	if !cfg.MutualAuthEnabled {
+func NewClient(params params, lc cell.Lifecycle, authCfg MutualAuthConfig, cfg ClientConfig, log *slog.Logger) identity.Provider {
+	if !authCfg.Enabled {
 		return &noopClient{}
 	}
 	client := &Client{
 		k8sClient: params.K8sClient,
 		cfg:       cfg,
-		log:       log.WithField(logfields.LogSubsys, "spire-client"),
+		log:       log.With(logfields.LogSubsys, "spire-client"),
 	}
 
 	lc.Append(cell.Hook{
@@ -131,10 +145,14 @@ func (c *Client) onStart(_ cell.HookContext) error {
 			attempts++
 			conn, err := c.connect(context.Background())
 			if err == nil {
+				c.entryMutex.Lock()
 				c.entry = entryv1.NewEntryClient(conn)
+				c.entryMutex.Unlock()
 				break
 			}
-			c.log.WithError(err).Warnf("Unable to connect to SPIRE server, attempt %d", attempts+1)
+			c.log.Warn("Unable to connect to SPIRE server",
+				logfields.Attempt, attempts+1,
+				logfields.Error, err)
 			time.Sleep(backoffTime.Duration(attempts))
 		}
 		c.log.Info("Initialized SPIRE client")
@@ -148,9 +166,9 @@ func (c *Client) connect(ctx context.Context) (*grpc.ClientConn, error) {
 
 	resolvedTarget, err := resolvedK8sService(ctx, c.k8sClient, c.cfg.SpireServerAddress)
 	if err != nil {
-		c.log.WithError(err).
-			WithField(logfields.URL, c.cfg.SpireServerAddress).
-			Warning("Unable to resolve SPIRE server address, using original value")
+		c.log.Warn("Unable to resolve SPIRE server address, using original value",
+			logfields.Error, err,
+			logfields.URL, c.cfg.SpireServerAddress)
 		resolvedTarget = &c.cfg.SpireServerAddress
 	}
 
@@ -172,25 +190,25 @@ func (c *Client) connect(ctx context.Context) (*grpc.ClientConn, error) {
 
 	tlsConfig := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeMemberOf(trustedDomain))
 
-	c.log.WithFields(logrus.Fields{
-		logfields.Address: c.cfg.SpireServerAddress,
-		logfields.IPAddr:  resolvedTarget,
-	}).Info("Trying to connect to SPIRE server")
-	conn, err := grpc.Dial(*resolvedTarget, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	c.log.Info("Trying to connect to SPIRE server",
+		logfields.Address, c.cfg.SpireServerAddress,
+		logfields.IPAddr, resolvedTarget)
+	conn, err := grpc.NewClient(*resolvedTarget, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create connection to SPIRE server: %w", err)
 	}
 
-	c.log.WithFields(logrus.Fields{
-		logfields.Address: c.cfg.SpireServerAddress,
-		logfields.IPAddr:  resolvedTarget,
-	}).Info("Connected to SPIRE server")
+	c.log.Info("Connected to SPIRE server",
+		logfields.Address, c.cfg.SpireServerAddress,
+		logfields.IPAddr, resolvedTarget)
 	return conn, nil
 }
 
 // Upsert creates or updates the SPIFFE ID for the given ID.
 // The SPIFFE ID is in the form of spiffe://<trust-domain>/identity/<id>.
 func (c *Client) Upsert(ctx context.Context, id string) error {
+	c.entryMutex.RLock()
+	defer c.entryMutex.RUnlock()
 	if c.entry == nil {
 		return fmt.Errorf("unable to connect to SPIRE server %s", c.cfg.SpireServerAddress)
 	}
@@ -228,6 +246,8 @@ func (c *Client) Upsert(ctx context.Context, id string) error {
 // Delete deletes the SPIFFE ID for the given ID.
 // The SPIFFE ID is in the form of spiffe://<trust-domain>/identity/<id>.
 func (c *Client) Delete(ctx context.Context, id string) error {
+	c.entryMutex.RLock()
+	defer c.entryMutex.RUnlock()
 	if c.entry == nil {
 		return fmt.Errorf("unable to connect to SPIRE server %s", c.cfg.SpireServerAddress)
 	}
@@ -259,6 +279,8 @@ func (c *Client) Delete(ctx context.Context, id string) error {
 }
 
 func (c *Client) List(ctx context.Context) ([]string, error) {
+	c.entryMutex.RLock()
+	defer c.entryMutex.RUnlock()
 	entries, err := c.entry.ListEntries(ctx, &entryv1.ListEntriesRequest{
 		Filter: &entryv1.ListEntriesRequest_Filter{
 			ByParentId: &types.SPIFFEID{

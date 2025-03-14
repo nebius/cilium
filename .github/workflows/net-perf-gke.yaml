@@ -1,9 +1,26 @@
-name: Network performance GKE
+name: Network performance GKE (net-perf-gke)
 
 # Any change in triggers needs to be reflected in the concurrency group.
 on:
   schedule:
     - cron: '39 0 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      PR-number:
+        description: "Pull request number."
+        required: true
+      context-ref:
+        description: "Context in which the workflow runs. If PR is from a fork, will be the PR target branch (general case). If PR is NOT from a fork, will be the PR branch itself (this allows committers to test changes to workflows directly from PRs)."
+        required: true
+      SHA:
+        description: "SHA under test (head of the PR branch)."
+        required: true
+      extra-args:
+        description: "[JSON object] Arbitrary arguments passed from the trigger comment via regex capture group. Parse with 'fromJson(inputs.extra-args).argName' in workflow."
+        required: false
+        default: '{}'
+
 # For testing uncomment following lines:
 #  push:
 #    branches:
@@ -12,10 +29,16 @@ on:
 # By specifying the access of one of the scopes, all of those that are not
 # specified are set to 'none'.
 permissions:
+  # To read actions state with catchpoint/workflow-telemetry-action
+  actions: read
   # To be able to access the repository with actions/checkout
   contents: read
   # To be able to request the JWT from GitHub's OIDC provider
   id-token: write
+  # To allow retrieving information from the PR API
+  pull-requests: read
+  # To be able to set commit status
+  statuses: write
 
 concurrency:
   # Structure:
@@ -37,17 +60,34 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  clusterName: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
-  cilium_cli_ci_version:
+  clusterName: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
   test_name: gke-perf
   USE_GKE_GCLOUD_AUTH_PLUGIN: True
   gcp_zone: us-east5-a
-  k8s_version: 1.28
+  # renovate: datasource=docker depName=google/cloud-sdk
+  gcloud_version: 512.0.0
 
 jobs:
+  echo-inputs:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Echo Workflow Dispatch Inputs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Echo Workflow Dispatch Inputs
+        run: |
+          echo '${{ tojson(inputs) }}'
+  commit-status-start:
+    name: Commit Status Start
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set initial commit status
+        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+        with:
+          sha: ${{ inputs.SHA || github.sha }}
+
   installation-and-perf:
     name: Installation and Perf Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       job_name: "Installation and Perf Test"
@@ -59,53 +99,40 @@ jobs:
             name: "native"
             mode: "gke"
             encryption: "none"
-            hubble: "false"
 
           - index: 2
             name: "tunnel"
             mode: "tunnel"
             encryption: "none"
-            hubble: "false"
 
           - index: 3
             name: "native-ipsec"
             mode: "gke"
             encryption: "ipsec"
-            hubble: "false"
 
           - index: 4
             name: "tunnel-ipsec"
             mode: "tunnel"
             encryption: "ipsec"
-            hubble: "false"
 
           - index: 5
-            name: "native-hubble"
+            name: "native-wireguard"
             mode: "gke"
-            encryption: "none"
-            hubble: "true"
+            encryption: "wireguard"
 
           - index: 6
-            name: "tunnel-hubble"
+            name: "tunnel-wireguard"
             mode: "tunnel"
-            encryption: "none"
-            hubble: "true"
-
-          - index: 7
-            name: "native-ipsec-hubble"
-            mode: "gke"
-            encryption: "ipsec"
-            hubble: "true"
-
-          - index: 8
-            name: "tunnel-ipsec-hubble"
-            mode: "tunnel"
-            encryption: "ipsec"
-            hubble: "true"
+            encryption: "wireguard"
 
     steps:
+      - name: Collect Workflow Telemetry
+        uses: catchpoint/workflow-telemetry-action@94c3c3d9567a0205de6da68a76c428ce4e769af1 # v2.0.0
+        with:
+          comment_on_pr: false
+
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.context-ref || github.sha }}
           persist-credentials: false
@@ -117,20 +144,17 @@ jobs:
         id: vars
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ ${{ github.event.pull_request }} ] ; then
-            SHA="${{ inputs.image-tag }}"
+            SHA="${{ inputs.SHA }}"
             OWNER="${{ inputs.PR-number }}"
           else
             SHA="${{ github.sha }}"
             OWNER="${{ github.ref_name }}"
-            OWNER="${OWNER/./-}"
+            OWNER="${OWNER//[.\/]/-}"
           fi
 
           CILIUM_INSTALL_DEFAULTS="--chart-directory=install/kubernetes/cilium \
             --helm-set=cluster.name=${{ env.clusterName }}-${{ matrix.index }} \
             --helm-set=agentNotReadyTaintKey=ignore-taint.cluster-autoscaler.kubernetes.io/cilium-agent-not-ready \
-            --helm-set=debug.enabled=false \
-            --helm-set=bpf.monitorAggregation=maximum \
-            --helm-set=hubble.enabled=${{ matrix.hubble == 'true' }} \
             --wait=false"
 
           # only add SHA to the image tags if it was set
@@ -157,19 +181,18 @@ jobs:
             CILIUM_INSTALL_DEFAULTS+=" --helm-set=encryption.enabled=true --helm-set=encryption.type=ipsec"
           fi
 
+          if [ "${{ matrix.encryption }}" = "wireguard" ] ; then
+            CILIUM_INSTALL_DEFAULTS+=" --helm-set=encryption.enabled=true --helm-set=encryption.type=wireguard"
+          fi
+
+          CILIUM_INSTALL_DEFAULTS+=" ${{ env.CILIUM_INSTALL_NET_PERF_EXTRA_ARGS }}"
+
           echo cilium_install_defaults=${CILIUM_INSTALL_DEFAULTS} >> $GITHUB_OUTPUT
           echo owner=${OWNER} >> $GITHUB_OUTPUT
 
-      - name: Install Cilium CLI
-        uses: cilium/cilium-cli@a9579d1afc528b085930c5237a69ee77b2c2be76 # v0.16.4
-        with:
-          repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
-          release-version: ${{ env.CILIUM_CLI_VERSION }}
-          ci-version: ${{ env.cilium_cli_ci_version }}
-
       - name: Set up gcloud credentials
         id: 'auth'
-        uses: google-github-actions/auth@55bd3a7c6e2ae7cf1877fd1ccb9d54c0503c457c # v2.1.2
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
         with:
           workload_identity_provider: ${{ secrets.GCP_PERF_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_PERF_SA }}
@@ -177,10 +200,10 @@ jobs:
           export_environment_variables: true
 
       - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@98ddc00a17442e89a24bbf282954a3b65ce6d200 # v2.1.0
+        uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f33d12def9a # v2.1.4
         with:
           project_id: ${{ secrets.GCP_PERF_PROJECT_ID }}
-          version: "405.0.0"
+          version: ${{ env.gcloud_version }}
 
       - name: Install gke-gcloud-auth-plugin
         run: |
@@ -191,11 +214,12 @@ jobs:
           gcloud info
 
       - name: Create GKE cluster
+        id: create-cluster
         run: |
           gcloud container clusters create ${{ env.clusterName }}-${{ matrix.index }} \
             --labels "usage=${{ github.repository_owner }}-${{ github.event.repository.name }},owner=${{ steps.vars.outputs.owner }}" \
             --zone ${{ env.gcp_zone }} \
-            --cluster-version ${{ env.k8s_version }} \
+            --release-channel=stable \
             --enable-ip-alias \
             --create-subnetwork="range=/26" \
             --cluster-ipv4-cidr="/21" \
@@ -207,9 +231,28 @@ jobs:
             --disk-size 20GB \
             --node-taints ignore-taint.cluster-autoscaler.kubernetes.io/cilium-agent-not-ready=true:NoExecute
 
+          native_cidr="$(gcloud container clusters describe ${{ env.clusterName }}-${{ matrix.index }} --zone ${{ env.gcp_zone }} --format 'value(clusterIpv4Cidr)')"
+          echo native_cidr=${native_cidr} >> $GITHUB_OUTPUT
+
       - name: Get cluster credentials
         run: |
           gcloud container clusters get-credentials ${{ env.clusterName }}-${{ matrix.index }} --zone ${{ env.gcp_zone }}
+
+      - name: Generate cilium-cli kubeconfig
+        id: gen-kubeconfig
+        uses: ./.github/actions/get-cloud-kubeconfig
+        with:
+          kubeconfig: "~/.kube/config"
+
+      - name: Install Cilium CLI
+        uses: cilium/cilium-cli@45a3879a8cb769c9e41b912635e03a38849c9242 # v0.18.1
+        with:
+          skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
+          image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
+          image-tag: ${{ steps.vars.outputs.sha }}
+          repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
+          release-version: ${{ env.CILIUM_CLI_VERSION }}
+          kubeconfig: ${{ steps.gen-kubeconfig.outputs.kubeconfig_path }}
 
       - name: Wait for images to be available
         timeout-minutes: 30
@@ -222,17 +265,18 @@ jobs:
       - name: Create custom IPsec secret
         if: ${{ matrix.encryption == 'ipsec' }}
         run: |
-          kubectl create -n kube-system secret generic cilium-ipsec-keys --from-literal=keys="15 rfc4106(gcm(aes)) $(echo $(dd if=/dev/urandom count=20 bs=1 2> /dev/null | xxd -p -c 64)) 128"
+          kubectl create -n kube-system secret generic cilium-ipsec-keys \
+              --from-literal=keys="3+ rfc4106(gcm(aes)) $(echo $(dd if=/dev/urandom count=20 bs=1 2> /dev/null | xxd -p -c 64)) 128"
 
       - name: Install Cilium
         id: install-cilium
         run: |
-          cilium install --dry-run-helm-values ${{ steps.vars.outputs.cilium_install_defaults }}
-          cilium install ${{ steps.vars.outputs.cilium_install_defaults }}
+          cilium install --dry-run-helm-values ${{ steps.vars.outputs.cilium_install_defaults }} --helm-set=ipv4NativeRoutingCIDR=${{ steps.create-cluster.outputs.native_cidr }}
+          cilium install ${{ steps.vars.outputs.cilium_install_defaults }} --helm-set=ipv4NativeRoutingCIDR=${{ steps.create-cluster.outputs.native_cidr }}
 
       - name: Wait for Cilium to be ready
         run: |
-          cilium status --wait --wait-duration=10m
+          cilium status --wait --interactive=false --wait-duration=10m
           kubectl get pods -n kube-system
           kubectl -n kube-system exec daemonset/cilium -- cilium-dbg status
 
@@ -241,12 +285,27 @@ jobs:
         run: |
           mkdir output
           cilium connectivity perf --duration=30s --host-net=true --pod-net=true --report-dir=./output
+          sudo chmod -R +r ./output
+
+      - name: Features tested
+        uses: ./.github/actions/feature-status
+        with:
+          title: "Summary of all features tested"
+          json-filename: "${{ env.job_name }} (${{ join(matrix.*, ', ') }})"
 
       - name: Get sysdump
         if: ${{ always() && steps.run-perf.outcome != 'skipped' && steps.run-perf.outcome != 'cancelled' }}
         run: |
           cilium status
           cilium sysdump --output-filename cilium-sysdump-final
+          sudo chmod +r cilium-sysdump-final.zip
+
+      - name: Upload features tested
+        if: ${{ always() }}
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: features-tested-${{ matrix.name }}
+          path: ${{ env.job_name }}*.json
 
       - name: Clean up GKE
         if: ${{ always() }}
@@ -259,9 +318,40 @@ jobs:
 
       - name: Export results and sysdump to GS bucket
         if: ${{ always() && steps.run-perf.outcome != 'skipped' && steps.run-perf.outcome != 'cancelled' }}
-        uses: cilium/scale-tests-action/export-results@238d773bd07754bfd693a6b22c94eddf3a12778d # main
+        uses: cilium/scale-tests-action/export-results@4499d7d0bfb04076af2334f5022c7a1bd654ecd0 # main
         with:
           test_name: ${{ env.test_name }}-${{ matrix.name }}
           results_bucket: ${{ env.GCP_PERF_RESULTS_BUCKET }}
           artifacts: ./output/*
           other_files: cilium-sysdump-final.zip
+
+  merge-upload:
+    if: ${{ always() }}
+    name: Merge and Upload Artifacts
+    runs-on: ubuntu-24.04
+    needs: installation-and-perf
+    steps:
+      - name: Checkout context ref (trusted)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.context-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Merge Features tested
+        uses: ./.github/actions/merge-artifacts
+        with:
+          name: features-tested
+          pattern: features-tested-*
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  commit-status-final:
+    if: ${{ always() }}
+    name: Commit Status Final
+    needs: installation-and-perf
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set final commit status
+        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+        with:
+          sha: ${{ inputs.SHA || github.sha }}
+          status: ${{ needs.installation-and-perf.result }}

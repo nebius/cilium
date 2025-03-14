@@ -76,7 +76,7 @@ type Rule struct {
 	// Ingress is a list of IngressRule which are enforced at ingress.
 	// If omitted or empty, this rule does not apply at ingress.
 	//
-	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:AnyOf
 	Ingress []IngressRule `json:"ingress,omitempty"`
 
 	// IngressDeny is a list of IngressDenyRule which are enforced at ingress.
@@ -84,13 +84,13 @@ type Rule struct {
 	// rules in the 'ingress' field.
 	// If omitted or empty, this rule does not apply at ingress.
 	//
-	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:AnyOf
 	IngressDeny []IngressDenyRule `json:"ingressDeny,omitempty"`
 
 	// Egress is a list of EgressRule which are enforced at egress.
 	// If omitted or empty, this rule does not apply at egress.
 	//
-	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:AnyOf
 	Egress []EgressRule `json:"egress,omitempty"`
 
 	// EgressDeny is a list of EgressDenyRule which are enforced at egress.
@@ -98,7 +98,7 @@ type Rule struct {
 	// rules in the 'egress' field.
 	// If omitted or empty, this rule does not apply at egress.
 	//
-	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:AnyOf
 	EgressDeny []EgressDenyRule `json:"egressDeny,omitempty"`
 
 	// Labels is a list of optional strings which can be used to
@@ -145,7 +145,7 @@ func (r *Rule) MarshalJSON() ([]byte, error) {
 		Egress            []EgressRule      `json:"egress,omitempty"`
 		EgressDeny        []EgressDenyRule  `json:"egressDeny,omitempty"`
 		Labels            labels.LabelArray `json:"labels,omitempty"`
-		EnableDefaultDeny DefaultDenyConfig `json:"enableDefaultDeny,omitempty"`
+		EnableDefaultDeny DefaultDenyConfig `json:"enableDefaultDeny,omitzero"`
 		Description       string            `json:"description,omitempty"`
 	}
 
@@ -228,6 +228,12 @@ func (r *Rule) WithEgressDenyRules(rules []EgressDenyRule) *Rule {
 	return r
 }
 
+// WithEnableDefaultDeny configures the Rule to enable default deny.
+func (r *Rule) WithEnableDefaultDeny(ingress, egress bool) *Rule {
+	r.EnableDefaultDeny = DefaultDenyConfig{&ingress, &egress}
+	return r
+}
+
 // WithLabels configures the Rule with the specified labels metadata.
 func (r *Rule) WithLabels(labels labels.LabelArray) *Rule {
 	r.Labels = labels
@@ -252,6 +258,16 @@ func (r *Rule) RequiresDerivative() bool {
 			return true
 		}
 	}
+	for _, rule := range r.Ingress {
+		if rule.RequiresDerivative() {
+			return true
+		}
+	}
+	for _, rule := range r.IngressDeny {
+		if rule.RequiresDerivative() {
+			return true
+		}
+	}
 	return false
 }
 
@@ -261,6 +277,8 @@ func (r *Rule) CreateDerivative(ctx context.Context) (*Rule, error) {
 	newRule := r.DeepCopy()
 	newRule.Egress = []EgressRule{}
 	newRule.EgressDeny = []EgressDenyRule{}
+	newRule.Ingress = []IngressRule{}
+	newRule.IngressDeny = []IngressDenyRule{}
 
 	for _, egressRule := range r.Egress {
 		derivativeEgressRule, err := egressRule.CreateDerivative(ctx)
@@ -294,4 +312,22 @@ func (r *Rule) CreateDerivative(ctx context.Context) (*Rule, error) {
 		newRule.IngressDeny = append(newRule.IngressDeny, *derivativeDenyIngressRule)
 	}
 	return newRule, nil
+}
+
+type PolicyMetrics interface {
+	AddRule(r Rule)
+	DelRule(r Rule)
+}
+
+type policyMetricsNoop struct {
+}
+
+func (p *policyMetricsNoop) AddRule(Rule) {
+}
+
+func (p *policyMetricsNoop) DelRule(Rule) {
+}
+
+func NewPolicyMetricsNoop() PolicyMetrics {
+	return &policyMetricsNoop{}
 }

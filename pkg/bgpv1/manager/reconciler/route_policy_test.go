@@ -8,9 +8,10 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
@@ -32,13 +33,14 @@ var (
 			},
 		},
 		Spec: v2alpha1api.CiliumLoadBalancerIPPoolSpec{
-			Cidrs: []v2alpha1api.CiliumLoadBalancerIPPoolIPBlock{
+			Blocks: []v2alpha1api.CiliumLoadBalancerIPPoolIPBlock{
 				{
 					Cidr: "192.168.0.0/24",
 				},
 			},
 		},
 	}
+
 	lbPoolUpdated = &v2alpha1api.CiliumLoadBalancerIPPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
@@ -46,7 +48,7 @@ var (
 			},
 		},
 		Spec: v2alpha1api.CiliumLoadBalancerIPPoolSpec{
-			Cidrs: []v2alpha1api.CiliumLoadBalancerIPPoolIPBlock{
+			Blocks: []v2alpha1api.CiliumLoadBalancerIPPoolIPBlock{
 				{
 					Cidr: "10.100.99.0/24", // UPDATED
 				},
@@ -143,7 +145,7 @@ var (
 
 	attrSelectAnyNode = v2alpha1api.CiliumBGPPathAttributes{
 		SelectorType:    v2alpha1api.PodCIDRSelectorName,
-		LocalPreference: pointer.Int64(150),
+		LocalPreference: ptr.To[int64](150),
 	}
 
 	attrSelectNonExistingNode = v2alpha1api.CiliumBGPPathAttributes{
@@ -153,7 +155,7 @@ var (
 				"node": "non-existing",
 			},
 		},
-		LocalPreference: pointer.Int64(150),
+		LocalPreference: ptr.To[int64](150),
 	}
 
 	attrSelectInvalid = v2alpha1api.CiliumBGPPathAttributes{
@@ -217,7 +219,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 									MatchNeighbors: []string{peerAddress},
 									MatchPrefixes: []*types.RoutePolicyPrefixMatch{
 										{
-											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Cidrs[0].Cidr)),
+											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Blocks[0].Cidr)),
 											PrefixLenMin: maxPrefixLenIPv4,
 											PrefixLenMax: maxPrefixLenIPv4,
 										},
@@ -321,7 +323,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 									MatchNeighbors: []string{peerAddress},
 									MatchPrefixes: []*types.RoutePolicyPrefixMatch{
 										{
-											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Cidrs[0].Cidr)),
+											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Blocks[0].Cidr)),
 											PrefixLenMin: maxPrefixLenIPv4,
 											PrefixLenMax: maxPrefixLenIPv4,
 										},
@@ -359,7 +361,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 									MatchNeighbors: []string{peerAddress},
 									MatchPrefixes: []*types.RoutePolicyPrefixMatch{
 										{
-											CIDR:         netip.MustParsePrefix(string(lbPoolUpdated.Spec.Cidrs[0].Cidr)),
+											CIDR:         netip.MustParsePrefix(string(lbPoolUpdated.Spec.Blocks[0].Cidr)),
 											PrefixLenMin: maxPrefixLenIPv4,
 											PrefixLenMax: maxPrefixLenIPv4,
 										},
@@ -591,12 +593,12 @@ func TestRoutePolicyReconciler(t *testing.T) {
 					ListenPort: -1,
 				},
 			}
-			testSC, err := instance.NewServerWithConfig(context.Background(), log, srvParams)
+			testSC, err := instance.NewServerWithConfig(context.Background(), hivetest.Logger(t), srvParams)
 			require.NoError(t, err)
 
 			testSC.Config = &v2alpha1api.CiliumBGPVirtualRouter{
 				LocalASN:      64125,
-				ExportPodCIDR: pointer.Bool(true),
+				ExportPodCIDR: ptr.To[bool](true),
 				Neighbors:     tt.initial.neighbors,
 			}
 
@@ -610,7 +612,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 				podStore.Upsert(obj)
 			}
 
-			policyReconciler := NewRoutePolicyReconciler(lbStore, podStore).Reconciler.(*RoutePolicyReconciler)
+			policyReconciler := NewRoutePolicyReconciler(hivetest.Logger(t), lbStore, podStore).Reconciler.(*RoutePolicyReconciler)
 			params := ReconcileParams{
 				CurrentServer: testSC,
 				DesiredConfig: testSC.Config,
@@ -677,7 +679,7 @@ func validatePoliciesMatch(t *testing.T, actual map[string]*types.RoutePolicy, e
 	for _, expPolicy := range expected {
 		policy := actual[expPolicy.Name]
 		require.NotNil(t, policy)
-		require.EqualValues(t, policy, expPolicy)
+		require.EqualValues(t, expPolicy, policy)
 	}
 }
 

@@ -3,8 +3,6 @@
 
 package types
 
-import "github.com/cilium/cilium/pkg/mtu"
-
 type MTU struct{}
 
 // GetDeviceMTU implements mtu.MTU.
@@ -22,4 +20,6 @@ func (*MTU) GetRoutePostEncryptMTU() int {
 	return 1420
 }
 
-var _ mtu.MTU = &MTU{}
+func (*MTU) IsEnableRouteMTUForCNIChaining() bool {
+	return false
+}

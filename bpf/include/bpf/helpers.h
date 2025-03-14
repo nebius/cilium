@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __BPF_HELPERS__
-#define __BPF_HELPERS__
+#pragma once
 
 #include <linux/bpf.h>
 
@@ -113,4 +112,8 @@ static inline int try_set_retval(int retval __maybe_unused)
 #endif
 }
 
-#endif /* __BPF_HELPERS__ */
+static long BPF_FUNC(loop, __u32 nr_loops, void *callback_fn, void *callback_ctx, __u64 flags);
+
+static void *BPF_FUNC(ringbuf_reserve, void *ringbuf, __u64 size, __u64 flags);
+static void BPF_FUNC(ringbuf_submit, void *data, __u64 flags);
+static void BPF_FUNC(ringbuf_discard, void *data, __u64 flags);

@@ -6,22 +6,24 @@ package api
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"syscall"
 
+	"github.com/cilium/hive/cell"
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/runtime"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
 	operatorApi "github.com/cilium/cilium/api/v1/operator/server"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi"
+	"github.com/cilium/cilium/api/v1/operator/server/restapi/cluster"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/metrics"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/operator"
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 type Server interface {
@@ -38,9 +40,10 @@ type params struct {
 
 	HealthHandler   operator.GetHealthzHandler
 	MetricsHandler  metrics.GetMetricsHandler
+	ClusterHandler  cluster.GetClusterHandler
 	OperatorAPISpec *operatorApi.Spec
 
-	Logger     logrus.FieldLogger
+	Logger     *slog.Logger
 	Lifecycle  cell.Lifecycle
 	Shutdowner hive.Shutdowner
 }
@@ -48,7 +51,7 @@ type params struct {
 type server struct {
 	*operatorApi.Server
 
-	logger     logrus.FieldLogger
+	logger     *slog.Logger
 	shutdowner hive.Shutdowner
 
 	address  string
@@ -56,6 +59,7 @@ type server struct {
 
 	healthHandler  operator.GetHealthzHandler
 	metricsHandler metrics.GetMetricsHandler
+	clusterHandler cluster.GetClusterHandler
 	apiSpec        *operatorApi.Spec
 }
 
@@ -74,6 +78,7 @@ func newServer(
 		address:        p.Cfg.OperatorAPIServeAddr,
 		healthHandler:  p.HealthHandler,
 		metricsHandler: p.MetricsHandler,
+		clusterHandler: p.ClusterHandler,
 		apiSpec:        p.OperatorAPISpec,
 	}
 	p.Lifecycle.Append(server)
@@ -88,11 +93,12 @@ func (s *server) Start(ctx cell.HookContext) error {
 	}
 
 	restAPI := restapi.NewCiliumOperatorAPI(spec)
-	restAPI.Logger = s.logger.Debugf
+	restAPI.Logger = s.logger.Debug
 	restAPI.OperatorGetHealthzHandler = s.healthHandler
 	restAPI.MetricsGetMetricsHandler = s.metricsHandler
+	restAPI.ClusterGetClusterHandler = s.clusterHandler
 
-	api.DisableAPIs(s.apiSpec.DeniedAPIs, restAPI.AddMiddlewareFor)
+	api.DisableAPIs(s.logger, s.apiSpec.DeniedAPIs, restAPI.AddMiddlewareFor)
 	srv := operatorApi.NewServer(restAPI)
 	srv.EnabledListeners = []string{"http"}
 	srv.ConfigureAPI()
@@ -132,10 +138,6 @@ func (s *server) Start(ctx cell.HookContext) error {
 		}
 		s.httpSrvs[i].listener = ln
 
-		s.logger.WithFields(logrus.Fields{
-			fmt.Sprintf("address-%d", i): ln.Addr().String(),
-		})
-
 		s.httpSrvs[i].server = &http.Server{
 			Addr:    s.httpSrvs[i].address,
 			Handler: mux,
@@ -151,7 +153,7 @@ func (s *server) Start(ctx cell.HookContext) error {
 
 	// otherwise just log any possible error and continue
 	for _, err := range errs {
-		s.logger.WithError(err).Error("apiserver start failed")
+		s.logger.Error("apiserver start failed", logfields.Error, err)
 	}
 
 	for _, srv := range s.httpSrvs {
@@ -160,7 +162,7 @@ func (s *server) Start(ctx cell.HookContext) error {
 		}
 		go func(srv httpServer) {
 			if err := srv.server.Serve(srv.listener); !errors.Is(err, http.ErrServerClosed) {
-				s.logger.WithError(err).Error("server stopped unexpectedly")
+				s.logger.Error("server stopped unexpectedly", logfields.Error, err)
 				s.shutdowner.Shutdown()
 			}
 		}(srv)
@@ -169,9 +171,7 @@ func (s *server) Start(ctx cell.HookContext) error {
 	return nil
 }
 
-// setsockoptReuseAddrAndPort sets the SO_REUSEADDR and SO_REUSEPORT socket options on c's
-// underlying socket in order to improve the chance to re-bind to the same address and port
-// upon restart.
+// Stop stops the server
 func (s *server) Stop(ctx cell.HookContext) error {
 	for _, srv := range s.httpSrvs {
 		if srv.server == nil {

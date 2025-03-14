@@ -7,23 +7,25 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net/netip"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/cilium/hive/cell"
 	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
-	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	v2api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 const (
@@ -38,6 +40,7 @@ type RoutePolicyReconcilerOut struct {
 }
 
 type RoutePolicyReconciler struct {
+	logger       *slog.Logger
 	lbPoolStore  store.BGPCPResourceStore[*v2alpha1api.CiliumLoadBalancerIPPool]
 	podPoolStore store.BGPCPResourceStore[*v2alpha1api.CiliumPodIPPool]
 }
@@ -46,11 +49,13 @@ type RoutePolicyReconciler struct {
 type RoutePolicyReconcilerMetadata map[string]*types.RoutePolicy
 
 func NewRoutePolicyReconciler(
+	logger *slog.Logger,
 	lbStore store.BGPCPResourceStore[*v2alpha1api.CiliumLoadBalancerIPPool],
 	podStore store.BGPCPResourceStore[*v2alpha1api.CiliumPodIPPool],
 ) RoutePolicyReconcilerOut {
 	return RoutePolicyReconcilerOut{
 		Reconciler: &RoutePolicyReconciler{
+			logger:       logger,
 			lbPoolStore:  lbStore,
 			podPoolStore: podStore,
 		},
@@ -68,8 +73,14 @@ func (r *RoutePolicyReconciler) Priority() int {
 	return 70
 }
 
+func (r *RoutePolicyReconciler) Init(_ *instance.ServerWithConfig) error {
+	return nil
+}
+
+func (r *RoutePolicyReconciler) Cleanup(_ *instance.ServerWithConfig) {}
+
 func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileParams) error {
-	l := log.WithFields(logrus.Fields{"component": "RoutePolicyReconciler"})
+	l := r.logger.With(types.ComponentLogField, "RoutePolicyReconciler")
 
 	if params.DesiredConfig == nil {
 		return fmt.Errorf("attempted routing policy reconciliation with nil DesiredConfig")
@@ -85,15 +96,16 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 	currentPolicies := r.getMetadata(params.CurrentServer)
 
 	// compile set of desired policies
+	// note: only per-neighbor export policies are supported at this time
 	desiredPolicies := make(map[string]*types.RoutePolicy)
 	for _, n := range params.DesiredConfig.Neighbors {
 		for _, routeAttrs := range n.AdvertisedPathAttributes {
-			policy, err := r.pathAttributesToPolicy(routeAttrs, n.PeerAddress, params)
+			exportPolicy, err := r.pathAttributesToPolicy(routeAttrs, n.PeerAddress, params)
 			if err != nil {
 				return fmt.Errorf("failed to convert BGP PathAttributes to a RoutePolicy: %w", err)
 			}
-			if len(policy.Statements) > 0 {
-				desiredPolicies[policy.Name] = policy
+			if len(exportPolicy.Statements) > 0 {
+				desiredPolicies[exportPolicy.Name] = exportPolicy
 			}
 		}
 	}
@@ -119,8 +131,15 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 
 	// add missing policies
 	for _, p := range toAdd {
-		l.Infof("Adding route policy %s to vrouter %d", p.Name, params.DesiredConfig.LocalASN)
-		err := params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{Policy: p})
+		l.Info(
+			"Adding route policy to vrouter",
+			types.PolicyLogField, p.Name,
+			types.LocalASNLogField, params.DesiredConfig.LocalASN,
+		)
+		err := params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{
+			DefaultExportAction: types.RoutePolicyActionNone, // no change to the default action
+			Policy:              p,
+		})
 		if err != nil {
 			return fmt.Errorf("failed adding route policy %v to vrouter %d: %w", p.Name, params.DesiredConfig.LocalASN, err)
 		}
@@ -130,13 +149,20 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 	for _, p := range toUpdate {
 		// As proper implementation of an update operation for complex policies would be quite involved,
 		// we resort to recreating the policies that need an update here.
-		l.Infof("Updating (re-creating) route policy %s in vrouter %d", p.Name, params.DesiredConfig.LocalASN)
+		l.Info(
+			"Updating (re-creating) route policy in vrouter",
+			types.PolicyLogField, p.Name,
+			types.LocalASNLogField, params.DesiredConfig.LocalASN,
+		)
 		existing := currentPolicies[p.Name]
 		err := params.CurrentServer.Server.RemoveRoutePolicy(ctx, types.RoutePolicyRequest{Policy: existing})
 		if err != nil {
 			return fmt.Errorf("failed removing route policy %v from vrouter %d: %w", existing.Name, params.DesiredConfig.LocalASN, err)
 		}
-		err = params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{Policy: p})
+		err = params.CurrentServer.Server.AddRoutePolicy(ctx, types.RoutePolicyRequest{
+			DefaultExportAction: types.RoutePolicyActionNone, // no change to the default action
+			Policy:              p,
+		})
 		if err != nil {
 			return fmt.Errorf("failed adding route policy %v to vrouter %d: %w", p.Name, params.DesiredConfig.LocalASN, err)
 		}
@@ -144,7 +170,11 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 	}
 	// remove old policies
 	for _, p := range toRemove {
-		l.Infof("Removing route policy %s from vrouter %d", p.Name, params.DesiredConfig.LocalASN)
+		l.Info(
+			"Removing route policy from vrouter",
+			types.PolicyLogField, p.Name,
+			types.LocalASNLogField, params.DesiredConfig.LocalASN,
+		)
 		err := params.CurrentServer.Server.RemoveRoutePolicy(ctx, types.RoutePolicyRequest{Policy: p})
 		if err != nil {
 			return fmt.Errorf("failed removing route policy %v from vrouter %d: %w", p.Name, params.DesiredConfig.LocalASN, err)
@@ -154,7 +184,11 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 
 	// soft-reset affected BGP peers to apply the changes on already advertised routes
 	for peer := range resetPeers {
-		l.Infof("Resetting peer %s on vrouter %d due to a routing policy change", peer, params.DesiredConfig.LocalASN)
+		l.Info(
+			"Resetting peer on vrouter due to a routing policy change",
+			types.PeerLogField, peer,
+			types.LocalASNLogField, params.DesiredConfig.LocalASN,
+		)
 		req := types.ResetNeighborRequest{
 			PeerAddress:        peer,
 			Soft:               true,
@@ -163,7 +197,11 @@ func (r *RoutePolicyReconciler) Reconcile(ctx context.Context, params ReconcileP
 		err := params.CurrentServer.Server.ResetNeighbor(ctx, req)
 		if err != nil {
 			// non-fatal error (may happen if the neighbor is not up), just log it
-			l.Warnf("error by resetting peer %s after a routing policy change: %v", peer, err)
+			l.Warn(
+				"error by resetting peer after a routing policy change",
+				logfields.Error, err,
+				types.PeerLogField, peer,
+			)
 		}
 	}
 
@@ -183,6 +221,7 @@ func (r *RoutePolicyReconciler) storeMetadata(sc *instance.ServerWithConfig, met
 	sc.ReconcilerMetadata[r.Name()] = meta
 }
 
+// pathAttributesToPolicy prepares an export policy configured by CRD using the Advertised Path Attributes feature
 func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumBGPPathAttributes, neighborAddress string, params ReconcileParams) (*types.RoutePolicy, error) {
 	var v4Prefixes, v6Prefixes types.PolicyPrefixMatchList
 
@@ -232,7 +271,8 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 			if attrs.Selector != nil && !labelSelector.Matches(labels.Set(pool.Labels)) {
 				continue
 			}
-			for _, cidrBlock := range pool.Spec.Cidrs {
+			prefixesSeen := sets.New[netip.Prefix]()
+			for _, cidrBlock := range pool.Spec.Blocks {
 				cidr, err := netip.ParsePrefix(string(cidrBlock.Cidr))
 				if err != nil {
 					return nil, fmt.Errorf("failed to parse IPAM pool CIDR %s: %w", cidrBlock.Cidr, err)
@@ -242,6 +282,7 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 				} else {
 					v6Prefixes = append(v6Prefixes, &types.RoutePolicyPrefixMatch{CIDR: cidr, PrefixLenMin: maxPrefixLenIPv6, PrefixLenMax: maxPrefixLenIPv6})
 				}
+				prefixesSeen.Insert(cidr)
 			}
 		}
 	case v2alpha1api.PodCIDRSelectorName:
@@ -275,8 +316,8 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 			return nil, err
 		}
 		largeCommunities = dedupLargeCommunities(attrs.Communities.Large)
-		sort.Strings(communities)
-		sort.Strings(largeCommunities)
+		slices.Sort(communities)
+		slices.Sort(largeCommunities)
 	}
 
 	// Due to a GoBGP limitation, we need to generate a separate statement for v4 and v6 prefixes, as families
@@ -294,11 +335,7 @@ func (r *RoutePolicyReconciler) pathAttributesToPolicy(attrs v2alpha1api.CiliumB
 // keyed by the pool name.
 func (r *RoutePolicyReconciler) populateLocalPools(localNode *v2api.CiliumNode) map[string][]netip.Prefix {
 	var (
-		l = log.WithFields(
-			logrus.Fields{
-				"component": "RoutePolicyReconciler",
-			},
-		)
+		l = r.logger.With(types.ComponentLogField, "RoutePolicyReconciler")
 	)
 
 	if localNode == nil {
@@ -312,7 +349,10 @@ func (r *RoutePolicyReconciler) populateLocalPools(localNode *v2api.CiliumNode) 
 			if p, err := cidr.ToPrefix(); err == nil {
 				prefixes = append(prefixes, *p)
 			} else {
-				l.Errorf("invalid ipam pool cidr %v: %v", cidr, err)
+				l.Error("invalid ipam pool cidr",
+					logfields.Error, err,
+					logfields.CIDR, cidr,
+				)
 			}
 		}
 		lp[pool.Pool] = prefixes

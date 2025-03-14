@@ -41,7 +41,7 @@ type KubeProxyReplacement struct {
 	Features *KubeProxyReplacementFeatures `json:"features,omitempty"`
 
 	// mode
-	// Enum: [True False]
+	// Enum: ["True","False"]
 	Mode string `json:"mode,omitempty"`
 }
 
@@ -286,6 +286,9 @@ func (m *KubeProxyReplacementDeviceListItems0) UnmarshalBinary(b []byte) error {
 //
 // swagger:model KubeProxyReplacementFeatures
 type KubeProxyReplacementFeatures struct {
+
+	// annotations
+	Annotations []string `json:"annotations"`
 
 	// flag bpf-lb-sock-hostns-only
 	BpfSocketLBHostnsOnly bool `json:"bpfSocketLBHostnsOnly,omitempty"`
@@ -788,9 +791,7 @@ func (m *KubeProxyReplacementFeatures) UnmarshalBinary(b []byte) error {
 	return nil
 }
 
-// KubeProxyReplacementFeaturesExternalIPs
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesExternalIPs kube proxy replacement features external i ps
 //
 // swagger:model KubeProxyReplacementFeaturesExternalIPs
 type KubeProxyReplacementFeaturesExternalIPs struct {
@@ -827,9 +828,7 @@ func (m *KubeProxyReplacementFeaturesExternalIPs) UnmarshalBinary(b []byte) erro
 	return nil
 }
 
-// KubeProxyReplacementFeaturesGracefulTermination
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesGracefulTermination kube proxy replacement features graceful termination
 //
 // swagger:model KubeProxyReplacementFeaturesGracefulTermination
 type KubeProxyReplacementFeaturesGracefulTermination struct {
@@ -866,9 +865,7 @@ func (m *KubeProxyReplacementFeaturesGracefulTermination) UnmarshalBinary(b []by
 	return nil
 }
 
-// KubeProxyReplacementFeaturesHostPort
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesHostPort kube proxy replacement features host port
 //
 // swagger:model KubeProxyReplacementFeaturesHostPort
 type KubeProxyReplacementFeaturesHostPort struct {
@@ -1140,9 +1137,7 @@ func (m *KubeProxyReplacementFeaturesNat46X64Gateway) UnmarshalBinary(b []byte) 
 	return nil
 }
 
-// KubeProxyReplacementFeaturesNat46X64Service
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesNat46X64Service kube proxy replacement features nat46 x64 service
 //
 // swagger:model KubeProxyReplacementFeaturesNat46X64Service
 type KubeProxyReplacementFeaturesNat46X64Service struct {
@@ -1179,23 +1174,21 @@ func (m *KubeProxyReplacementFeaturesNat46X64Service) UnmarshalBinary(b []byte) 
 	return nil
 }
 
-// KubeProxyReplacementFeaturesNodePort
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesNodePort kube proxy replacement features node port
 //
 // swagger:model KubeProxyReplacementFeaturesNodePort
 type KubeProxyReplacementFeaturesNodePort struct {
 
 	// acceleration
-	// Enum: [None Native Generic Best-Effort]
+	// Enum: ["None","Native","Generic","Best-Effort"]
 	Acceleration string `json:"acceleration,omitempty"`
 
 	// algorithm
-	// Enum: [Random Maglev]
+	// Enum: ["Random","Maglev"]
 	Algorithm string `json:"algorithm,omitempty"`
 
 	// dsr mode
-	// Enum: [IP Option/Extension IPIP Geneve]
+	// Enum: ["IP Option/Extension","IPIP","Geneve"]
 	DsrMode string `json:"dsrMode,omitempty"`
 
 	// enabled
@@ -1205,7 +1198,7 @@ type KubeProxyReplacementFeaturesNodePort struct {
 	LutSize int64 `json:"lutSize,omitempty"`
 
 	// mode
-	// Enum: [SNAT DSR Hybrid]
+	// Enum: ["SNAT","DSR","Hybrid"]
 	Mode string `json:"mode,omitempty"`
 
 	// port max
@@ -1444,9 +1437,7 @@ func (m *KubeProxyReplacementFeaturesNodePort) UnmarshalBinary(b []byte) error {
 	return nil
 }
 
-// KubeProxyReplacementFeaturesSessionAffinity
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesSessionAffinity kube proxy replacement features session affinity
 //
 // swagger:model KubeProxyReplacementFeaturesSessionAffinity
 type KubeProxyReplacementFeaturesSessionAffinity struct {
@@ -1483,9 +1474,7 @@ func (m *KubeProxyReplacementFeaturesSessionAffinity) UnmarshalBinary(b []byte) 
 	return nil
 }
 
-// KubeProxyReplacementFeaturesSocketLB
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesSocketLB kube proxy replacement features socket l b
 //
 // swagger:model KubeProxyReplacementFeaturesSocketLB
 type KubeProxyReplacementFeaturesSocketLB struct {
@@ -1522,9 +1511,7 @@ func (m *KubeProxyReplacementFeaturesSocketLB) UnmarshalBinary(b []byte) error {
 	return nil
 }
 
-// KubeProxyReplacementFeaturesSocketLBTracing
-//
-// +k8s:deepcopy-gen=true
+// KubeProxyReplacementFeaturesSocketLBTracing kube proxy replacement features socket l b tracing
 //
 // swagger:model KubeProxyReplacementFeaturesSocketLBTracing
 type KubeProxyReplacementFeaturesSocketLBTracing struct {

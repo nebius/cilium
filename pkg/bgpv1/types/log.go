@@ -36,4 +36,82 @@ const (
 
 	// AdvertTypeLogField is used as key for BGP advertisement type in the log field.
 	AdvertTypeLogField = "advertisement_type"
+
+	// PodIPPoolLogField is used as key for Pod IP pool in the log field.
+	PodIPPoolLogField = "pod_ip_pool"
+
+	// PolicyLogField is used as key for BGP policy in the log field.
+	PolicyLogField = "policy"
+
+	// ResourceLogField is used as key for k8s resource in the log field.
+	ResourceLogField = "resource"
+
+	// ComponentLogField ...
+	ComponentLogField = "component"
+
+	// NodeLabelsLogField ...
+	NodeLabelsLogField = "nodeLabels"
+
+	// PolicyNodeSelectorLogField ...
+	PolicyNodeSelectorLogField = "policyNodeSelector"
+
+	// SubsysLogField ...
+	SubsysLogField = "subsys"
+
+	// NameLogField ...
+	NameLogField = "name"
+
+	// NLRILogField ...
+	NLRILogField = "NLRI"
+
+	// PeerASNLogField ...
+	PeerASNLogField = "peer_asn"
+
+	// SecretRefLogField ...
+	SecretRefLogField = "secret_ref"
+
+	// FromPortLogField ...
+	FromPortLogField = "from_port"
+
+	// ToPortLogField ...
+	ToPortLogField = "to_port"
+
+	// FromRouterIDLogField ...
+	FromRouterIDLogField = "from_router_id"
+
+	// ToRouterIDLogField ...
+	ToRouterIDLogField = "to_router_id"
+
+	// PriorityLogField ...
+	PriorityLogField = "priority"
+
+	// ExistingPriorityLogField ...
+	ExistingPriorityLogField = "existing_priority"
+
+	// PeerEventLogField ...
+	PeerEventLogField = "peer_event"
+
+	// RouteLogField ...
+	RouteLogField = "route_event"
+
+	// PodCIDRAnnouncementsLogField ...
+	PodCIDRAnnouncementsLogField = "pod_cidr_announcements"
+
+	// PodCIDRUpdatedLogField ...
+	PodCIDRUpdatedLogField = "pod_cidr_updated"
+
+	// PodIPPoolLogFieldUpdatedLogField ...
+	PodIPPoolLogFieldUpdatedLogField = "pod_ip_pool_updated"
+
+	// ServicesAnnouncementsLogField ...
+	ServicesAnnouncementsLogField = "services_announcements"
+
+	// ServicesUpdatedLogField ...
+	ServicesUpdatedLogField = "services_updated"
+
+	// DiffLogField ...
+	DiffLogField = "diff"
+
+	// UpdatedInstancesLogField ...
+	UpdatedInstancesLogField = "updated_instances"
 )

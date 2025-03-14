@@ -8,24 +8,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	mcsapicontrollers "sigs.k8s.io/mcs-api/controllers"
 	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
-	mcsapicontrollers "sigs.k8s.io/mcs-api/pkg/controllers"
-
-	"github.com/cilium/cilium/operator/pkg/model"
 )
 
 var (
 	httpRFFinalizer = "batch.gateway.io/finalizer"
+
+	// Used for GAMMA parentRef checks
+	serviceKind = (gatewayv1.Kind)("Service")
+	coreGroup   = (gatewayv1.Group)("")
 
 	crdsFixture = []client.Object{
 		// Minimal ServiceImport CRD for existence checking
@@ -103,6 +107,15 @@ var (
 				ControllerName: "io.cilium/gateway-controller",
 			},
 		},
+		// Non-Matching GatewayClass
+		&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "someotherimplementation",
+			},
+			Spec: gatewayv1.GatewayClassSpec{
+				ControllerName: "someothergateway.io/implementation",
+			},
+		},
 
 		// Gateway for valid HTTPRoute
 		&gatewayv1.Gateway{
@@ -116,7 +129,26 @@ var (
 					{
 						Name:     "http",
 						Port:     80,
-						Hostname: model.AddressOf[gatewayv1.Hostname]("*.cilium.io"),
+						Hostname: ptr.To[gatewayv1.Hostname]("*.cilium.io"),
+					},
+				},
+			},
+			Status: gatewayv1.GatewayStatus{},
+		},
+
+		// Gateway that rolls up to a different GatewayClass
+		&gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "other-implementation-gateway",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "someotherimplementation",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "http",
+						Port:     80,
+						Hostname: ptr.To[gatewayv1.Hostname]("*.cilium.io"),
 					},
 				},
 			},
@@ -135,7 +167,7 @@ var (
 					{
 						Name:     "http",
 						Port:     80,
-						Hostname: model.AddressOf[gatewayv1.Hostname]("bar.foo.com"),
+						Hostname: ptr.To[gatewayv1.Hostname]("bar.foo.com"),
 					},
 				},
 			},
@@ -156,7 +188,7 @@ var (
 						Port: 80,
 						AllowedRoutes: &gatewayv1.AllowedRoutes{
 							Namespaces: &gatewayv1.RouteNamespaces{
-								From: model.AddressOf(gatewayv1.NamespacesFromSame),
+								From: ptr.To(gatewayv1.NamespacesFromSame),
 							},
 						},
 					},
@@ -179,7 +211,7 @@ var (
 						Port: 80,
 						AllowedRoutes: &gatewayv1.AllowedRoutes{
 							Namespaces: &gatewayv1.RouteNamespaces{
-								From: model.AddressOf(gatewayv1.NamespacesFromSame),
+								From: ptr.To(gatewayv1.NamespacesFromSame),
 							},
 						},
 					},
@@ -188,7 +220,7 @@ var (
 						Port: 443,
 						AllowedRoutes: &gatewayv1.AllowedRoutes{
 							Namespaces: &gatewayv1.RouteNamespaces{
-								From: model.AddressOf(gatewayv1.NamespacesFromAll),
+								From: ptr.To(gatewayv1.NamespacesFromAll),
 							},
 						},
 					},
@@ -196,6 +228,7 @@ var (
 			},
 			Status: gatewayv1.GatewayStatus{},
 		},
+
 		// Service for valid HTTPRoute
 		&corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -252,7 +285,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "dummy-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -286,7 +319,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "dummy-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -320,7 +353,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "dummy-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -330,7 +363,7 @@ var (
 										Group: GroupPtr(mcsapiv1alpha1.GroupName),
 										Kind:  KindPtr("ServiceImport"),
 										Name:  "dummy-backend",
-										Port:  model.AddressOf[gatewayv1.PortNumber](8080),
+										Port:  ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -360,7 +393,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "dummy-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -370,7 +403,7 @@ var (
 										Group: GroupPtr(mcsapiv1alpha1.GroupName),
 										Kind:  KindPtr("ServiceImport"),
 										Name:  "dummy-backend",
-										Port:  model.AddressOf[gatewayv1.PortNumber](8080),
+										Port:  ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -401,7 +434,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "nonexistent-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -432,7 +465,7 @@ var (
 										Group: GroupPtr(mcsapiv1alpha1.GroupName),
 										Kind:  KindPtr("ServiceImport"),
 										Name:  "nonexistent-backend",
-										Port:  model.AddressOf[gatewayv1.PortNumber](8080),
+										Port:  ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -463,7 +496,7 @@ var (
 										Group: GroupPtr(mcsapiv1alpha1.GroupName),
 										Kind:  KindPtr("ServiceImport"),
 										Name:  "dummy-backend-no-svc",
-										Port:  model.AddressOf[gatewayv1.PortNumber](8080),
+										Port:  ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -494,7 +527,7 @@ var (
 										Group: GroupPtr(mcsapiv1alpha1.GroupName),
 										Kind:  KindPtr("ServiceImport"),
 										Name:  "dummy-backend-no-svc-annotation",
-										Port:  model.AddressOf[gatewayv1.PortNumber](8080),
+										Port:  ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -525,7 +558,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name:      "dummy-backend",
-										Namespace: model.AddressOf[gatewayv1.Namespace]("another-namespace"),
+										Namespace: ptr.To[gatewayv1.Namespace]("another-namespace"),
 									},
 								},
 							},
@@ -556,8 +589,8 @@ var (
 										Group:     GroupPtr(mcsapiv1alpha1.GroupName),
 										Kind:      KindPtr("ServiceImport"),
 										Name:      "dummy-backend",
-										Namespace: model.AddressOf[gatewayv1.Namespace]("another-namespace"),
-										Port:      model.AddressOf[gatewayv1.PortNumber](8080),
+										Namespace: ptr.To[gatewayv1.Namespace]("another-namespace"),
+										Port:      ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -577,7 +610,7 @@ var (
 					ParentRefs: []gatewayv1.ParentReference{
 						{
 							Name:      "dummy-gateway-two-listeners",
-							Namespace: model.AddressOf[gatewayv1.Namespace]("default"),
+							Namespace: ptr.To[gatewayv1.Namespace]("default"),
 						},
 					},
 				},
@@ -588,8 +621,8 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name:      "dummy-backend",
-										Namespace: model.AddressOf[gatewayv1.Namespace]("another-namespace"),
-										Port:      model.AddressOf(gatewayv1.PortNumber(8080)),
+										Namespace: ptr.To[gatewayv1.Namespace]("another-namespace"),
+										Port:      ptr.To(gatewayv1.PortNumber(8080)),
 									},
 								},
 							},
@@ -612,7 +645,7 @@ var (
 					ParentRefs: []gatewayv1.ParentReference{
 						{
 							Name:      "dummy-gateway-two-listeners",
-							Namespace: model.AddressOf[gatewayv1.Namespace]("default"),
+							Namespace: ptr.To[gatewayv1.Namespace]("default"),
 						},
 					},
 				},
@@ -623,8 +656,8 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name:      "dummy-backend",
-										Namespace: model.AddressOf[gatewayv1.Namespace]("another-namespace"),
-										Port:      model.AddressOf(gatewayv1.PortNumber(8080)),
+										Namespace: ptr.To[gatewayv1.Namespace]("another-namespace"),
+										Port:      ptr.To(gatewayv1.PortNumber(8080)),
 									},
 								},
 							},
@@ -654,8 +687,8 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name:      "dummy-backend-grant",
-										Namespace: model.AddressOf[gatewayv1.Namespace]("another-namespace"),
-										Port:      model.AddressOf[gatewayv1.PortNumber](8080),
+										Namespace: ptr.To[gatewayv1.Namespace]("another-namespace"),
+										Port:      ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -665,8 +698,8 @@ var (
 										Group:     GroupPtr(mcsapiv1alpha1.GroupName),
 										Kind:      KindPtr("ServiceImport"),
 										Name:      "dummy-backend-grant",
-										Namespace: model.AddressOf[gatewayv1.Namespace]("another-namespace"),
-										Port:      model.AddressOf[gatewayv1.PortNumber](8080),
+										Namespace: ptr.To[gatewayv1.Namespace]("another-namespace"),
+										Port:      ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -836,7 +869,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "dummy-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -857,7 +890,7 @@ var (
 					ParentRefs: []gatewayv1.ParentReference{
 						{
 							Name:      "dummy-gateway",
-							Namespace: model.AddressOf[gatewayv1.Namespace]("another-namespace"),
+							Namespace: ptr.To[gatewayv1.Namespace]("another-namespace"),
 						},
 					},
 				},
@@ -868,7 +901,7 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "dummy-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -902,7 +935,138 @@ var (
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
 										Name: "dummy-backend",
-										Port: model.AddressOf[gatewayv1.PortNumber](8080),
+										Port: ptr.To[gatewayv1.PortNumber](8080),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+
+		// InvalidHTTPRoute, no Gateway ParentRef, should not be processed at all
+		&gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "gamma-parentref-only",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Name:  "dummy-backend",
+							Kind:  &serviceKind,
+							Group: &coreGroup,
+						},
+					},
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "dummy-backend",
+										Port: ptr.To[gatewayv1.PortNumber](8080),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		// ValidHTTPRoute, one Gateway ParentRef, one GAMMA, only Gateway should be processed
+		&gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "both-parentrefs",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Name:  "dummy-backend",
+							Kind:  &serviceKind,
+							Group: &coreGroup,
+						},
+						{
+							Name: "dummy-gateway",
+						},
+					},
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "dummy-backend",
+										Port: ptr.To[gatewayv1.PortNumber](8080),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		// ValidHTTPRoute, belongs to another implementation
+		&gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "otherimpl-parentref",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Name: "other-implementation-gateway",
+						},
+					},
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "dummy-backend",
+										Port: ptr.To[gatewayv1.PortNumber](8080),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		// ValidHTTPRoute, one Cilium Gateway ParentRef, one other impl, only Cilium Gateway should be processed
+		&gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "oneofeach-gateway-parentrefs",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Name: "dummy-gateway",
+						},
+						{
+							Name: "other-implementation-gateway",
+						},
+					},
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "dummy-backend",
+										Port: ptr.To[gatewayv1.PortNumber](8080),
 									},
 								},
 							},
@@ -926,7 +1090,7 @@ func Test_httpRouteReconciler_Reconcile(t *testing.T) {
 		WithStatusSubresource(&gatewayv1.HTTPRoute{}).
 		Build()
 
-	r := &httpRouteReconciler{Client: c}
+	r := &httpRouteReconciler{Client: c, logger: hivetest.Logger(t)}
 
 	t.Run("no http route", func(t *testing.T) {
 		result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -1074,6 +1238,44 @@ func Test_httpRouteReconciler_Reconcile(t *testing.T) {
 			NamespacedName: key,
 		})
 
+		require.Error(t, err, "Expecting Reconciliation error")
+		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
+
+		route := &gatewayv1.HTTPRoute{}
+		err = c.Get(context.Background(), key, route)
+
+		require.NoError(t, err)
+		require.Empty(t, route.Status.RouteStatus.Parents, "Should have 0 parents")
+	})
+
+	t.Run("http route with only GAMMA parentRef", func(t *testing.T) {
+		key := types.NamespacedName{
+			Name:      "gamma-parentref-only",
+			Namespace: "default",
+		}
+		result, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: key,
+		})
+
+		require.Error(t, err, "Expecting Reconciliation error")
+		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
+
+		route := &gatewayv1.HTTPRoute{}
+		err = c.Get(context.Background(), key, route)
+
+		require.NoError(t, err)
+		require.Empty(t, route.Status.RouteStatus.Parents, "Should have 0 parents")
+	})
+
+	t.Run("valid http route with another GAMMA parentRef", func(t *testing.T) {
+		key := types.NamespacedName{
+			Name:      "both-parentrefs",
+			Namespace: "default",
+		}
+		result, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: key,
+		})
+
 		require.NoError(t, err, "Error reconciling httpRoute")
 		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
 
@@ -1085,8 +1287,52 @@ func Test_httpRouteReconciler_Reconcile(t *testing.T) {
 		require.Len(t, route.Status.RouteStatus.Parents[0].Conditions, 2)
 
 		require.Equal(t, "Accepted", route.Status.RouteStatus.Parents[0].Conditions[0].Type)
-		require.Equal(t, metav1.ConditionStatus("False"), route.Status.RouteStatus.Parents[0].Conditions[0].Status)
-		require.Equal(t, "InvalidHTTPRoute", route.Status.RouteStatus.Parents[0].Conditions[0].Reason)
+		require.Equal(t, metav1.ConditionStatus("True"), route.Status.RouteStatus.Parents[0].Conditions[0].Status)
+
+		require.Equal(t, "ResolvedRefs", route.Status.RouteStatus.Parents[0].Conditions[1].Type)
+		require.Equal(t, metav1.ConditionStatus("True"), route.Status.RouteStatus.Parents[0].Conditions[1].Status)
+	})
+
+	t.Run("valid http route that belongs to another implementation", func(t *testing.T) {
+		key := types.NamespacedName{
+			Name:      "otherimpl-parentref",
+			Namespace: "default",
+		}
+		result, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: key,
+		})
+
+		require.Error(t, err, "Expecting Reconciliation error")
+		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
+
+		route := &gatewayv1.HTTPRoute{}
+		err = c.Get(context.Background(), key, route)
+
+		require.NoError(t, err)
+		require.Empty(t, route.Status.RouteStatus.Parents, "Should have 0 parents")
+	})
+
+	t.Run("valid http route with another implementation parentRef as well", func(t *testing.T) {
+		key := types.NamespacedName{
+			Name:      "oneofeach-gateway-parentrefs",
+			Namespace: "default",
+		}
+		result, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: key,
+		})
+
+		require.NoError(t, err, "Error reconciling httpRoute")
+		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
+
+		route := &gatewayv1.HTTPRoute{}
+		err = c.Get(context.Background(), key, route)
+
+		require.NoError(t, err)
+		require.Len(t, route.Status.RouteStatus.Parents, 1, "Should have 1 parent")
+		require.Len(t, route.Status.RouteStatus.Parents[0].Conditions, 2)
+
+		require.Equal(t, "Accepted", route.Status.RouteStatus.Parents[0].Conditions[0].Type)
+		require.Equal(t, metav1.ConditionStatus("True"), route.Status.RouteStatus.Parents[0].Conditions[0].Status)
 
 		require.Equal(t, "ResolvedRefs", route.Status.RouteStatus.Parents[0].Conditions[1].Type)
 		require.Equal(t, metav1.ConditionStatus("True"), route.Status.RouteStatus.Parents[0].Conditions[1].Status)
@@ -1296,7 +1542,7 @@ func Test_httpRouteReconciler_Reconcile_NoServiceImportCRD(t *testing.T) {
 		WithStatusSubresource(&gatewayv1.HTTPRoute{}).
 		Build()
 
-	r := &httpRouteReconciler{Client: c}
+	r := &httpRouteReconciler{Client: c, logger: hivetest.Logger(t)}
 
 	t.Run("valid http route with Service", func(t *testing.T) {
 		key := types.NamespacedName{
@@ -1349,9 +1595,7 @@ func Test_httpRouteReconciler_Reconcile_NoServiceImportCRD(t *testing.T) {
 		require.Equal(t, "ResolvedRefs", route.Status.RouteStatus.Parents[0].Conditions[1].Type)
 		require.Equal(t, metav1.ConditionStatus("False"), route.Status.RouteStatus.Parents[0].Conditions[1].Status)
 		require.Equal(t, "BackendNotFound", route.Status.RouteStatus.Parents[0].Conditions[1].Reason)
-		require.Equal(t, "Attempt to reference a ServiceImport backend while "+
-			"the corresponding CRD is not installed, "+
-			"please restart the cilium-operator if the CRD is already installed",
+		require.Equal(t, "serviceimports.multicluster.x-k8s.io \"dummy-backend\" not found",
 			route.Status.RouteStatus.Parents[0].Conditions[1].Message)
 	})
 }

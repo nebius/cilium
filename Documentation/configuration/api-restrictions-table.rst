@@ -70,7 +70,6 @@ GetLRP                -
 GetMap                -
 GetMapName            -
 GetMapNameEvents      -
-GetMetrics            -
 GetNodeIds            Retrieves a list of node IDs allocated by the agent and
                       their associated node IP addresses.
 GetPolicy             Returns the entire policy tree with all children.
@@ -81,8 +80,6 @@ GetRecorderID         -
 GetRecorderMasks      -
 GetService            -
 GetServiceID          -
-GetStatedbDump        -
-GetStatedbQueryTable  -
 PatchConfig           Updates the daemon configuration by applying the provided
                       ConfigurationMap and regenerates & recompiles all required
                       datapath components.
@@ -128,7 +125,7 @@ The following API flags are compatible with the ``cilium-operator`` flag
 ===================== ====================
 Flag Name             Description
 ===================== ====================
-GetHealthz            This path will return the status of cilium operator
-                      instance.
-GetMetrics            -
+GetCluster            Returns the list of remote clusters and their status.
+GetHealthz            Returns the status of cilium operator instance.
+GetMetrics            Returns the metrics exposed by the Cilium operator.
 ===================== ====================

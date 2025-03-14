@@ -50,6 +50,10 @@ func LXCMap() *bpf.Map {
 const (
 	// EndpointFlagHost indicates that this endpoint represents the host
 	EndpointFlagHost = 1
+
+	// EndpointFlagAtHostNS indicates that this endpoint is located at the host networking
+	// namespace
+	EndpointFlagAtHostNS = 2
 )
 
 // EndpointFrontend is the interface to implement for an object to synchronize
@@ -58,10 +62,12 @@ type EndpointFrontend interface {
 	LXCMac() mac.MAC
 	GetNodeMAC() mac.MAC
 	GetIfIndex() int
+	GetParentIfIndex() int
 	GetID() uint64
 	IPv4Address() netip.Addr
 	IPv6Address() netip.Addr
 	GetIdentity() identity.NumericIdentity
+	IsAtHostNS() bool
 }
 
 // GetBPFKeys returns all keys which should represent this endpoint in the BPF
@@ -83,29 +89,37 @@ func GetBPFKeys(e EndpointFrontend) []*EndpointKey {
 // BPF endpoints map
 // Must only be called if init() succeeded.
 func GetBPFValue(e EndpointFrontend) (*EndpointInfo, error) {
-	mac, err := e.LXCMac().Uint64()
-	if err != nil {
+	tmp := e.LXCMac()
+	mac, err := tmp.Uint64()
+	if len(tmp) > 0 && err != nil {
 		return nil, fmt.Errorf("invalid LXC MAC: %w", err)
 	}
 
-	nodeMAC, err := e.GetNodeMAC().Uint64()
-	if err != nil {
+	tmp = e.GetNodeMAC()
+	nodeMAC, err := tmp.Uint64()
+	if len(tmp) > 0 && err != nil {
 		return nil, fmt.Errorf("invalid node MAC: %w", err)
 	}
 
+	// Both lxc and node mac can be nil for the case of L3/NOARP devices.
 	info := &EndpointInfo{
-		IfIndex: uint32(e.GetIfIndex()),
-		LxcID:   uint16(e.GetID()),
-		MAC:     mac,
-		NodeMAC: nodeMAC,
-		SecID:   e.GetIdentity().Uint32(), // Host byte-order
+		IfIndex:       uint32(e.GetIfIndex()),
+		LxcID:         uint16(e.GetID()),
+		MAC:           mac,
+		NodeMAC:       nodeMAC,
+		SecID:         e.GetIdentity().Uint32(), // Host byte-order
+		ParentIfIndex: uint32(e.GetParentIfIndex()),
+	}
+
+	if e.IsAtHostNS() {
+		info.Flags |= EndpointFlagAtHostNS
 	}
 
 	return info, nil
 
 }
 
-type pad3uint32 [3]uint32
+type pad2uint32 [2]uint32
 
 // EndpointInfo represents the value of the endpoints BPF map.
 //
@@ -116,11 +130,12 @@ type EndpointInfo struct {
 	LxcID   uint16 `align:"lxc_id"`
 	Flags   uint32 `align:"flags"`
 	// go alignment
-	_       uint32
-	MAC     mac.Uint64MAC `align:"mac"`
-	NodeMAC mac.Uint64MAC `align:"node_mac"`
-	SecID   uint32        `align:"sec_id"`
-	Pad     pad3uint32    `align:"pad"`
+	_             uint32
+	MAC           mac.Uint64MAC `align:"mac"`
+	NodeMAC       mac.Uint64MAC `align:"node_mac"`
+	SecID         uint32        `align:"sec_id"`
+	ParentIfIndex uint32        `align:"parent_ifindex"`
+	Pad           pad2uint32    `align:"pad"`
 }
 
 type EndpointKey struct {
@@ -148,13 +163,14 @@ func (v *EndpointInfo) String() string {
 		return "(localhost)"
 	}
 
-	return fmt.Sprintf("id=%-5d sec_id=%-5d flags=0x%04X ifindex=%-3d mac=%s nodemac=%s",
+	return fmt.Sprintf("id=%-5d sec_id=%-5d flags=0x%04X ifindex=%-3d mac=%s nodemac=%s parent_ifindex=%-3d",
 		v.LxcID,
 		v.SecID,
 		v.Flags,
 		v.IfIndex,
 		v.MAC,
 		v.NodeMAC,
+		v.ParentIfIndex,
 	)
 }
 

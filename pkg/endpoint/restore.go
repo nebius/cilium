@@ -23,6 +23,7 @@ import (
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	dptypes "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/fqdn"
@@ -33,6 +34,7 @@ import (
 	"github.com/cilium/cilium/pkg/labelsfilter"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/mac"
+	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
@@ -43,18 +45,9 @@ var (
 	initialGlobalIdentitiesControllerGroup = controller.NewGroup("initial-global-identities")
 )
 
-// hostObjFileName is the name of the host object file.
-const hostObjFileName = "bpf_host.o"
-
-func hasHostObjectFile(epDir string) bool {
-	hostObjFilepath := filepath.Join(epDir, hostObjFileName)
-	_, err := os.Stat(hostObjFilepath)
-	return err == nil
-}
-
 // ReadEPsFromDirNames returns a mapping of endpoint ID to endpoint of endpoints
 // from a list of directory names that can possible contain an endpoint.
-func ReadEPsFromDirNames(ctx context.Context, owner regeneration.Owner, policyGetter policyRepoGetter,
+func ReadEPsFromDirNames(ctx context.Context, owner regeneration.Owner, policyMapFactory policymap.Factory, policyGetter policyRepoGetter,
 	namedPortsGetter namedPortsGetter, basePath string, eptsDirNames []string) map[uint16]*Endpoint {
 
 	completeEPDirNames, incompleteEPDirNames := partitionEPDirNamesByRestoreStatus(eptsDirNames)
@@ -75,7 +68,6 @@ func ReadEPsFromDirNames(ctx context.Context, owner regeneration.Owner, policyGe
 	possibleEPs := map[uint16]*Endpoint{}
 	for _, epDirName := range completeEPDirNames {
 		epDir := filepath.Join(basePath, epDirName)
-		isHost := hasHostObjectFile(epDir)
 
 		scopedLog := log.WithFields(logrus.Fields{
 			logfields.EndpointID: epDirName,
@@ -88,7 +80,7 @@ func ReadEPsFromDirNames(ctx context.Context, owner regeneration.Owner, policyGe
 			continue
 		}
 
-		ep, err := parseEndpoint(ctx, owner, policyGetter, namedPortsGetter, state)
+		ep, err := parseEndpoint(owner, policyMapFactory, policyGetter, namedPortsGetter, state)
 		if err != nil {
 			scopedLog.WithError(err).Warn("Unable to parse the C header file")
 			continue
@@ -105,7 +97,7 @@ func ReadEPsFromDirNames(ctx context.Context, owner regeneration.Owner, policyGe
 
 		// We need to save the host endpoint ID as we'll need it to regenerate
 		// other endpoints.
-		if isHost {
+		if ep.IsHost() {
 			node.SetEndpointID(ep.GetID())
 		}
 	}
@@ -202,6 +194,10 @@ func partitionEPDirNamesByRestoreStatus(eptsDirNames []string) (complete []strin
 // Returns an error if any operation fails while trying to perform the above
 // operations.
 func (e *Endpoint) RegenerateAfterRestore(regenerator *Regenerator, bwm dptypes.BandwidthManager, resolveMetadata MetadataResolverCB) error {
+	if err := e.restoreHostIfindex(); err != nil {
+		return err
+	}
+
 	if err := e.restoreIdentity(regenerator); err != nil {
 		return err
 	}
@@ -215,13 +211,33 @@ func (e *Endpoint) RegenerateAfterRestore(regenerator *Regenerator, bwm dptypes.
 
 	regenerationMetadata := &regeneration.ExternalRegenerationMetadata{
 		Reason:            "syncing state to host",
-		RegenerationLevel: regeneration.RegenerateWithDatapathRewrite,
+		RegenerationLevel: regeneration.RegenerateWithDatapath,
 	}
 	if buildSuccess := <-e.Regenerate(regenerationMetadata); !buildSuccess {
 		return fmt.Errorf("failed while regenerating endpoint")
 	}
 
 	scopedLog.WithField(logfields.IPAddr, []string{e.GetIPv4Address(), e.GetIPv6Address()}).Info("Restored endpoint")
+	return nil
+}
+
+// restoreHostIfindex looks up the host interface's ifindex using netlink and
+// populates the value in the Endpoint. This used to be left at zero for
+// whatever reason, so the zero ifindex got persisted to disk.
+//
+// Try to populate the ifindex field using netlink so we can rely on it to
+// generate the host's endpoint configuration.
+func (e *Endpoint) restoreHostIfindex() error {
+	if !e.isHost || e.ifIndex != 0 {
+		return nil
+	}
+
+	l, err := safenetlink.LinkByName(e.ifName)
+	if err != nil {
+		return fmt.Errorf("get host interface: %w", err)
+	}
+	e.ifIndex = l.Attrs().Index
+
 	return nil
 }
 
@@ -308,7 +324,15 @@ func (e *Endpoint) restoreIdentity(regenerator *Regenerator) error {
 	// the ones with fixed identity (e.g. host endpoint), this ensures that
 	// the regenerated datapath always lookups from a ready ipcache map.
 	if option.Config.KVStore != "" {
-		ipcache.WaitForKVStoreSync()
+		if err := ipcache.WaitForKVStoreSync(e.aliveCtx); err != nil {
+			return ErrNotAlive
+		}
+
+		// Additionally wait for node synchronization, as nodes also contribute
+		// entries to the ipcache map, most notably about the remote node IPs.
+		if err := regenerator.WaitForKVStoreNodesSync(e.aliveCtx); err != nil {
+			return ErrNotAlive
+		}
 	}
 
 	// Wait for ipcache and identities synchronization from all remote clusters,
@@ -410,9 +434,11 @@ func (e *Endpoint) toSerializedEndpoint() *serializableEndpoint {
 		DNSZombies:               e.DNSZombies,
 		K8sPodName:               e.K8sPodName,
 		K8sNamespace:             e.K8sNamespace,
+		K8sUID:                   e.K8sUID,
 		DatapathConfiguration:    e.DatapathConfiguration,
 		CiliumEndpointUID:        e.ciliumEndpointUID,
 		Properties:               e.properties,
+		NetnsCookie:              e.NetNsCookie,
 	}
 }
 
@@ -511,6 +537,9 @@ type serializableEndpoint struct {
 	// K8sNamespace is the Kubernetes namespace of the endpoint
 	K8sNamespace string
 
+	// K8sUID is the Kubernetes pod UID of the endpoint
+	K8sUID string
+
 	// DatapathConfiguration is the endpoint's datapath configuration as
 	// passed in via the plugin that created the endpoint, e.g. the CNI
 	// plugin which performed the plumbing will enable certain datapath
@@ -525,6 +554,9 @@ type serializableEndpoint struct {
 
 	// Properties are used to store some internal property about this Endpoint.
 	Properties map[string]interface{}
+
+	// NetnsCookie is the network namespace cookie of the Endpoint.
+	NetnsCookie uint64
 }
 
 // UnmarshalJSON expects that the contents of `raw` are a serializableEndpoint,
@@ -534,6 +566,7 @@ func (ep *Endpoint) UnmarshalJSON(raw []byte) error {
 	// translation from serializableEndpoint --> Endpoint.
 	restoredEp := &serializableEndpoint{
 		OpLabels:   labels.NewOpLabels(),
+		Options:    option.NewIntOptions(&EndpointMutableOptionLibrary),
 		DNSHistory: fqdn.NewDNSCacheWithLimit(option.Config.ToFQDNsMinTTL, option.Config.ToFQDNsMaxIPsPerHost),
 		DNSZombies: fqdn.NewDNSZombieMappings(option.Config.ToFQDNsMaxDeferredConnectionDeletes, option.Config.ToFQDNsMaxIPsPerHost),
 	}
@@ -553,6 +586,7 @@ func (ep *Endpoint) MarshalJSON() ([]byte, error) {
 func (ep *Endpoint) fromSerializedEndpoint(r *serializableEndpoint) {
 	ep.ID = r.ID
 	ep.createdAt = time.Now()
+	ep.InitialEnvoyPolicyComputed = make(chan struct{})
 	ep.containerName.Store(&r.ContainerName)
 	ep.containerID.Store(&r.ContainerID)
 	ep.dockerNetworkID = r.DockerNetworkID
@@ -575,6 +609,7 @@ func (ep *Endpoint) fromSerializedEndpoint(r *serializableEndpoint) {
 	ep.DNSZombies = r.DNSZombies
 	ep.K8sPodName = r.K8sPodName
 	ep.K8sNamespace = r.K8sNamespace
+	ep.K8sUID = r.K8sUID
 	ep.DatapathConfiguration = r.DatapathConfiguration
 	ep.Options = r.Options
 	ep.ciliumEndpointUID = r.CiliumEndpointUID
@@ -583,4 +618,5 @@ func (ep *Endpoint) fromSerializedEndpoint(r *serializableEndpoint) {
 	} else {
 		ep.properties = map[string]interface{}{}
 	}
+	ep.NetNsCookie = r.NetnsCookie
 }

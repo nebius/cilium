@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/go-openapi/runtime/middleware"
@@ -15,8 +16,10 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	. "github.com/cilium/cilium/api/v1/server/restapi/daemon"
+	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
@@ -30,12 +33,11 @@ import (
 	"github.com/cilium/cilium/pkg/maps/lbmap"
 	"github.com/cilium/cilium/pkg/maps/lxcmap"
 	"github.com/cilium/cilium/pkg/maps/metricsmap"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmap"
 	"github.com/cilium/cilium/pkg/maps/timestamp"
 	tunnelmap "github.com/cilium/cilium/pkg/maps/tunnel"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
-	"github.com/cilium/cilium/pkg/promise"
-	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/status"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/version"
@@ -51,8 +53,6 @@ const (
 	// healthy
 	k8sMinimumEventHeartbeat = time.Minute
 )
-
-var randGen = rand.NewSafeRand(time.Now().UnixNano())
 
 type k8sVersion struct {
 	version          string
@@ -123,15 +123,20 @@ func (d *Daemon) getMasqueradingStatus() *models.Masquerading {
 		return s
 	}
 
+	localNode, err := d.nodeLocalStore.Get(context.TODO())
+	if err != nil {
+		return s
+	}
+
 	if option.Config.EnableIPv4 {
 		// SnatExclusionCidr is the legacy field, continue to provide
 		// it for the time being
-		s.SnatExclusionCidr = datapath.RemoteSNATDstAddrExclusionCIDRv4().String()
-		s.SnatExclusionCidrV4 = datapath.RemoteSNATDstAddrExclusionCIDRv4().String()
+		s.SnatExclusionCidr = datapath.RemoteSNATDstAddrExclusionCIDRv4(localNode).String()
+		s.SnatExclusionCidrV4 = datapath.RemoteSNATDstAddrExclusionCIDRv4(localNode).String()
 	}
 
 	if option.Config.EnableIPv6 {
-		s.SnatExclusionCidrV6 = datapath.RemoteSNATDstAddrExclusionCIDRv6().String()
+		s.SnatExclusionCidrV6 = datapath.RemoteSNATDstAddrExclusionCIDRv6(localNode).String()
 	}
 
 	if option.Config.EnableBPFMasquerade {
@@ -185,14 +190,22 @@ func (d *Daemon) getBandwidthManagerStatus() *models.BandwidthManager {
 		s.CongestionControl = models.BandwidthManagerCongestionControlBbr
 	}
 
-	s.Devices = option.Config.GetDevices()
+	devs, _ := datapathTables.SelectedDevices(d.devices, d.db.ReadTxn())
+	s.Devices = datapathTables.DeviceNames(devs)
 	return s
 }
 
-func (d *Daemon) getHostRoutingStatus() *models.HostRouting {
-	s := &models.HostRouting{Mode: models.HostRoutingModeBPF}
+func (d *Daemon) getRoutingStatus() *models.Routing {
+	s := &models.Routing{
+		IntraHostRoutingMode: models.RoutingIntraHostRoutingModeBPF,
+		InterHostRoutingMode: models.RoutingInterHostRoutingModeTunnel,
+		TunnelProtocol:       d.tunnelConfig.Protocol().String(),
+	}
 	if option.Config.EnableHostLegacyRouting {
-		s.Mode = models.HostRoutingModeLegacy
+		s.IntraHostRoutingMode = models.RoutingIntraHostRoutingModeLegacy
+	}
+	if option.Config.RoutingMode == option.RoutingModeNative {
+		s.InterHostRoutingMode = models.RoutingInterHostRoutingModeNative
 	}
 	return s
 }
@@ -202,14 +215,34 @@ func (d *Daemon) getHostFirewallStatus() *models.HostFirewall {
 	if option.Config.EnableHostFirewall {
 		mode = models.HostFirewallModeEnabled
 	}
+	devs, _ := datapathTables.SelectedDevices(d.devices, d.db.ReadTxn())
 	return &models.HostFirewall{
 		Mode:    mode,
-		Devices: option.Config.GetDevices(),
+		Devices: datapathTables.DeviceNames(devs),
 	}
 }
 
 func (d *Daemon) getClockSourceStatus() *models.ClockSource {
 	return timestamp.GetClockSourceFromOptions()
+}
+
+func (d *Daemon) getAttachModeStatus() models.AttachMode {
+	mode := models.AttachModeTc
+	if option.Config.EnableTCX && probes.HaveTCX() == nil {
+		mode = models.AttachModeTcx
+	}
+	return mode
+}
+
+func (d *Daemon) getDatapathModeStatus() models.DatapathMode {
+	mode := models.DatapathModeVeth
+	switch option.Config.DatapathMode {
+	case datapathOption.DatapathModeNetkit:
+		mode = models.DatapathModeNetkit
+	case datapathOption.DatapathModeNetkitL2:
+		mode = models.DatapathModeNetkitDashL2
+	}
+	return mode
 }
 
 func (d *Daemon) getCNIChainingStatus() *models.CNIChainingStatus {
@@ -267,12 +300,16 @@ func (d *Daemon) getKubeProxyReplacementStatus() *models.KubeProxyReplacement {
 			features.NodePort.DsrMode = models.KubeProxyReplacementFeaturesNodePortDsrModeGeneve
 		}
 		if option.Config.NodePortMode == option.NodePortModeHybrid {
+			//nolint:staticcheck
 			features.NodePort.Mode = strings.Title(option.Config.NodePortMode)
 		}
 		features.NodePort.Algorithm = models.KubeProxyReplacementFeaturesNodePortAlgorithmRandom
 		if option.Config.NodePortAlg == option.NodePortAlgMaglev {
 			features.NodePort.Algorithm = models.KubeProxyReplacementFeaturesNodePortAlgorithmMaglev
-			features.NodePort.LutSize = int64(option.Config.MaglevTableSize)
+			features.NodePort.LutSize = int64(d.maglevConfig.MaglevTableSize)
+		}
+		if option.Config.LoadBalancerAlgorithmAnnotation {
+			features.NodePort.LutSize = int64(d.maglevConfig.MaglevTableSize)
 		}
 		if option.Config.NodePortAcceleration == option.NodePortAccelerationGeneric {
 			features.NodePort.Acceleration = models.KubeProxyReplacementFeaturesNodePortAccelerationGeneric
@@ -314,12 +351,32 @@ func (d *Daemon) getKubeProxyReplacementStatus() *models.KubeProxyReplacement {
 		}
 		features.Nat46X64.Service = svc
 	}
+	if option.Config.LoadBalancerAlgorithmAnnotation {
+		features.Annotations = append(features.Annotations, annotation.ServiceLoadBalancingAlgorithm)
+	}
+	if option.Config.LoadBalancerModeAnnotation {
+		features.Annotations = append(features.Annotations, annotation.ServiceForwardingMode)
+	}
+	features.Annotations = append(features.Annotations, annotation.ServiceNodeExposure)
+	features.Annotations = append(features.Annotations, annotation.ServiceNodeSelectorExposure)
+	features.Annotations = append(features.Annotations, annotation.ServiceTypeExposure)
+	features.Annotations = append(features.Annotations, annotation.ServiceProxyDelegation)
+	if option.Config.EnableSVCSourceRangeCheck {
+		features.Annotations = append(features.Annotations, annotation.ServiceSourceRangesPolicy)
+	}
+	sort.Strings(features.Annotations)
+
+	var directRoutingDevice string
+	drd, _ := d.directRoutingDev.Get(context.TODO(), d.db.ReadTxn())
+	if drd != nil {
+		directRoutingDevice = drd.Name
+	}
 
 	return &models.KubeProxyReplacement{
 		Mode:                mode,
 		Devices:             datapathTables.DeviceNames(devices),
 		DeviceList:          devicesList,
-		DirectRoutingDevice: option.Config.DirectRoutingDevice,
+		DirectRoutingDevice: directRoutingDevice,
 		Features:            features,
 	}
 }
@@ -341,7 +398,7 @@ func (d *Daemon) getBPFMapStatus() *models.BPFMapStatus {
 				Size: int64(option.Config.CTMapEntriesGlobalTCP),
 			},
 			{
-				Name: "Endpoint policy",
+				Name: "Endpoints",
 				Size: int64(lxcmap.MaxEntries),
 			},
 			{
@@ -389,6 +446,10 @@ func (d *Daemon) getBPFMapStatus() *models.BPFMapStatus {
 				Size: int64(metricsmap.MaxEntries),
 			},
 			{
+				Name: "Ratelimit metrics",
+				Size: int64(ratelimitmap.MaxMetricsEntries),
+			},
+			{
 				Name: "NAT",
 				Size: int64(option.Config.NATMapEntriesGlobal),
 			},
@@ -397,8 +458,12 @@ func (d *Daemon) getBPFMapStatus() *models.BPFMapStatus {
 				Size: int64(option.Config.NeighMapEntriesGlobal),
 			},
 			{
-				Name: "Global policy",
-				Size: int64(option.Config.PolicyMapEntries),
+				Name: "Endpoint policy",
+				Size: int64(d.policyMapFactory.PolicyMaxEntries()),
+			},
+			{
+				Name: "Policy stats",
+				Size: int64(d.policyMapFactory.StatsMaxEntries()),
 			},
 			{
 				Name: "Session affinity",
@@ -418,213 +483,14 @@ func (d *Daemon) getBPFMapStatus() *models.BPFMapStatus {
 
 func getHealthzHandler(d *Daemon, params GetHealthzParams) middleware.Responder {
 	brief := params.Brief != nil && *params.Brief
-	sr := d.getStatus(brief)
+	requireK8sConnectivity := params.RequireK8sConnectivity != nil && *params.RequireK8sConnectivity
+	sr := d.getStatus(brief, requireK8sConnectivity)
 	return NewGetHealthzOK().WithPayload(&sr)
-}
-
-func (d *Daemon) getNodeStatus() *models.ClusterStatus {
-	clusterStatus := models.ClusterStatus{
-		Self: nodeTypes.GetAbsoluteNodeName(),
-	}
-	for _, node := range d.nodeDiscovery.Manager.GetNodes() {
-		clusterStatus.Nodes = append(clusterStatus.Nodes, node.GetModel())
-	}
-	return &clusterStatus
-}
-
-type getNodes struct {
-	// mutex to protect the clients map against concurrent access
-	lock.RWMutex
-	// clients maps a client ID to a clusterNodesClient
-	clients map[int64]*clusterNodesClient
-}
-
-func NewGetClusterNodesHandler(dp promise.Promise[*Daemon]) *apiHandler[GetClusterNodesParams] {
-	h := &apiHandler[GetClusterNodesParams]{dp: dp}
-	gn := &getNodes{
-		clients: map[int64]*clusterNodesClient{},
-	}
-	h.handler = gn.Handle
-	return h
-}
-
-// clientGCTimeout is the time for which the clients are kept. After timeout
-// is reached, clients will be cleaned up.
-const clientGCTimeout = 15 * time.Minute
-
-type clusterNodesClient struct {
-	// mutex to protect the client against concurrent access
-	lock.RWMutex
-	lastSync time.Time
-	*models.ClusterNodeStatus
-}
-
-func (c *clusterNodesClient) Name() string {
-	return "cluster-node"
-}
-
-func (c *clusterNodesClient) NodeAdd(newNode nodeTypes.Node) error {
-	c.Lock()
-	c.NodesAdded = append(c.NodesAdded, newNode.GetModel())
-	c.Unlock()
-	return nil
-}
-
-func (c *clusterNodesClient) NodeUpdate(oldNode, newNode nodeTypes.Node) error {
-	c.Lock()
-	defer c.Unlock()
-
-	// If the node is on the added list, just update it
-	for i, added := range c.NodesAdded {
-		if added.Name == newNode.Fullname() {
-			c.NodesAdded[i] = newNode.GetModel()
-			return nil
-		}
-	}
-
-	// otherwise, add the new node and remove the old one
-	c.NodesAdded = append(c.NodesAdded, newNode.GetModel())
-	c.NodesRemoved = append(c.NodesRemoved, oldNode.GetModel())
-	return nil
-}
-
-func (c *clusterNodesClient) NodeDelete(node nodeTypes.Node) error {
-	c.Lock()
-	// If the node was added/updated and removed before the clusterNodesClient
-	// was aware of it then we can safely remove it from the list of added
-	// nodes and not set it in the list of removed nodes.
-	found := -1
-	for i, added := range c.NodesAdded {
-		if added.Name == node.Fullname() {
-			found = i
-		}
-	}
-	if found != -1 {
-		c.NodesAdded = append(c.NodesAdded[:found], c.NodesAdded[found+1:]...)
-	} else {
-		c.NodesRemoved = append(c.NodesRemoved, node.GetModel())
-	}
-	c.Unlock()
-	return nil
-}
-
-func (c *clusterNodesClient) AllNodeValidateImplementation() {
-}
-
-func (c *clusterNodesClient) NodeValidateImplementation(node nodeTypes.Node) error {
-	// no-op
-	return nil
-}
-
-func (c *clusterNodesClient) NodeConfigurationChanged(config datapath.LocalNodeConfiguration) error {
-	// no-op
-	return nil
-}
-
-func (c *clusterNodesClient) NodeNeighDiscoveryEnabled() bool {
-	// no-op
-	return false
-}
-
-func (c *clusterNodesClient) NodeNeighborRefresh(ctx context.Context, node nodeTypes.Node, refresh bool) error {
-	return nil
-}
-
-func (c *clusterNodesClient) NodeCleanNeighbors(migrateOnly bool) {
-	// no-op
-}
-
-func (c *clusterNodesClient) GetNodeIP(_ uint16) string {
-	// no-op
-	return ""
-}
-
-func (c *clusterNodesClient) DumpNodeIDs() []*models.NodeID {
-	// no-op
-	return nil
-}
-
-func (c *clusterNodesClient) RestoreNodeIDs() {
-	// no-op
-}
-
-func (h *getNodes) cleanupClients(d *Daemon) {
-	past := time.Now().Add(-clientGCTimeout)
-	for k, v := range h.clients {
-		if v.lastSync.Before(past) {
-			d.nodeDiscovery.Manager.Unsubscribe(v)
-			delete(h.clients, k)
-		}
-	}
-}
-
-func (h *getNodes) Handle(d *Daemon, params GetClusterNodesParams) middleware.Responder {
-	var cns *models.ClusterNodeStatus
-	// If ClientID is not set then we send all nodes, otherwise we will store
-	// the client ID in the list of clients and we subscribe this new client
-	// to the list of clients.
-	if params.ClientID == nil {
-		ns := d.getNodeStatus()
-		cns = &models.ClusterNodeStatus{
-			Self:       ns.Self,
-			NodesAdded: ns.Nodes,
-		}
-		return NewGetClusterNodesOK().WithPayload(cns)
-	}
-
-	h.Lock()
-	defer h.Unlock()
-
-	var clientID int64
-	c, exists := h.clients[*params.ClientID]
-	if exists {
-		clientID = *params.ClientID
-	} else {
-		clientID = randGen.Int63()
-		// make sure we haven't allocated an existing client ID nor the
-		// randomizer has allocated ID 0, if we have then we will return
-		// clientID 0.
-		_, exists := h.clients[clientID]
-		if exists || clientID == 0 {
-			ns := d.getNodeStatus()
-			cns = &models.ClusterNodeStatus{
-				ClientID:   0,
-				Self:       ns.Self,
-				NodesAdded: ns.Nodes,
-			}
-			return NewGetClusterNodesOK().WithPayload(cns)
-		}
-		c = &clusterNodesClient{
-			lastSync: time.Now(),
-			ClusterNodeStatus: &models.ClusterNodeStatus{
-				ClientID: clientID,
-				Self:     nodeTypes.GetAbsoluteNodeName(),
-			},
-		}
-		d.nodeDiscovery.Manager.Subscribe(c)
-
-		// Clean up other clients before adding a new one
-		h.cleanupClients(d)
-		h.clients[clientID] = c
-	}
-	c.Lock()
-	// Copy the ClusterNodeStatus to the response
-	cns = c.ClusterNodeStatus
-	// Store a new ClusterNodeStatus to reset the list of nodes
-	// added / removed.
-	c.ClusterNodeStatus = &models.ClusterNodeStatus{
-		ClientID: clientID,
-		Self:     nodeTypes.GetAbsoluteNodeName(),
-	}
-	c.lastSync = time.Now()
-	c.Unlock()
-
-	return NewGetClusterNodesOK().WithPayload(cns)
 }
 
 // getStatus returns the daemon status. If brief is provided a minimal version
 // of the StatusResponse is provided.
-func (d *Daemon) getStatus(brief bool) models.StatusResponse {
+func (d *Daemon) getStatus(brief bool, requireK8sConnectivity bool) models.StatusResponse {
 	staleProbes := d.statusCollector.GetStaleProbes()
 	stale := make(map[string]strfmt.DateTime, len(staleProbes))
 	for probe, startTime := range staleProbes {
@@ -680,7 +546,9 @@ func (d *Daemon) getStatus(brief bool) models.StatusResponse {
 			State: models.StatusStateWarning,
 			Msg:   fmt.Sprintf("%s    %s", ciliumVer, msg),
 		}
-	case d.statusResponse.Kvstore != nil && d.statusResponse.Kvstore.State != models.StatusStateOk:
+	case d.statusResponse.Kvstore != nil &&
+		d.statusResponse.Kvstore.State != models.StatusStateOk &&
+		d.statusResponse.Kvstore.State != models.StatusStateDisabled:
 		msg := "Kvstore service is not ready: " + d.statusResponse.Kvstore.Msg
 		sr.Cilium = &models.Status{
 			State: d.statusResponse.Kvstore.State,
@@ -695,7 +563,7 @@ func (d *Daemon) getStatus(brief bool) models.StatusResponse {
 			State: d.statusResponse.ContainerRuntime.State,
 			Msg:   fmt.Sprintf("%s    %s", ciliumVer, msg),
 		}
-	case d.clientset.IsEnabled() && d.statusResponse.Kubernetes != nil && d.statusResponse.Kubernetes.State != models.StatusStateOk:
+	case d.clientset.IsEnabled() && d.statusResponse.Kubernetes != nil && d.statusResponse.Kubernetes.State != models.StatusStateOk && requireK8sConnectivity:
 		msg := "Kubernetes service is not ready: " + d.statusResponse.Kubernetes.Msg
 		sr.Cilium = &models.Status{
 			State: d.statusResponse.Kubernetes.State,
@@ -719,61 +587,46 @@ func (d *Daemon) getStatus(brief bool) models.StatusResponse {
 
 func (d *Daemon) getIdentityRange() *models.IdentityRange {
 	s := &models.IdentityRange{
-		MinIdentity: int64(identity.GetMinimalAllocationIdentity()),
-		MaxIdentity: int64(identity.GetMaximumAllocationIdentity()),
+		MinIdentity: int64(identity.GetMinimalAllocationIdentity(d.clusterInfo.ID)),
+		MaxIdentity: int64(identity.GetMaximumAllocationIdentity(d.clusterInfo.ID)),
 	}
 
 	return s
 }
 
-func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
+func (d *Daemon) startStatusCollector(ctx context.Context, cleaner *daemonCleanup) error {
 	probes := []status.Probe{
-		{
-			Name: "check-locks",
-			Probe: func(ctx context.Context) (interface{}, error) {
-				// Try to acquire a couple of global locks to have the status API fail
-				// in case of a deadlock on these locks
-				option.Config.ConfigPatchMutex.Lock()
-				option.Config.ConfigPatchMutex.Unlock()
-				return nil, nil
-			},
-			OnStatusUpdate: func(status status.Status) {
-				d.statusCollectMutex.Lock()
-				defer d.statusCollectMutex.Unlock()
-				// FIXME we have no field for the lock status
-			},
-		},
 		{
 			Name: "kvstore",
 			Probe: func(ctx context.Context) (interface{}, error) {
 				if option.Config.KVStore == "" {
-					return models.StatusStateDisabled, nil
+					return &models.Status{State: models.StatusStateDisabled}, nil
 				} else {
-					return kvstore.Client().Status()
+					return kvstore.Client().Status(), nil
 				}
 			},
 			OnStatusUpdate: func(status status.Status) {
-				var msg string
-				state := models.StatusStateOk
-				info, ok := status.Data.(string)
-
-				switch {
-				case ok && status.Err != nil:
-					state = models.StatusStateFailure
-					msg = fmt.Sprintf("Err: %s - %s", status.Err, info)
-				case status.Err != nil:
-					state = models.StatusStateFailure
-					msg = fmt.Sprintf("Err: %s", status.Err)
-				case ok:
-					msg = info
-				}
-
 				d.statusCollectMutex.Lock()
 				defer d.statusCollectMutex.Unlock()
 
-				d.statusResponse.Kvstore = &models.Status{
-					State: state,
-					Msg:   msg,
+				if status.Err != nil {
+					d.statusResponse.Kvstore = &models.Status{
+						State: models.StatusStateFailure,
+						Msg:   status.Err.Error(),
+					}
+					return
+				}
+
+				if kvstore, ok := status.Data.(*models.Status); ok {
+					if kvstore.State == models.StatusStateWarning && option.Config.KVstorePodNetworkSupport {
+						// Don't treat warnings as errors when the support for running
+						// etcd in pod network is enabled. This is necessary to allow
+						// Cilium turning ready even before connecting to the kvstore,
+						// and break the chicken-and-egg dependency during startup.
+						kvstore.State = models.StatusStateOk
+					}
+
+					d.statusResponse.Kvstore = kvstore
 				}
 			},
 		},
@@ -974,7 +827,7 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 		{
 			Name: "hubble",
 			Probe: func(ctx context.Context) (interface{}, error) {
-				return d.getHubbleStatus(ctx), nil
+				return d.hubble.Status(ctx), nil
 			},
 			OnStatusUpdate: func(status status.Status) {
 				d.statusCollectMutex.Lock()
@@ -997,7 +850,7 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 					}, nil
 				case option.Config.EnableWireguard:
 					var msg string
-					status, err := d.datapath.WireguardAgent().Status(false)
+					status, err := d.wireguardAgent.Status(false)
 					if err != nil {
 						msg = err.Error()
 					}
@@ -1026,11 +879,7 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 		{
 			Name: "kube-proxy-replacement",
 			Probe: func(ctx context.Context) (interface{}, error) {
-				if d.clientset.IsEnabled() || option.Config.DatapathMode == datapathOption.DatapathModeLBOnly {
-					return d.getKubeProxyReplacementStatus(), nil
-				} else {
-					return nil, nil
-				}
+				return d.getKubeProxyReplacementStatus(), nil
 			},
 			OnStatusUpdate: func(status status.Status) {
 				d.statusCollectMutex.Lock()
@@ -1063,6 +912,25 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 				}
 			},
 		},
+		{
+			Name: "cni-config",
+			Probe: func(ctx context.Context) (interface{}, error) {
+				if d.cniConfigManager == nil {
+					return nil, nil
+				}
+				return d.cniConfigManager.Status(), nil
+			},
+			OnStatusUpdate: func(status status.Status) {
+				d.statusCollectMutex.Lock()
+				defer d.statusCollectMutex.Unlock()
+
+				if status.Err == nil {
+					if s, ok := status.Data.(*models.Status); ok {
+						d.statusResponse.CniFile = s
+					}
+				}
+			},
+		},
 	}
 
 	d.statusResponse.Masquerading = d.getMasqueradingStatus()
@@ -1070,20 +938,29 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 	d.statusResponse.IPV4BigTCP = d.getIPV4BigTCPStatus()
 	d.statusResponse.BandwidthManager = d.getBandwidthManagerStatus()
 	d.statusResponse.HostFirewall = d.getHostFirewallStatus()
-	d.statusResponse.HostRouting = d.getHostRoutingStatus()
+	d.statusResponse.Routing = d.getRoutingStatus()
 	d.statusResponse.ClockSource = d.getClockSourceStatus()
 	d.statusResponse.BpfMaps = d.getBPFMapStatus()
 	d.statusResponse.CniChaining = d.getCNIChainingStatus()
 	d.statusResponse.IdentityRange = d.getIdentityRange()
 	d.statusResponse.Srv6 = d.getSRv6Status()
+	d.statusResponse.AttachMode = d.getAttachModeStatus()
+	d.statusResponse.DatapathMode = d.getDatapathModeStatus()
 
-	d.statusCollector = status.NewCollector(probes, status.Config{StackdumpPath: "/run/cilium/state/agent.stack.gz"})
+	d.statusCollector = status.NewCollector(probes, status.DefaultConfig)
+
+	// Block until all probes have been executed at least once, to make sure that
+	// the status has been fully initialized once we exit from this function.
+	if err := d.statusCollector.WaitForFirstRun(ctx); err != nil {
+		return fmt.Errorf("waiting for first run: %w", err)
+	}
 
 	// Set up a signal handler function which prints out logs related to daemon status.
 	cleaner.cleanupFuncs.Add(func() {
 		// If the KVstore state is not OK, print help for user.
 		if d.statusResponse.Kvstore != nil &&
-			d.statusResponse.Kvstore.State != models.StatusStateOk {
+			d.statusResponse.Kvstore.State != models.StatusStateOk &&
+			d.statusResponse.Kvstore.State != models.StatusStateDisabled {
 			helpMsg := "cilium-agent depends on the availability of cilium-operator/etcd-cluster. " +
 				"Check if the cilium-operator pod and etcd-cluster are running and do not have any " +
 				"warnings or error messages."
@@ -1093,5 +970,9 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 			}).Error("KVStore state not OK")
 
 		}
+
+		d.statusCollector.Close()
 	})
+
+	return nil
 }

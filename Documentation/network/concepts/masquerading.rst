@@ -48,9 +48,11 @@ eBPF-based
    file a GitHub issue if you experience any problems. IPv4 BPF masquerading is
    production-ready.
 
-The eBPF-based implementation is the most efficient
-implementation. It requires Linux kernel 4.19 and can be enabled with
+The eBPF-based implementation is the most efficient implementation. It can be enabled with
 the ``bpf.masquerade=true`` helm option.
+
+By default, BPF masquerading also enables the BPF Host-Routing mode.
+See :ref:`eBPF_Host_Routing` for benefits and limitations of this mode.
 
 The current implementation depends on :ref:`the BPF NodePort feature <kubeproxy-free>`.
 The dependency will be removed in the future (:gh-issue:`13732`).
@@ -147,10 +149,6 @@ and ``--set ipMasqAgent.config.masqLinkLocal=false`` (or with the corresponding
 option, for IPv6) when installing Cilium via Helm to
 configure the ``ip-masq-agent`` as above.
 
-.. note::
-
-    eBPF-based masquerading for IPv6 is not compatible with the host firewall.
-
 iptables-based
 **************
 
@@ -174,3 +172,9 @@ primary interface address. The latter is then only considered as a catch-all
 fallback, and for the default routes. For these advanced cases the user needs
 to ensure that there are no overlapping destination CIDRs as routes on the
 relevant masquerading interfaces.
+
+With the ``enable-masquerade-to-route-source: "true"`` option, Cilium will, 
+by default, use interfaces listed in the ``devices`` field as the egress masquerade interfaces 
+when ``egress-masquerade-interfaces`` is empty. When ``egress-masquerade-interfaces`` is set, 
+it takes precedence over ``devices`` to choose which network interface should perform masquerading.
+You can set ``egress-masquerade-interfaces`` to match multiple interfaces like this: ``eth+ ens+``.

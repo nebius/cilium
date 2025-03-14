@@ -4,20 +4,14 @@
 package kvstoremesh
 
 import (
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
-)
-
-var (
-	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "kvstoremesh")
+	"github.com/cilium/cilium/pkg/version"
 )
 
 func NewCmd(h *hive.Hive) *cobra.Command {
@@ -25,18 +19,18 @@ func NewCmd(h *hive.Hive) *cobra.Command {
 		Use:   "kvstoremesh",
 		Short: "Run KVStoreMesh",
 		Run: func(cmd *cobra.Command, args []string) {
-			if err := h.Run(); err != nil {
-				log.Fatal(err)
+			if err := h.Run(logging.DefaultSlogLogger); err != nil {
+				logging.Fatal(logging.DefaultSlogLogger, err.Error())
 			}
 		},
 		PreRun: func(cmd *cobra.Command, args []string) {
 			// Overwrite the metrics namespace with the one specific for KVStoreMesh
 			metrics.Namespace = metrics.CiliumKVStoreMeshNamespace
+			option.Config.SetupLogging(h.Viper(), "kvstoremesh")
 			option.Config.Populate(h.Viper())
-			if option.Config.Debug {
-				log.Logger.SetLevel(logrus.DebugLevel)
-			}
-			option.LogRegisteredOptions(h.Viper(), log)
+			log := logging.DefaultSlogLogger.With(logfields.LogSubsys, "kvstoremesh")
+			option.LogRegisteredSlogOptions(h.Viper(), log)
+			log.Info("Cilium KVStoreMesh", logfields.Version, version.Version)
 		},
 	}
 
@@ -44,18 +38,4 @@ func NewCmd(h *hive.Hive) *cobra.Command {
 	rootCmd.AddCommand(h.Command())
 
 	return rootCmd
-}
-
-func registerClusterInfoValidator(lc cell.Lifecycle, cinfo types.ClusterInfo) {
-	lc.Append(cell.Hook{
-		OnStart: func(cell.HookContext) error {
-			if err := cinfo.InitClusterIDMax(); err != nil {
-				return err
-			}
-			if err := cinfo.ValidateStrict(); err != nil {
-				return err
-			}
-			return nil
-		},
-	})
 }

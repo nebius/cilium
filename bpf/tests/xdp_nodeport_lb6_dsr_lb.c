@@ -6,9 +6,6 @@
 #include <bpf/ctx/xdp.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV6
 #define ENABLE_NODEPORT
@@ -17,9 +14,8 @@
 
 #define DISABLE_LOOPBACK_LB
 
-/* Skip ingress policy checks, not needed to validate hairpin flow */
+/* Skip ingress policy checks */
 #define USE_BPF_PROG_FOR_INGRESS_POLICY
-#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
 
 #define CLIENT_IP		{ .addr = { 0x1, 0x0, 0x0, 0x0, 0x0, 0x0 } }
 #define CLIENT_PORT		__bpf_htons(111)
@@ -115,7 +111,7 @@ int nodeport_dsr_fwd_setup(struct __ctx_buff *ctx)
 	union v6addr backend_ip = BACKEND_IP;
 	__u16 revnat_id = 1;
 
-	lb_v6_add_service(&frontend_ip, FRONTEND_PORT, 1, revnat_id);
+	lb_v6_add_service(&frontend_ip, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 	lb_v6_add_backend(&frontend_ip, FRONTEND_PORT, 1, 124,
 			  &backend_ip, BACKEND_PORT, IPPROTO_TCP, 0);
 
@@ -200,6 +196,9 @@ int nodeport_dsr_fwd_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port hasn't been NATed to backend port");
+
+	if (l4->check != bpf_htons(0x0d7c))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }

@@ -20,13 +20,14 @@ import (
 	envoy_config_cluster "github.com/cilium/proxy/go/envoy/config/cluster/v3"
 	envoy_config_core "github.com/cilium/proxy/go/envoy/config/core/v3"
 	envoy_config_endpoint "github.com/cilium/proxy/go/envoy/config/endpoint/v3"
+	envoy_config_overload "github.com/cilium/proxy/go/envoy/config/overload/v3"
 	envoy_extensions_bootstrap_internal_listener_v3 "github.com/cilium/proxy/go/envoy/extensions/bootstrap/internal_listener/v3"
+	envoy_extensions_resource_monitors_downstream_connections "github.com/cilium/proxy/go/envoy/extensions/resource_monitors/downstream_connections/v3"
 	envoy_config_upstream "github.com/cilium/proxy/go/envoy/extensions/upstreams/http/v3"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/cilium/cilium/pkg/flowdebug"
@@ -36,17 +37,25 @@ import (
 	"github.com/cilium/cilium/pkg/time"
 )
 
-var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "envoy-manager")
+const (
+	envoyLogLevelOff      = "off"
+	envoyLogLevelCritical = "critical"
+	envoyLogLevelError    = "error"
+	envoyLogLevelWarning  = "warning"
+	envoyLogLevelInfo     = "info"
+	envoyLogLevelDebug    = "debug"
+	envoyLogLevelTrace    = "trace"
+)
 
 var (
 	// envoyLevelMap maps logrus.Level values to Envoy (spdlog) log levels.
 	envoyLevelMap = map[logrus.Level]string{
-		logrus.PanicLevel: "off",
-		logrus.FatalLevel: "critical",
-		logrus.ErrorLevel: "error",
-		logrus.WarnLevel:  "warning",
-		logrus.InfoLevel:  "info",
-		logrus.DebugLevel: "debug",
+		logrus.PanicLevel: envoyLogLevelOff,
+		logrus.FatalLevel: envoyLogLevelCritical,
+		logrus.ErrorLevel: envoyLogLevelError,
+		logrus.WarnLevel:  envoyLogLevelWarning,
+		logrus.InfoLevel:  envoyLogLevelInfo,
+		logrus.DebugLevel: envoyLogLevelDebug,
 		// spdlog "trace" not mapped
 	}
 
@@ -56,6 +65,8 @@ var (
 const (
 	ciliumEnvoyStarter = "cilium-envoy-starter"
 	ciliumEnvoy        = "cilium-envoy"
+
+	maxActiveDownstreamConnections = 50000
 )
 
 // EnableTracing changes Envoy log level to "trace", producing the most logs.
@@ -63,16 +74,24 @@ func EnableTracing() {
 	tracing = true
 }
 
-func mapLogLevel(level logrus.Level) string {
-	if tracing {
-		return "trace"
+func mapLogLevel(agentLogLevel logrus.Level, defaultEnvoyLogLevel string) string {
+	// Set Envoy loglevel to trace if debug AND verbose Engoy logging is enabled
+	if agentLogLevel == logrus.DebugLevel && tracing {
+		return envoyLogLevelTrace
 	}
 
 	// Suppress the debug level if not debugging at flow level.
-	if level == logrus.DebugLevel && !flowdebug.Enabled() {
-		level = logrus.InfoLevel
+	if agentLogLevel == logrus.DebugLevel && !flowdebug.Enabled() {
+		return envoyLogLevelInfo
 	}
-	return envoyLevelMap[level]
+
+	// If defined, use explicit default log level for Envoy
+	if defaultEnvoyLogLevel != "" {
+		return defaultEnvoyLogLevel
+	}
+
+	// Fall back to current log level of the agent
+	return envoyLevelMap[agentLogLevel]
 }
 
 // Envoy manages a running Envoy proxy instance via the
@@ -86,24 +105,35 @@ type EmbeddedEnvoy struct {
 type embeddedEnvoyConfig struct {
 	runDir                   string
 	logPath                  string
+	defaultLogLevel          string
 	baseID                   uint64
+	keepCapNetBindService    bool
 	connectTimeout           int64
 	maxRequestsPerConnection uint32
 	maxConnectionDuration    time.Duration
 	idleTimeout              time.Duration
+	maxConcurrentRetries     uint32
 }
 
-// startEmbeddedEnvoy starts an Envoy proxy instance.
-func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
+// startEmbeddedEnvoyInternal starts an Envoy proxy instance.
+func (o *onDemandXdsStarter) startEmbeddedEnvoyInternal(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
 	envoy := &EmbeddedEnvoy{
 		stopCh: make(chan struct{}),
 		errCh:  make(chan error, 1),
-		admin:  NewEnvoyAdminClientForSocket(GetSocketDir(config.runDir)),
+		admin:  NewEnvoyAdminClientForSocket(o.logger, GetSocketDir(config.runDir), config.defaultLogLevel),
 	}
 
-	bootstrapFilePath := filepath.Join(config.runDir, "envoy", "bootstrap.pb")
+	bootstrapDir := filepath.Join(config.runDir, "envoy")
 
-	writeBootstrapConfigFile(bootstrapConfig{
+	// make sure envoy dir exists
+	os.Mkdir(bootstrapDir, 0777)
+
+	// Make sure sockets dir exists
+	os.Mkdir(GetSocketDir(config.runDir), 0777)
+
+	bootstrapFilePath := filepath.Join(bootstrapDir, "bootstrap.pb")
+
+	o.writeBootstrapConfigFile(bootstrapConfig{
 		filePath:                 bootstrapFilePath,
 		nodeId:                   "host~127.0.0.1~no-id~localdomain", // node id format inherited from Istio
 		cluster:                  ingressClusterName,
@@ -115,9 +145,10 @@ func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
 		maxRequestsPerConnection: config.maxRequestsPerConnection,
 		maxConnectionDuration:    config.maxConnectionDuration,
 		idleTimeout:              config.idleTimeout,
+		maxConcurrentRetries:     config.maxConcurrentRetries,
 	})
 
-	log.Debugf("Envoy: Starting: %v", *envoy)
+	o.logger.Debug("Envoy: Starting embedded Envoy")
 
 	// make it a buffered channel, so we can not only
 	// read the written value but also skip it in
@@ -146,32 +177,41 @@ func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
 
 			// Create a piper that parses and writes into logrus the log
 			// messages from Envoy.
-			logWriter = newEnvoyLogPiper()
+			logWriter = o.newEnvoyLogPiper()
 		}
 		defer logWriter.Close()
 
+		envoyArgs := []string{"-l", mapLogLevel(logging.GetLevel(logging.DefaultLogger), config.defaultLogLevel), "-c", bootstrapFilePath, "--base-id", strconv.FormatUint(config.baseID, 10), "--log-format", logFormat}
+		envoyStarterArgs := []string{}
+		if config.keepCapNetBindService {
+			envoyStarterArgs = append(envoyStarterArgs, "--keep-cap-net-bind-service", "--")
+		}
+		envoyStarterArgs = append(envoyStarterArgs, envoyArgs...)
+
 		for {
-			logLevel := logging.GetLevel(logging.DefaultLogger)
-			cmd := exec.Command(ciliumEnvoyStarter, "-l", mapLogLevel(logLevel), "-c", bootstrapFilePath, "--base-id", strconv.FormatUint(config.baseID, 10), "--log-format", logFormat)
+			cmd := exec.Command(ciliumEnvoyStarter, envoyStarterArgs...)
 			cmd.Stderr = logWriter
 			cmd.Stdout = logWriter
 
 			if err := cmd.Start(); err != nil {
-				log.WithError(err).Warn("Envoy: Failed to start proxy")
+				o.logger.Warn("Envoy: Failed to start proxy",
+					logfields.Error, err,
+				)
 				select {
 				case started <- false:
 				default:
 				}
 				return
 			}
-			log.Debugf("Envoy: Started proxy")
+
+			o.logger.Info("Envoy: Proxy started",
+				logfields.PID, cmd.Process.Pid,
+			)
+			metrics.SubprocessStart.WithLabelValues(ciliumEnvoyStarter).Inc()
 			select {
 			case started <- true:
 			default:
 			}
-
-			log.Infof("Envoy: Proxy started with pid %d", cmd.Process.Pid)
-			metrics.SubprocessStart.WithLabelValues(ciliumEnvoyStarter).Inc()
 
 			// We do not return after a successful start, but watch the Envoy process
 			// and restart it if it crashes.
@@ -183,9 +223,16 @@ func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
 			crashCh := make(chan struct{})
 			go func() {
 				if err := cmd.Wait(); err != nil {
-					log.WithError(err).Warn("Envoy: Proxy crashed")
+					o.logger.Warn("Envoy: Proxy crashed",
+						logfields.PID, cmd.Process.Pid,
+						logfields.Error, err,
+					)
 					// Avoid busy loop & hogging CPU resources by waiting before restarting envoy.
 					time.Sleep(100 * time.Millisecond)
+				} else {
+					o.logger.Info("Envoy: Proxy terminated",
+						logfields.PID, cmd.Process.Pid,
+					)
 				}
 				close(crashCh)
 			}()
@@ -195,12 +242,18 @@ func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
 				// Start Envoy again
 				continue
 			case <-envoy.stopCh:
-				log.Infof("Envoy: Stopping proxy with pid %d", cmd.Process.Pid)
+				o.logger.Info("Envoy: Stopping embedded Envoy proxy",
+					logfields.PID, cmd.Process.Pid,
+				)
 				if err := envoy.admin.quit(); err != nil {
-					log.WithError(err).Fatalf("Envoy: Envoy admin quit failed, killing process with pid %d", cmd.Process.Pid)
-
+					o.logger.Error("Envoy: Envoy admin quit failed, killing process",
+						logfields.PID, cmd.Process.Pid,
+						logfields.Error, err,
+					)
 					if err := cmd.Process.Kill(); err != nil {
-						log.WithError(err).Fatal("Envoy: Stopping Envoy failed")
+						o.logger.Error("Envoy: Stopping Envoy failed",
+							logfields.Error, err,
+						)
 						envoy.errCh <- err
 					}
 				}
@@ -218,66 +271,67 @@ func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
 }
 
 // newEnvoyLogPiper creates a writer that parses and logs log messages written by Envoy.
-func newEnvoyLogPiper() io.WriteCloser {
+func (o *onDemandXdsStarter) newEnvoyLogPiper() io.WriteCloser {
 	reader, writer := io.Pipe()
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(nil, 1024*1024)
 	go func() {
-		scopedLog := log.WithFields(logrus.Fields{
-			logfields.LogSubsys: "unknown",
-			logfields.ThreadID:  "unknown",
-		})
-		level := "debug"
-
 		for scanner.Scan() {
 			line := scanner.Text()
-			var msg string
+
+			logThreadID := "unknown"
+			logLevel := "debug"
+			logSubsys := "unknown"
+			logMsg := ""
 
 			parts := strings.SplitN(line, "|", 4)
 			// Parse the line as a log message written by Envoy, assuming it
 			// uses the configured format: "%t|%l|%n|%v".
 			if len(parts) == 4 {
-				threadID := parts[0]
-				level = parts[1]
-				loggerName := parts[2]
+				logThreadID = parts[0]
+				logLevel = parts[1]
+				logSubsys = fmt.Sprintf("envoy-%s", parts[2])
 				// TODO: Parse msg to extract the source filename, line number, etc.
-				msg = fmt.Sprintf("[%s", parts[3])
-
-				scopedLog = log.WithFields(logrus.Fields{
-					logfields.LogSubsys: fmt.Sprintf("envoy-%s", loggerName),
-					logfields.ThreadID:  threadID,
-				})
+				logMsg = fmt.Sprintf("[%s", parts[3])
 			} else {
 				// If this line can't be parsed, it continues a multi-line log
 				// message. In this case, log it at the same level and with the
 				// same fields as the previous line.
-				msg = line
+				logMsg = line
 			}
 
-			if len(msg) == 0 {
+			scopedLog := o.logger.With(
+				logfields.LogSubsys, logSubsys,
+				logfields.ThreadID, logThreadID,
+			)
+
+			if len(logMsg) == 0 {
 				continue
 			}
 
 			// Map the Envoy log level to a logrus level.
-			switch level {
-			case "off", "critical", "error":
-				scopedLog.Error(msg)
-			case "warning":
-				if !tracing && (strings.Contains(msg, "Usage of the deprecated runtime key overload.global_downstream_max_connections, consider switching to `envoy.resource_monitors.downstream_connections` instead.This runtime key will be removed in future.") ||
-					strings.Contains(msg, "There is no configured limit to the number of allowed active downstream connections. Configure a limit in `envoy.resource_monitors.downstream_connections` resource monitor.")) {
+			switch logLevel {
+			case envoyLogLevelOff, envoyLogLevelCritical, envoyLogLevelError:
+				scopedLog.Error(logMsg)
+			case envoyLogLevelWarning:
+				// Demote expected warnings to info level
+				if strings.Contains(logMsg, "gRPC config: initial fetch timed out for") {
+					scopedLog.Info(logMsg)
 					continue
 				}
-				scopedLog.Warn(msg)
-			case "info":
-				scopedLog.Info(msg)
-			case "debug", "trace":
-				scopedLog.Debug(msg)
+				scopedLog.Warn(logMsg)
+			case envoyLogLevelInfo:
+				scopedLog.Info(logMsg)
+			case envoyLogLevelDebug, envoyLogLevelTrace:
+				scopedLog.Debug(logMsg)
 			default:
-				scopedLog.Debug(msg)
+				scopedLog.Debug(logMsg)
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			log.WithError(err).Error("Error while parsing Envoy logs")
+			o.logger.Error("Error while parsing Envoy logs",
+				logfields.Error, err,
+			)
 		}
 		reader.Close()
 	}()
@@ -311,9 +365,10 @@ type bootstrapConfig struct {
 	maxRequestsPerConnection uint32
 	maxConnectionDuration    time.Duration
 	idleTimeout              time.Duration
+	maxConcurrentRetries     uint32
 }
 
-func writeBootstrapConfigFile(config bootstrapConfig) {
+func (o *onDemandXdsStarter) writeBootstrapConfigFile(config bootstrapConfig) {
 	useDownstreamProtocol := map[string]*anypb.Any{
 		"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": toAny(&envoy_config_upstream.HttpProtocolOptions{
 			CommonHttpProtocolOptions: &envoy_config_core.HttpProtocolOptions{
@@ -355,6 +410,12 @@ func writeBootstrapConfigFile(config bootstrapConfig) {
 		}),
 	}
 
+	clusterRetryLimits := &envoy_config_cluster.CircuitBreakers{
+		Thresholds: []*envoy_config_cluster.CircuitBreakers_Thresholds{{
+			MaxRetries: &wrapperspb.UInt32Value{Value: config.maxConcurrentRetries},
+		}},
+	}
+
 	bs := &envoy_config_bootstrap.Bootstrap{
 		Node: &envoy_config_core.Node{Id: config.nodeId, Cluster: config.cluster},
 		StaticResources: &envoy_config_bootstrap.Bootstrap_StaticResources{
@@ -366,6 +427,7 @@ func writeBootstrapConfigFile(config bootstrapConfig) {
 					CleanupInterval:               &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 500000000},
 					LbPolicy:                      envoy_config_cluster.Cluster_CLUSTER_PROVIDED,
 					TypedExtensionProtocolOptions: useDownstreamProtocol,
+					CircuitBreakers:               clusterRetryLimits,
 				},
 				{
 					Name:                          egressTLSClusterName,
@@ -467,30 +529,32 @@ func writeBootstrapConfigFile(config bootstrapConfig) {
 				TypedConfig: toAny(&envoy_extensions_bootstrap_internal_listener_v3.InternalListener{}),
 			},
 		},
-		LayeredRuntime: &envoy_config_bootstrap.LayeredRuntime{
-			Layers: []*envoy_config_bootstrap.RuntimeLayer{
-				{
-					Name: "static_layer_0",
-					LayerSpecifier: &envoy_config_bootstrap.RuntimeLayer_StaticLayer{
-						StaticLayer: &structpb.Struct{Fields: map[string]*structpb.Value{
-							"overload": {Kind: &structpb.Value_StructValue{StructValue: &structpb.Struct{Fields: map[string]*structpb.Value{
-								"global_downstream_max_connections": {Kind: &structpb.Value_NumberValue{NumberValue: 50000}},
-							}}}},
-						}},
-					},
+		OverloadManager: &envoy_config_overload.OverloadManager{
+			ResourceMonitors: []*envoy_config_overload.ResourceMonitor{{
+				Name: "envoy.resource_monitors.global_downstream_max_connections",
+				ConfigType: &envoy_config_overload.ResourceMonitor_TypedConfig{
+					TypedConfig: toAny(&envoy_extensions_resource_monitors_downstream_connections.DownstreamConnectionsConfig{
+						MaxActiveDownstreamConnections: maxActiveDownstreamConnections,
+					}),
 				},
-			},
+			}},
 		},
 	}
 
-	log.Debugf("Envoy: Bootstrap: %s", bs)
+	o.logger.Debug("Envoy: Writing Bootstrap config",
+		logfields.Resource, bs,
+	)
 	data, err := proto.Marshal(bs)
 	if err != nil {
-		log.WithError(err).Fatal("Envoy: Error marshaling Envoy bootstrap")
+		o.logger.Error("Envoy: Error marshaling Envoy bootstrap",
+			logfields.Error, err,
+		)
+		return
 	}
-	err = os.WriteFile(config.filePath, data, 0644)
-	if err != nil {
-		log.WithError(err).Fatal("Envoy: Error writing Envoy bootstrap file")
+	if err := os.WriteFile(config.filePath, data, 0644); err != nil {
+		o.logger.Error("Envoy: Error writing Envoy bootstrap file",
+			logfields.Error, err,
+		)
 	}
 }
 

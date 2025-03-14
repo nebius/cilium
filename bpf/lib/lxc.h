@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_LXC_H_
-#define __LIB_LXC_H_
+#pragma once
 
 #include "common.h"
 #include "utils.h"
@@ -15,8 +14,6 @@
 #include "l4.h"
 #include "proxy.h"
 #include "proxy_hairpin.h"
-
-#define TEMPLATE_LXC_ID 0xffff
 
 #ifdef ENABLE_SIP_VERIFICATION
 static __always_inline
@@ -56,5 +53,3 @@ int is_valid_lxc_src_ipv4(struct iphdr *ip4 __maybe_unused)
 	return 1;
 }
 #endif /* ENABLE_SIP_VERIFICATION */
-
-#endif /* __LIB_LXC_H_ */

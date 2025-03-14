@@ -7,11 +7,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
+
+	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/api/v1/server"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/lock/lockfile"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/promise"
@@ -25,26 +27,38 @@ var deletionQueueCell = cell.Group(
 type deletionQueue struct {
 	lf            *lockfile.Lockfile
 	daemonPromise promise.Promise[*Daemon]
+	wg            sync.WaitGroup
 }
 
-func (dq *deletionQueue) Start(ctx cell.HookContext) error {
-	d, err := dq.daemonPromise.Await(ctx)
-	if err != nil {
-		return err
-	}
+func (dq *deletionQueue) Start(cell.HookContext) error {
+	dq.wg.Add(1)
+	go func() {
+		defer dq.wg.Done()
 
-	if err := dq.lock(ctx); err != nil {
-		return err
-	}
+		// hook context cancels when the start hooks have run, use context.Background()
+		// as we may be running after that.
+		d, err := dq.daemonPromise.Await(context.Background())
+		if err != nil {
+			log.WithError(err).Error("deletionQueue: Daemon promise failed")
+			return
+		}
 
-	bootstrapStats.deleteQueue.Start()
-	err = dq.processQueuedDeletes(d, ctx)
-	bootstrapStats.deleteQueue.EndError(err)
-	return err
+		if err := dq.lock(d.ctx); err != nil {
+			return
+		}
 
+		bootstrapStats.deleteQueue.Start()
+		err = dq.processQueuedDeletes(d, d.ctx)
+		bootstrapStats.deleteQueue.EndError(err)
+		if err != nil {
+			log.WithError(err).Error("deletionQueue: processQueuedDeletes failed")
+		}
+	}()
+	return nil
 }
 
-func (dq *deletionQueue) Stop(ctx cell.HookContext) error {
+func (dq *deletionQueue) Stop(cell.HookContext) error {
+	dq.wg.Wait()
 	return nil
 }
 
@@ -57,20 +71,24 @@ func newDeletionQueue(lc cell.Lifecycle, p promise.Promise[*Daemon]) *deletionQu
 func (dq *deletionQueue) lock(ctx context.Context) error {
 	if err := os.MkdirAll(defaults.DeleteQueueDir, 0755); err != nil {
 		log.WithError(err).WithField(logfields.Path, defaults.DeleteQueueDir).Error("Failed to ensure CNI deletion queue directory exists")
-		return nil
+		// Return error to avoid attempting successive df.processQueuedDeletes accessing
+		// defaults.DeleteQueueLockfile and erroring because of the non-existent directory.
+		return err
 	}
 
+	// Don't return a non-nil error from here on so a successive call to dq.processQueuedDeletes
+	// can still continue with best effort.
 	var err error
 	dq.lf, err = lockfile.NewLockfile(defaults.DeleteQueueLockfile)
 	if err != nil {
 		log.WithError(err).WithField(logfields.Path, defaults.DeleteQueueLockfile).Warn("Failed to lock queued deletion directory, proceeding anyways. This may cause CNI deletions to be missed.")
-	} else {
-		err = dq.lf.Lock(ctx, true)
-		if err != nil {
-			log.WithError(err).WithField(logfields.Path, defaults.DeleteQueueLockfile).Warn("Failed to lock queued deletion directory, proceeding anyways. This may cause CNI deletions to be missed.")
-			dq.lf.Close()
-			dq.lf = nil
-		}
+		return nil
+	}
+
+	if err = dq.lf.Lock(ctx, true); err != nil {
+		log.WithError(err).WithField(logfields.Path, defaults.DeleteQueueLockfile).Warn("Failed to lock queued deletion directory, proceeding anyways. This may cause CNI deletions to be missed.")
+		dq.lf.Close()
+		dq.lf = nil
 	}
 	return nil
 }

@@ -7,13 +7,11 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/clustermesh"
 	"github.com/cilium/cilium/pkg/clustermesh/wait"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -22,35 +20,22 @@ var (
 		"endpoint-regeneration",
 		"Endpoints regeneration",
 
-		cell.Config(RegeneratorConfigDefault),
 		cell.Provide(newRegenerator),
 	)
 )
 
+// KVStoreNodesWaitFn is the type of the function used to wait for synchronization
+// of all nodes from the kvstore.
+type KVStoreNodesWaitFn wait.Fn
+
 // Regenerator wraps additional functionalities for endpoint regeneration.
 type Regenerator struct {
-	RegeneratorConfig
-
-	cmWaitFn wait.Fn
+	nodesWaitFn   KVStoreNodesWaitFn
+	cmWaitFn      wait.Fn
+	cmWaitTimeout time.Duration
 
 	logger        logrus.FieldLogger
 	cmSyncLogOnce sync.Once
-}
-
-type RegeneratorConfig struct {
-	// ClusterMeshIPIdentitiesSyncTimeout is the timeout when waiting for the
-	// initial synchronization of ipcache entries and identities from all remote
-	// clusters before regenerating the local endpoints.
-	ClusterMeshIPIdentitiesSyncTimeout time.Duration
-}
-
-func (def RegeneratorConfig) Flags(flags *pflag.FlagSet) {
-	flags.Duration("clustermesh-ip-identities-sync-timeout", def.ClusterMeshIPIdentitiesSyncTimeout,
-		"Timeout waiting for the initial synchronization of IPs and identities from remote clusters before local endpoints regeneration")
-}
-
-var RegeneratorConfigDefault = RegeneratorConfig{
-	ClusterMeshIPIdentitiesSyncTimeout: 1 * time.Minute,
 }
 
 func newRegenerator(in struct {
@@ -58,7 +43,8 @@ func newRegenerator(in struct {
 
 	Logger logrus.FieldLogger
 
-	Config      RegeneratorConfig
+	Config      wait.TimeoutConfig
+	NodesWaitFn KVStoreNodesWaitFn
 	ClusterMesh *clustermesh.ClusterMesh
 }) *Regenerator {
 	waitFn := func(context.Context) error { return nil }
@@ -67,29 +53,19 @@ func newRegenerator(in struct {
 	}
 
 	return &Regenerator{
-		RegeneratorConfig: in.Config,
-		logger:            in.Logger,
-		cmWaitFn:          waitFn,
+		logger:        in.Logger,
+		nodesWaitFn:   in.NodesWaitFn,
+		cmWaitFn:      waitFn,
+		cmWaitTimeout: in.Config.ClusterMeshSyncTimeout,
 	}
 }
 
-// CapTimeoutForSynchronousRegeneration caps the timeout to a value suitable in
-// case the regeneration of an endpoint needs to be performed synchronously
-// (currently required when IPSec is enabled). In particular, this is necessary
-// to not block the agent bootstrap, as that prevents the scheduling of new
-// workloads. This logic is implemented as a separate function to avoid
-// forgetting to remove it when the synchronous regeneration is removed.
-func (r *Regenerator) CapTimeoutForSynchronousRegeneration() {
-	const maxTimeout = 5 * time.Second
-	if r.ClusterMeshIPIdentitiesSyncTimeout > maxTimeout {
-		r.ClusterMeshIPIdentitiesSyncTimeout = maxTimeout
-		r.logger.WithField(logfields.Value, maxTimeout).
-			Info("Capped clustermesh-ip-identities-sync-timeout because endpoint regeneration needs to be performed synchronously")
-	}
+func (r *Regenerator) WaitForKVStoreNodesSync(ctx context.Context) error {
+	return r.nodesWaitFn(ctx)
 }
 
 func (r *Regenerator) WaitForClusterMeshIPIdentitiesSync(ctx context.Context) error {
-	wctx, cancel := context.WithTimeout(ctx, r.ClusterMeshIPIdentitiesSyncTimeout)
+	wctx, cancel := context.WithTimeout(ctx, r.cmWaitTimeout)
 	defer cancel()
 	err := r.cmWaitFn(wctx)
 

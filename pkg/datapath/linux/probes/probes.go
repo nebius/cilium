@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,14 +20,16 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/features"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/cilium/ebpf/link"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/command/exec"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/netns"
 )
 
 var (
@@ -390,6 +393,13 @@ func HaveFibIfindex() error {
 	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnRedirectPeer)
 }
 
+// HaveWriteableQueueMapping checks if kernel has 74e31ca850c1 ("bpf: add
+// skb->queue_mapping write access from tc clsact") which is 5.1+. This got merged
+// in the same kernel as the bpf_skb_ecn_set_ce() helper.
+func HaveWriteableQueueMapping() error {
+	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnSkbEcnSetCe)
+}
+
 // HaveV2ISA is a wrapper around features.HaveV2ISA() to check if the kernel
 // supports the V2 ISA.
 // On unexpected probe results this function will terminate with log.Fatal().
@@ -418,68 +428,92 @@ func HaveV3ISA() error {
 	return nil
 }
 
-// HaveOuterSourceIPSupport tests whether the kernel support setting the outer
-// source IP address via the bpf_skb_set_tunnel_key BPF helper. We can't rely
-// on the verifier to reject a program using the new support because the
-// verifier just accepts any argument size for that helper; non-supported
-// fields will simply not be used. Instead, we set the outer source IP and
-// retrieve it with bpf_skb_get_tunnel_key right after. If the retrieved value
-// equals the value set, we have a confirmation the kernel supports it.
-func HaveOuterSourceIPSupport() (err error) {
-	defer func() {
-		if err != nil && !errors.Is(err, ebpf.ErrNotSupported) {
-			log.WithError(err).Fatal("failed to probe for outer source IP support")
-		}
-	}()
-
-	progSpec := &ebpf.ProgramSpec{
-		Name:    "set_tunnel_key_probe",
-		Type:    ebpf.SchedACT,
-		License: "GPL",
-	}
-	progSpec.Instructions = asm.Instructions{
-		asm.Mov.Reg(asm.R8, asm.R1),
-
-		asm.Mov.Imm(asm.R2, 0),
-		asm.StoreMem(asm.RFP, -8, asm.R2, asm.DWord),
-		asm.StoreMem(asm.RFP, -16, asm.R2, asm.DWord),
-		asm.StoreMem(asm.RFP, -24, asm.R2, asm.DWord),
-		asm.StoreMem(asm.RFP, -32, asm.R2, asm.DWord),
-		asm.StoreMem(asm.RFP, -40, asm.R2, asm.DWord),
-		asm.Mov.Imm(asm.R2, 42),
-		asm.StoreMem(asm.RFP, -44, asm.R2, asm.Word),
-		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -44),
-		asm.Mov.Imm(asm.R3, 44), // sizeof(struct bpf_tunnel_key) when setting the outer source IP is supported.
-		asm.Mov.Imm(asm.R4, 0),
-		asm.FnSkbSetTunnelKey.Call(),
-
-		asm.Mov.Reg(asm.R1, asm.R8),
-		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -44),
-		asm.Mov.Imm(asm.R3, 44),
-		asm.Mov.Imm(asm.R4, 0),
-		asm.FnSkbGetTunnelKey.Call(),
-
-		asm.LoadMem(asm.R0, asm.RFP, -44, asm.Word),
-		asm.Return(),
-	}
-	prog, err := ebpf.NewProgram(progSpec)
+// HaveTCX returns nil if the running kernel supports attaching bpf programs to
+// tcx hooks.
+var HaveTCX = sync.OnceValue(func() error {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+		License: "Apache-2.0",
+	})
 	if err != nil {
 		return err
 	}
 	defer prog.Close()
 
-	pkt := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-	ret, _, err := prog.Test(pkt)
+	ns, err := netns.New()
+	if err != nil {
+		return fmt.Errorf("create netns: %w", err)
+	}
+	defer ns.Close()
+
+	// link.AttachTCX already performs its own feature detection and returns
+	// ebpf.ErrNotSupported if the host kernel doesn't have tcx.
+	return ns.Do(func() error {
+		l, err := link.AttachTCX(link.TCXOptions{
+			Program:   prog,
+			Attach:    ebpf.AttachTCXIngress,
+			Interface: 1, // lo
+			Anchor:    link.Tail(),
+		})
+		if err != nil {
+			return fmt.Errorf("creating link: %w", err)
+		}
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("closing link: %w", err)
+		}
+
+		return nil
+	})
+})
+
+// HaveNetkit returns nil if the running kernel supports attaching bpf programs
+// to netkit devices.
+var HaveNetkit = sync.OnceValue(func() error {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+		License: "Apache-2.0",
+	})
 	if err != nil {
 		return err
 	}
-	if ret != 42 {
-		return ebpf.ErrNotSupported
+	defer prog.Close()
+
+	ns, err := netns.New()
+	if err != nil {
+		return fmt.Errorf("create netns: %w", err)
 	}
-	return nil
-}
+	defer ns.Close()
+
+	return ns.Do(func() error {
+		l, err := link.AttachNetkit(link.NetkitOptions{
+			Program:   prog,
+			Attach:    ebpf.AttachNetkitPrimary,
+			Interface: math.MaxInt,
+		})
+		// We rely on this being checked during the syscall. With
+		// an otherwise correct payload we expect ENODEV here as
+		// an indication that the feature is present.
+		if errors.Is(err, unix.ENODEV) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("creating link: %w", err)
+		}
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("closing link: %w", err)
+		}
+
+		return fmt.Errorf("unexpected success: %w", err)
+	})
+})
 
 // HaveSKBAdjustRoomL2RoomMACSupport tests whether the kernel supports the `bpf_skb_adjust_room` helper
 // with the `BPF_ADJ_ROOM_MAC` mode. To do so, we create a program that requests the passed in SKB
@@ -648,13 +682,10 @@ func ExecuteHeaderProbes() *FeatureProbes {
 		// common probes
 		{ebpf.CGroupSock, asm.FnGetNetnsCookie},
 		{ebpf.CGroupSockAddr, asm.FnGetNetnsCookie},
-		{ebpf.CGroupSockAddr, asm.FnGetSocketCookie},
 		{ebpf.CGroupSock, asm.FnJiffies64},
 		{ebpf.CGroupSockAddr, asm.FnJiffies64},
 		{ebpf.SchedCLS, asm.FnJiffies64},
 		{ebpf.XDP, asm.FnJiffies64},
-		{ebpf.CGroupSockAddr, asm.FnSkLookupTcp},
-		{ebpf.CGroupSockAddr, asm.FnSkLookupUdp},
 		{ebpf.CGroupSockAddr, asm.FnGetCurrentCgroupId},
 		{ebpf.CGroupSock, asm.FnSetRetval},
 		{ebpf.SchedCLS, asm.FnRedirectNeigh},
@@ -683,7 +714,6 @@ func writeCommonHeader(writer io.Writer, probes *FeatureProbes) error {
 	features := map[string]bool{
 		"HAVE_NETNS_COOKIE": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnGetNetnsCookie}] &&
 			probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetNetnsCookie}],
-		"HAVE_SOCKET_COOKIE": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetSocketCookie}],
 		"HAVE_JIFFIES": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnJiffies64}] &&
 			probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnJiffies64}] &&
 			probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnJiffies64}] &&
@@ -730,5 +760,29 @@ func writeFeatureHeader(writer io.Writer, features map[string]bool, common bool)
 		return fmt.Errorf("could not write template: %w", err)
 	}
 
+	return nil
+}
+
+// HaveBatchAPI checks if kernel supports batched bpf map lookup API.
+func HaveBatchAPI() error {
+	spec := ebpf.MapSpec{
+		Type:       ebpf.LRUHash,
+		KeySize:    1,
+		ValueSize:  1,
+		MaxEntries: 2,
+	}
+	m, err := ebpf.NewMapWithOptions(&spec, ebpf.MapOptions{})
+	if err != nil {
+		return ErrNotSupported
+	}
+	defer m.Close()
+	var cursor ebpf.MapBatchCursor
+	_, err = m.BatchLookup(&cursor, []byte{0}, []byte{0}, nil) // only do one batched lookup
+	if err != nil {
+		if errors.Is(err, ebpf.ErrNotSupported) {
+			return ErrNotSupported
+		}
+		return nil
+	}
 	return nil
 }

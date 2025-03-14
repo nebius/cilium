@@ -6,6 +6,7 @@ package endpointslicesync
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"maps"
 	"strings"
 	"sync/atomic"
@@ -16,15 +17,13 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	discoveryinformers "k8s.io/client-go/informers/discovery/v1"
-	discoveryv1 "k8s.io/client-go/kubernetes/typed/discovery/v1"
 	listersv1 "k8s.io/client-go/listers/core/v1"
-	discoverylisters "k8s.io/client-go/listers/discovery/v1"
-	cache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/cache"
 	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
 
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/clustermesh/common"
+	"github.com/cilium/cilium/pkg/k8s"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	"github.com/cilium/cilium/pkg/service/store"
@@ -46,12 +45,11 @@ const (
 type meshServiceInformer struct {
 	dummyInformer
 
+	logger             *slog.Logger
 	globalServiceCache *common.GlobalServiceCache
 	services           resource.Resource[*slim_corev1.Service]
 	serviceStore       resource.Store[*slim_corev1.Service]
-
-	discoveryClient     discoveryv1.DiscoveryV1Interface
-	endpointSliceLister discoverylisters.EndpointSliceLister
+	meshNodeInformer   *meshNodeInformer
 
 	servicesSynced atomic.Bool
 	handler        cache.ResourceEventHandler
@@ -72,18 +70,18 @@ func doesServiceSyncEndpointSlice(svc *slim_corev1.Service) bool {
 	}
 
 	value, ok = annotation.Get(svc, annotation.GlobalServiceSyncEndpointSlices)
-	if !ok || strings.ToLower(value) != "true" {
-		return false
+	if !ok {
+		// If the service is headless we sync the EndpointSlice by default
+		return svc.Spec.ClusterIP == v1.ClusterIPNone
 	}
-
-	return true
+	return strings.ToLower(value) == "true"
 }
 
-func (i *meshServiceInformer) refreshAllCluster(svc *slim_corev1.Service) error {
+func (i *meshServiceInformer) refreshAllCluster(svc *slim_corev1.Service) {
 	if i.handler == nil {
 		// We don't really need to return an error here as this means that the EndpointSlice controller
 		// has not started yet and the controller will resync the initial state anyway
-		return nil
+		return
 	}
 
 	if globalSvc := i.globalServiceCache.GetGlobalService(types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}); globalSvc != nil {
@@ -95,35 +93,33 @@ func (i *meshServiceInformer) refreshAllCluster(svc *slim_corev1.Service) error 
 			}
 		}
 	}
-
-	return nil
 }
 
 func newMeshServiceInformer(
+	logger *slog.Logger,
 	globalServiceCache *common.GlobalServiceCache,
 	services resource.Resource[*slim_corev1.Service],
-	discoveryClient discoveryv1.DiscoveryV1Interface,
-	endpointSliceInformer discoveryinformers.EndpointSliceInformer,
+	meshNodeInformer *meshNodeInformer,
 ) *meshServiceInformer {
 	return &meshServiceInformer{
-		dummyInformer:       dummyInformer{"meshServiceInformer"},
-		globalServiceCache:  globalServiceCache,
-		services:            services,
-		discoveryClient:     discoveryClient,
-		endpointSliceLister: endpointSliceInformer.Lister(),
+		dummyInformer:      dummyInformer{name: "meshServiceInformer", logger: logger},
+		logger:             logger,
+		globalServiceCache: globalServiceCache,
+		services:           services,
+		meshNodeInformer:   meshNodeInformer,
 	}
 }
 
 // toKubeServicePort use the clusterSvc to get a list of ServicePort to build
-// the kubernetes (non slim) Service. Note that we cannot use the slim Service to get this
-// as the slim Service trims the TargetPort which we needs inside the EndpointSliceReconciler
+// the kubernetes (non slim) Service. Note that we intentionally not use the local
+// Service to build the port list so that we don't change the remote Cluster Service port
+// list. Also targetPort might be targeting a named port and we currently don't
+// sync the container ports names.
 func toKubeServicePort(clusterSvc *store.ClusterService) []v1.ServicePort {
 	// Merge all the port config into one to get all the possible ports
 	globalPortConfig := store.PortConfiguration{}
 	for _, portConfig := range clusterSvc.Backends {
-		for name, l4Addr := range portConfig {
-			globalPortConfig[name] = l4Addr
-		}
+		maps.Copy(globalPortConfig, portConfig)
 	}
 
 	// Get the ServicePort from the PortConfig
@@ -201,17 +197,36 @@ type meshServiceLister struct {
 	namespace string
 }
 
+// List returns the matrix of all the local services and all the remote clusters.
+// This is not similar to what does the Get method. For instance, List may returns
+// services that could not be found on a call to the Get method.
+// By doing that we can ensure that the controller reconciliation is called
+// on every possible remote services especially the one that are deleted while
+// we still have some EndpointSlices locally (which won't be cleared by the
+// OwnerReference mechanism since our actual local service is not deleted).
 func (l meshServiceLister) List(selector labels.Selector) ([]*v1.Service, error) {
 	reqs, _ := selector.Requirements()
 	if !selector.Empty() {
 		return nil, fmt.Errorf("meshServiceInformer only supports listing everything as requirements: %s", reqs)
 	}
 
-	clusterSvcs := l.informer.globalServiceCache.GetServices(l.namespace)
-	svcs := make([]*v1.Service, 0, len(clusterSvcs))
-	for _, clusterSvc := range clusterSvcs {
-		if svc, err := l.informer.clusterSvcToSvc(clusterSvc, false); err == nil {
-			svcs = append(svcs, svc)
+	originalSvcs, err := l.informer.serviceStore.ByIndex(k8s.NamespaceIndex, l.namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	clusters := l.informer.meshNodeInformer.ListClusters()
+	var svcs []*v1.Service
+	for _, svc := range originalSvcs {
+		for _, cluster := range clusters {
+			dummyClusterSvc := &store.ClusterService{
+				Cluster:   cluster,
+				Name:      svc.Name,
+				Namespace: l.namespace,
+			}
+			if svc, err := l.informer.clusterSvcToSvc(dummyClusterSvc, false); err == nil {
+				svcs = append(svcs, svc)
+			}
 		}
 	}
 
@@ -261,17 +276,16 @@ func (i *meshServiceInformer) Start(ctx context.Context) error {
 
 	go func() {
 		for event := range i.services.Events(ctx) {
-			var err error
 			switch event.Kind {
 			case resource.Sync:
-				log.Debug("Local services are synced")
+				i.logger.Debug("Local services are synced")
 				i.servicesSynced.Store(true)
 			case resource.Upsert:
-				err = i.refreshAllCluster(event.Object)
+				i.refreshAllCluster(event.Object)
 			case resource.Delete:
-				err = i.refreshAllCluster(event.Object)
+				i.refreshAllCluster(event.Object)
 			}
-			event.Done(err)
+			event.Done(nil)
 		}
 	}()
 	return nil
@@ -280,14 +294,16 @@ func (i *meshServiceInformer) Start(ctx context.Context) error {
 func (i *meshServiceInformer) Services(namespace string) listersv1.ServiceNamespaceLister {
 	return &meshServiceLister{informer: i, namespace: namespace}
 }
+
 func (i *meshServiceInformer) Informer() cache.SharedIndexInformer {
 	return i
 }
+
 func (i *meshServiceInformer) Lister() listersv1.ServiceLister {
 	return i
 }
 
 func (i *meshServiceInformer) List(selector labels.Selector) (ret []*v1.Service, err error) {
-	log.Error("called not implemented function meshServiceInformer.List")
+	i.logger.Error("called not implemented function meshServiceInformer.List")
 	return nil, nil
 }

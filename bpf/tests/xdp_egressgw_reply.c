@@ -6,9 +6,6 @@
 #include <bpf/ctx/xdp.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
@@ -22,7 +19,7 @@
 
 #define DISABLE_LOOPBACK_LB
 
-/* Skip ingress policy checks, not needed to validate hairpin flow */
+/* Skip ingress policy checks */
 #define USE_BPF_PROG_FOR_INGRESS_POLICY
 
 #define IPV4_DIRECT_ROUTING	v4_node_one /* gateway node */
@@ -103,7 +100,7 @@ int egressgw_reply_pktgen(struct __ctx_buff *ctx)
 		.to_sport = MASQ_PORT,
 	};
 
-	map_update_elem(&SNAT_MAPPING_IPV4, &tuple, &nat_entry, BPF_ANY);
+	map_update_elem(&cilium_snat_v4_external, &tuple, &nat_entry, BPF_ANY);
 
 	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
 			.test = TEST_XDP_REPLY,
@@ -132,7 +129,7 @@ int egressgw_reply_setup(struct __ctx_buff *ctx)
 		.to_dport = client_port(TEST_XDP_REPLY),
 	};
 
-	map_update_elem(&SNAT_MAPPING_IPV4, &snat_tuple, &snat_entry, BPF_ANY);
+	map_update_elem(&cilium_snat_v4_external, &snat_tuple, &snat_entry, BPF_ANY);
 
 	/* install ipcache entry for the CLIENT_IP: */
 	ipcache_v4_add_entry(CLIENT_IP, 0, 0, CLIENT_NODE_IP, 0);
@@ -205,6 +202,9 @@ int egressgw_reply_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l3->protocol != IPPROTO_UDP)
 		test_fatal("outer IP doesn't have correct L4 protocol")
 
+	if (l3->check != bpf_htons(0x527e))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l3->saddr != IPV4_DIRECT_ROUTING)
 		test_fatal("outerSrcIP is not correct")
 
@@ -225,6 +225,9 @@ int egressgw_reply_check(__maybe_unused const struct __ctx_buff *ctx)
 
 	if (inner_l3->daddr != CLIENT_IP)
 		test_fatal("innerDstIP hasn't been revNATed to the client IP");
+
+	if (inner_l3->check != bpf_htons(0x4212))
+		test_fatal("inner L3 checksum is invalid: %x", bpf_htons(inner_l3->check));
 
 	if (inner_l4->source != EXTERNAL_SVC_PORT)
 		test_fatal("innerSrcPort is not the external SVC port");

@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
@@ -37,7 +38,7 @@ func NewDedicatedIngressTranslator(cecTranslator translation.CECTranslator, host
 }
 
 func (d *dedicatedIngressTranslator) Translate(m *model.Model) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, *corev1.Endpoints, error) {
-	if m == nil || (len(m.HTTP) == 0 && len(m.TLS) == 0) {
+	if m == nil || (len(m.HTTP) == 0 && len(m.TLSPassthrough) == 0) {
 		return nil, nil, nil, fmt.Errorf("model source can't be empty")
 	}
 
@@ -46,13 +47,15 @@ func (d *dedicatedIngressTranslator) Translate(m *model.Model) (*ciliumv2.Cilium
 	var sourceResource model.FullyQualifiedResource
 	var modelService *model.Service
 	var cecName string
+	var tlsOnly bool
 
 	if len(m.HTTP) == 0 {
-		name = fmt.Sprintf("%s-%s", ciliumIngressPrefix, m.TLS[0].Sources[0].Name)
-		namespace = m.TLS[0].Sources[0].Namespace
-		sourceResource = m.TLS[0].Sources[0]
-		modelService = m.TLS[0].Service
-		cecName = fmt.Sprintf("%s-%s-%s", ciliumIngressPrefix, namespace, m.TLS[0].Sources[0].Name)
+		name = fmt.Sprintf("%s-%s", ciliumIngressPrefix, m.TLSPassthrough[0].Sources[0].Name)
+		namespace = m.TLSPassthrough[0].Sources[0].Namespace
+		sourceResource = m.TLSPassthrough[0].Sources[0]
+		modelService = m.TLSPassthrough[0].Service
+		cecName = fmt.Sprintf("%s-%s-%s", ciliumIngressPrefix, namespace, m.TLSPassthrough[0].Sources[0].Name)
+		tlsOnly = true
 	} else {
 		name = fmt.Sprintf("%s-%s", ciliumIngressPrefix, m.HTTP[0].Sources[0].Name)
 		namespace = m.HTTP[0].Sources[0].Namespace
@@ -71,27 +74,40 @@ func (d *dedicatedIngressTranslator) Translate(m *model.Model) (*ciliumv2.Cilium
 	// Set the name to avoid any breaking change during upgrade.
 	cec.Name = cecName
 
-	return cec, d.getService(sourceResource, modelService), getEndpoints(sourceResource), err
+	dedicatedService := d.getService(sourceResource, modelService, tlsOnly)
+
+	return cec, dedicatedService, getEndpoints(sourceResource), err
 }
 
-func (d *dedicatedIngressTranslator) getService(resource model.FullyQualifiedResource, service *model.Service) *corev1.Service {
+func (d *dedicatedIngressTranslator) getService(resource model.FullyQualifiedResource, service *model.Service, tlsOnly bool) *corev1.Service {
 	serviceType := corev1.ServiceTypeLoadBalancer
 	clusterIP := ""
 	if d.hostNetworkEnabled {
 		serviceType = corev1.ServiceTypeClusterIP
 	}
 
-	ports := []corev1.ServicePort{
-		{
-			Name:     "http",
-			Protocol: "TCP",
-			Port:     80,
-		},
-		{
-			Name:     "https",
-			Protocol: "TCP",
-			Port:     443,
-		},
+	var ports []corev1.ServicePort
+	if tlsOnly {
+		ports = []corev1.ServicePort{
+			{
+				Name:     "https",
+				Protocol: "TCP",
+				Port:     443,
+			},
+		}
+	} else {
+		ports = []corev1.ServicePort{
+			{
+				Name:     "http",
+				Protocol: "TCP",
+				Port:     80,
+			},
+			{
+				Name:     "https",
+				Protocol: "TCP",
+				Port:     443,
+			},
+		}
 	}
 
 	if service != nil {
@@ -123,7 +139,7 @@ func (d *dedicatedIngressTranslator) getService(resource model.FullyQualifiedRes
 					Kind:       "Ingress",
 					Name:       resource.Name,
 					UID:        types.UID(resource.UID),
-					Controller: model.AddressOf(true),
+					Controller: ptr.To(true),
 				},
 			},
 		},
@@ -147,7 +163,7 @@ func getEndpoints(resource model.FullyQualifiedResource) *corev1.Endpoints {
 					Kind:       "Ingress",
 					Name:       resource.Name,
 					UID:        types.UID(resource.UID),
-					Controller: model.AddressOf(true),
+					Controller: ptr.To(true),
 				},
 			},
 		},

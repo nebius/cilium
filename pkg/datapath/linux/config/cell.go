@@ -4,25 +4,27 @@
 package config
 
 import (
-	"github.com/sirupsen/logrus"
+	"log/slog"
+
+	"github.com/cilium/hive/cell"
 
 	dpdef "github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/maglev"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 )
 
 type WriterParams struct {
 	cell.In
 
-	Log                logrus.FieldLogger
+	Log                *slog.Logger
 	NodeMap            nodemap.MapV2
 	NodeAddressing     datapath.NodeAddressing
 	NodeExtraDefines   []dpdef.Map `group:"header-node-defines"`
 	NodeExtraDefineFns []dpdef.Fn  `group:"header-node-define-fns"`
-	BandwidthManager   datapath.BandwidthManager
 	Sysctl             sysctl.Sysctl
+	Maglev             *maglev.Maglev
 }
 
 var Cell = cell.Module(

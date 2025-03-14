@@ -95,14 +95,14 @@ Ubuntu_                    >= 20.04
           GitHub issue or by creating a pull request that updates this guide.
 
 
-Flatcar
-~~~~~~~
+Flatcar on AWS EKS in ENI mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Flatcar is known to manipulate network interfaces created and managed by
-Cilium. This is especially true in the official Flatcar image for AWS EKS, and
-causes connectivity issues and potentially prevents the Cilium agent from
-booting when Cilium is running in ENI mode. To avoid this, disable DHCP on
-these interfaces and mark them as unmanaged by adding
+Cilium. When running the official Flatcar image for AWS EKS nodes in ENI
+mode, this may cause connectivity issues and potentially prevent the Cilium
+agent from booting. To avoid this, disable DHCP on the ENI interfaces and mark
+them as unmanaged by adding
 
 .. code-block:: text
 
@@ -144,7 +144,7 @@ subsystems which integrate with eBPF. Therefore, host systems are required to
 run a recent Linux kernel to run a Cilium agent. More recent kernels may
 provide additional eBPF functionality that Cilium will automatically detect and
 use on agent start. For this version of Cilium, it is recommended to use kernel
-4.19.57 or later (or equivalent such as 4.18 on RHEL8). For a list of features
+5.4 or later (or equivalent such as 4.18 on RHEL8). For a list of features
 that require newer kernels, see :ref:`advanced_features`.
 
 In order for the eBPF feature to be enabled properly, the following kernel
@@ -190,6 +190,7 @@ configuration must include the following modules:
 ::
 
         CONFIG_NETFILTER_XT_TARGET_TPROXY=m
+        CONFIG_NETFILTER_XT_TARGET_MARK=m
         CONFIG_NETFILTER_XT_TARGET_CT=m
         CONFIG_NETFILTER_XT_MATCH_MARK=m
         CONFIG_NETFILTER_XT_MATCH_SOCKET=m
@@ -202,9 +203,9 @@ to allow L7 policies and visibility to be used with those
 kernels. Currently this fallback disables ``ip_early_demux`` kernel
 feature in non-tunneled datapath modes, which may decrease system
 networking performance. This guarantees HTTP and Kafka redirection
-works as intended.  However, if HTTP or Kafka enforcement policies or
-visibility annotations are never used, this behavior can be turned off
-by adding the following to the helm configuration command line:
+works as intended.  However, if HTTP or Kafka enforcement policies are
+never used, this behavior can be turned off by adding the following to
+the helm configuration command line:
 
 .. parsed-literal::
 
@@ -253,6 +254,16 @@ to change the packet scheduling algorithm.
 
         CONFIG_NET_SCH_FQ=m
 
+Requirements for Netkit Device Mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The :ref:`netkit` requires the following kernel configuration option
+to create netkit devices.
+
+::
+
+        CONFIG_NETKIT=y
+
 .. _advanced_features:
 
 Required Kernel Versions for Advanced Features
@@ -265,16 +276,15 @@ enabled by upgrading to more recent kernel versions as detailed below.
 ====================================================== ===============================
 Cilium Feature                                         Minimum Kernel Version
 ====================================================== ===============================
-:ref:`bandwidth-manager`                               >= 5.1
-:ref:`egress-gateway`                                  >= 5.2
-VXLAN Tunnel Endpoint (VTEP) Integration               >= 5.2
 :ref:`encryption_wg`                                   >= 5.6
 Full support for :ref:`session-affinity`               >= 5.7
 BPF-based proxy redirection                            >= 5.7
 Socket-level LB bypass in pod netns                    >= 5.7
 L3 devices                                             >= 5.8
 BPF-based host routing                                 >= 5.10
+:ref:`enable_multicast` (AMD64)                        >= 5.10
 IPv6 BIG TCP support                                   >= 5.19
+:ref:`enable_multicast` (AArch64)                      >= 6.0
 IPv4 BIG TCP support                                   >= 6.3
 ====================================================== ===============================
 
@@ -332,14 +342,11 @@ to enable health monitoring. If the firewall does not permit either of these
 methods, Cilium will still operate fine but will not be able to provide health
 information.
 
-For IPSec enabled Cilium deployments, you need to ensure that the firewall
+For IPsec enabled Cilium deployments, you need to ensure that the firewall
 allows ESP traffic through. For example, AWS Security Groups doesn't allow ESP
 traffic by default.
 
-If you are using WireGuard, you must allow UDP port 51871. Furthermore, if you
-have disabled node-to-node encryption and configured an overlay network mode
-(such as VXLAN or Geneve) in addition to WireGuard, then the overlay ports must
-also be allowed.
+If you are using WireGuard, you must allow UDP port 51871.
 
 If you are using VXLAN overlay network mode, Cilium uses Linux's default VXLAN
 port 8472 over UDP, unless Linux has been configured otherwise. In this case,

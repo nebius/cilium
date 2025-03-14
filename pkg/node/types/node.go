@@ -5,8 +5,10 @@ package types
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"path"
 	"slices"
 
@@ -172,36 +174,10 @@ func (n *Node) ToCiliumNode() *ciliumv2.CiliumNode {
 	}
 }
 
-// RegisterNode overloads GetKeyName to ignore the cluster name, as cluster name may not be stable during node registration.
-//
-// +k8s:deepcopy-gen=true
-type RegisterNode struct {
-	Node
-}
-
-// GetKeyName Overloaded key name w/o cluster name
-func (n *RegisterNode) GetKeyName() string {
-	return n.Name
-}
-
-// DeepKeyCopy creates a deep copy of the LocalKey
-func (n *RegisterNode) DeepKeyCopy() store.LocalKey {
-	return n.DeepCopy()
-}
-
-func (n *RegisterNode) Unmarshal(_ string, data []byte) error {
-	newNode := Node{}
-	if err := json.Unmarshal(data, &newNode); err != nil {
-		return err
-	}
-
-	n.Node = newNode
-	return nil
-}
-
 // Node contains the nodes name, the list of addresses to this address
 //
 // +k8s:deepcopy-gen=true
+// +deepequal-gen=true
 type Node struct {
 	// Name is the name of the node. This is typically the hostname of the node.
 	Name string
@@ -286,12 +262,35 @@ type Address struct {
 	IP   net.IP
 }
 
+func (a *Address) DeepEqual(other *Address) bool {
+	return a.Type == other.Type && slices.Equal(a.IP, other.IP)
+}
+
 func (a Address) ToString() string {
 	return a.IP.String()
 }
 
 func (a Address) AddrType() addressing.AddressType {
 	return a.Type
+}
+
+// IsNodeIP determines if addr is one of the node's IP addresses,
+// and returns which type of address it is. "" is returned if addr
+// is not one of the node's IP addresses.
+func (n *Node) IsNodeIP(addr netip.Addr) addressing.AddressType {
+	for _, a := range n.IPAddresses {
+		// for IPv4 this should not allocate memory
+		// this conversion will go away once net.IP is replaced with netip.Addr
+		ip := a.IP.To4()
+		if ip == nil {
+			ip = a.IP
+		}
+		if na, ok := netip.AddrFromSlice(ip); ok && na == addr {
+			return a.Type
+		}
+	}
+
+	return ""
 }
 
 // GetNodeIP returns one of the node's IP addresses available with the
@@ -627,7 +626,7 @@ func (n *Node) Marshal() ([]byte, error) {
 }
 
 // Unmarshal parses the JSON byte slice and updates the node receiver
-func (n *Node) Unmarshal(_ string, data []byte) error {
+func (n *Node) Unmarshal(key string, data []byte) error {
 	newNode := Node{}
 	if err := json.Unmarshal(data, &newNode); err != nil {
 		return err
@@ -652,6 +651,13 @@ func (n *Node) LogRepr() string {
 }
 
 func (n *Node) validate() error {
+	switch {
+	case n.Cluster == "":
+		return errors.New("cluster is unset")
+	case n.Name == "":
+		return errors.New("name is unset")
+	}
+
 	// Skip the ClusterID check if it matches the local one, as we assume that
 	// it has already been validated, and to allow it to be zero.
 	if n.ClusterID != option.Config.ClusterID {

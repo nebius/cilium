@@ -6,10 +6,11 @@
  * It contains function definitions for testing "send_drop_notify" and "__send_drop_notify".
  * It is used to perform unit test on the above two functions to demonstrate how
  * to handle tailcalls.
- * There is a tailcall at the end of function send_drop_notif which actually
+ * There is a tailcall at the end of function send_drop_notify which actually
  * calls function __send_drop_notify. We can stub the tailcall and actually call
  * the function with callback.
- * If other functions in drop.h need to be tested, please add the function definitions at the bottom.
+ * If other functions in drop.h need to be tested, please add the function
+ * definitions at the bottom.
  */
 
 #include "common.h"
@@ -20,9 +21,9 @@
 #include "bpf/ctx/skb.h"
 #include "node_config.h"
 
-/* Include lib/metrics.h which contains the definition of tail_call_internal first to */
+/* Include lib/maps.h which contains the definition of tail_call_internal first to */
 /* avoid it to be included again in lib/drop.h. */
-#include "lib/metrics.h"
+#include "lib/maps.h"
 
 /* Forward declare the mock func */
 int mock_tail_call(void *ctx, const void *map, __u32 index);
@@ -59,8 +60,8 @@ int test_send_drop_notify(struct __ctx_buff ctx)
 {
 	test_init();
 
-	assert(!send_drop_notify(&ctx, 0, 0, 0, 0, 0, 0));
-	assert(!__send_drop_notify_res);
+	assert(send_drop_notify(&ctx, 0, 0, 0, 0, 0) == CTX_ACT_DROP);
+	assert(__send_drop_notify_res == CTX_ACT_DROP);
 
 	test_finish();
 }

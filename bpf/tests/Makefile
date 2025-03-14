@@ -7,7 +7,7 @@ MAKEFLAGS += -r
 
 CLANG ?= clang
 
-FLAGS := -I$(ROOT_DIR)/bpf/include -I$(ROOT_DIR)/bpf -D__NR_CPUS__=$(shell nproc --all) -O2 -g
+FLAGS := -I$(ROOT_DIR)/bpf/include -I$(ROOT_DIR)/bpf -O2 -g
 
 CLANG_FLAGS := ${FLAGS} --target=bpf -std=gnu99 -nostdinc
 # eBPF verifier enforces unaligned access checks where necessary, so don't
@@ -75,11 +75,14 @@ endif
 ifdef RUN
     BPF_TEST_FLAGS += -run $(RUN)
 endif
-ifdef DUMPCTX
+ifdef BPF_TEST_DUMP_CTX
     BPF_TEST_FLAGS += -dump-ctx
 endif
+ifdef BPF_TEST_FILE
+	BPF_TEST_FLAGS += -test $(BPF_TEST_FILE)
+endif
 
-run:
+run: $(TEST_OBJECTS)
 	$(QUIET)$(GO) test ./bpftest -bpf-test-path $(ROOT_DIR)/bpf/tests $(BPF_TEST_FLAGS)
 
 -include $(TEST_OBJECTS:.o=.d)

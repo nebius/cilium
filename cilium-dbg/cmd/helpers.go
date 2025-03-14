@@ -7,11 +7,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -29,6 +30,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
+	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
@@ -206,14 +208,14 @@ type PolicyUpdateArgs struct {
 	trafficDirection trafficdirection.TrafficDirection
 
 	// label represents the identity of the label provided as argument.
-	label uint32
+	label identity.NumericIdentity
 
 	// port represents the port associated with the command, if specified.
 	port uint16
 
 	// protocols represents the set of protocols associated with the
 	// command, if specified.
-	protocols []uint8
+	protocols []u8proto.U8proto
 
 	isDeny bool
 }
@@ -286,10 +288,10 @@ func parsePolicyUpdateArgsHelper(args []string, isDeny bool) (*PolicyUpdateArgs,
 	if err != nil {
 		return nil, fmt.Errorf("Failed to convert %s", args[2])
 	}
-	label := uint32(peerLbl)
+	label := identity.NumericIdentity(peerLbl)
 
 	port := uint16(0)
-	protos := []uint8{}
+	protos := []u8proto.U8proto{}
 	if len(args) > 3 {
 		pp, err := parseL4PortsSlice([]string{args[3]})
 		if err != nil {
@@ -300,10 +302,10 @@ func parsePolicyUpdateArgsHelper(args []string, isDeny bool) (*PolicyUpdateArgs,
 			proto, _ := u8proto.ParseProtocol(pp[0].Protocol)
 			if proto == 0 {
 				for _, proto := range u8proto.ProtoIDs {
-					protos = append(protos, uint8(proto))
+					protos = append(protos, proto)
 				}
 			} else {
-				protos = append(protos, uint8(proto))
+				protos = append(protos, proto)
 			}
 		}
 	}
@@ -331,7 +333,7 @@ func updatePolicyKey(pa *PolicyUpdateArgs, add bool) {
 	// The map needs not to be transparently initialized here even if
 	// it's not present for some reason. Triggering map recreation with
 	// OpenOrCreate when some map attribute had changed would be much worse.
-	policyMap, err := policymap.Open(pa.path)
+	policyMap, err := policymap.OpenPolicyMap(pa.path)
 	if err != nil {
 		Fatalf("Cannot open policymap %q : %s", pa.path, err)
 	}
@@ -339,22 +341,14 @@ func updatePolicyKey(pa *PolicyUpdateArgs, add bool) {
 	for _, proto := range pa.protocols {
 		u8p := u8proto.U8proto(proto)
 		entry := fmt.Sprintf("%d %d/%s", pa.label, pa.port, u8p.String())
+		mapKey := policymap.NewKeyFromPolicyKey(policyTypes.KeyForDirection(pa.trafficDirection).WithIdentity(pa.label).WithPortProto(proto, pa.port))
 		if add {
-			var (
-				authType  uint8  // never set
-				proxyPort uint16 // never set
-				err       error
-			)
-			if pa.isDeny {
-				err = policyMap.Deny(pa.label, pa.port, u8p, pa.trafficDirection)
-			} else {
-				err = policyMap.Allow(pa.label, pa.port, u8p, pa.trafficDirection, authType, proxyPort)
-			}
-			if err != nil {
+			mapEntry := policymap.NewEntryFromPolicyEntry(mapKey, policyTypes.MapStateEntry{}.WithDeny(pa.isDeny))
+			if err := policyMap.Update(&mapKey, &mapEntry); err != nil {
 				Fatalf("Cannot add policy key '%s': %s\n", entry, err)
 			}
 		} else {
-			if err := policyMap.Delete(pa.label, pa.port, u8p, pa.trafficDirection); err != nil {
+			if err := policyMap.DeleteKey(mapKey); err != nil {
 				Fatalf("Cannot delete policy key '%s': %s\n", entry, err)
 			}
 		}
@@ -367,7 +361,7 @@ func dumpConfig(Opts map[string]string, indented bool) {
 	for k := range Opts {
 		opts = append(opts, k)
 	}
-	sort.Strings(opts)
+	slices.Sort(opts)
 
 	for _, k := range opts {
 		// XXX: Reuse the format function from *option.Library
@@ -400,42 +394,38 @@ func mapKeysToLowerCase(s map[string]interface{}) map[string]interface{} {
 	return m
 }
 
-// getIpv6EnableStatus api returns the EnableIPv6 status
-// by consulting the cilium-agent otherwise reads from the
-// runtime system config
-func getIpv6EnableStatus() bool {
+// getIpEnableStatuses api returns the EnableIPv6 and EnableIPv4 statuses by
+// consulting the cilium-agent otherwise reads from the runtime system config.
+func getIpEnableStatuses() (bool, bool) {
 	params := daemon.NewGetHealthzParamsWithTimeout(5 * time.Second)
 	brief := true
 	params.SetBrief(&brief)
-	// If cilium-agent is running get the ipv6 enable status
+	// If cilium-agent is running get the enable statuses
 	if _, err := client.Daemon.GetHealthz(params); err == nil {
 		if resp, err := client.ConfigGet(); err == nil {
 			if resp.Status != nil {
-				return resp.Status.Addressing.IPV6 != nil && resp.Status.Addressing.IPV6.Enabled
+				ipv4 := resp.Status.Addressing.IPV4 != nil && resp.Status.Addressing.IPV4.Enabled
+				ipv6 := resp.Status.Addressing.IPV6 != nil && resp.Status.Addressing.IPV6.Enabled
+				return ipv4, ipv6
 			}
 		}
-	} else { // else read the EnableIPv6 status from the file-system
+	} else { // else read the statuses from the file-system
 		agentConfigFile := filepath.Join(defaults.RuntimePath, defaults.StateDir,
 			"agent-runtime-config.json")
 
 		if byteValue, err := os.ReadFile(agentConfigFile); err == nil {
 			if err = json.Unmarshal(byteValue, &option.Config); err == nil {
-				return option.Config.EnableIPv6
+				return option.Config.EnableIPv4, option.Config.EnableIPv6
 			}
 		}
 	}
-	// returning the EnableIPv6 default status
-	return defaults.EnableIPv6
+	// returning the default statuses
+	return defaults.EnableIPv4, defaults.EnableIPv6
 }
 
 func mergeMaps(m1, m2 map[string]interface{}) map[string]interface{} {
-	m3 := make(map[string]interface{})
-	for k, v := range m1 {
-		m3[k] = v
-	}
-	for k, v := range m2 {
-		m3[k] = v
-	}
+	m3 := maps.Clone(m1)
+	maps.Copy(m3, m2)
 	return m3
 }
 

@@ -62,7 +62,6 @@ const (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:categories={cilium,ciliumbgp},singular="ciliumbgpadvertisement",path="ciliumbgpadvertisements",scope="Cluster",shortName={cbgpadvert}
 // +kubebuilder:printcolumn:JSONPath=".metadata.creationTimestamp",name="Age",type=date
-// +kubebuilder:storageversion
 
 // CiliumBGPAdvertisement is the Schema for the ciliumbgpadvertisements API
 type CiliumBGPAdvertisement struct {
@@ -91,7 +90,6 @@ type CiliumBGPAdvertisementSpec struct {
 	// Advertisements is a list of BGP advertisements.
 	//
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinItems=1
 	Advertisements []BGPAdvertisement `json:"advertisements"`
 }
 
@@ -109,7 +107,7 @@ type BGPAdvertisement struct {
 	Service *BGPServiceOptions `json:"service,omitempty"`
 
 	// Selector is a label selector to select objects of the type specified by AdvertisementType.
-	// If not specified, all objects of the type specified by AdvertisementType are selected for advertisement.
+	// If not specified, no objects of the type specified by AdvertisementType are selected for advertisement.
 	//
 	// +kubebuilder:validation:Optional
 	Selector *slimv1.LabelSelector `json:"selector,omitempty"`
