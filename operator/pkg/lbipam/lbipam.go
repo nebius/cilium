@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/hive/cell"
@@ -87,6 +88,8 @@ type lbIPAMParams struct {
 
 	config      lbipamConfig
 	defaultIPAM bool
+
+	testCounters *testCounters
 }
 
 func newLBIPAM(params lbIPAMParams) *LBIPAM {
@@ -111,6 +114,9 @@ type LBIPAM struct {
 
 func (ipam *LBIPAM) restart() {
 	ipam.logger.Info("Restarting LB IPAM")
+	if ipam.testCounters != nil {
+		ipam.testCounters.restarted.Add(1)
+	}
 
 	// Reset all stored state
 	ipam.pools = make(map[string]*cilium_api_v2alpha1.CiliumLoadBalancerIPPool)
@@ -133,6 +139,9 @@ func (ipam *LBIPAM) Run(ctx context.Context, health cell.Health) {
 	poolChan := ipam.poolResource.Events(ctx, eventsOpts)
 
 	ipam.logger.Info("LB-IPAM initializing")
+	if ipam.testCounters != nil {
+		ipam.testCounters.initializing.Add(1)
+	}
 	svcChan := ipam.initialize(ctx, poolChan)
 
 	// Initialization was cancelled by a shutdown
@@ -140,6 +149,9 @@ func (ipam *LBIPAM) Run(ctx context.Context, health cell.Health) {
 		return
 	}
 	ipam.logger.Info("LB-IPAM done initializing")
+	if ipam.testCounters != nil {
+		ipam.testCounters.initialized.Add(1)
+	}
 
 	for {
 		select {
@@ -233,6 +245,10 @@ func (ipam *LBIPAM) initialize(
 }
 
 func (ipam *LBIPAM) handlePoolEvent(ctx context.Context, event resource.Event[*cilium_api_v2alpha1.CiliumLoadBalancerIPPool]) {
+	if ipam.testCounters != nil {
+		ipam.testCounters.poolEvents.Add(1)
+	}
+
 	var err error
 	switch event.Kind {
 	case resource.Upsert:
@@ -252,6 +268,10 @@ func (ipam *LBIPAM) handlePoolEvent(ctx context.Context, event resource.Event[*c
 }
 
 func (ipam *LBIPAM) handleServiceEvent(ctx context.Context, event resource.Event[*slim_core_v1.Service]) {
+	if ipam.testCounters != nil {
+		ipam.testCounters.serviceEvents.Add(1)
+	}
+
 	var err error
 	switch event.Kind {
 	case resource.Upsert:
@@ -1925,4 +1945,13 @@ func isIPv6(ip netip.Addr) bool {
 func rangeFromPrefix(prefix netip.Prefix) (netip.Addr, netip.Addr) {
 	prefix = prefix.Masked()
 	return prefix.Addr(), netipx.PrefixLastIP(prefix)
+}
+
+// These counters are used to expose internal event counts during testing.
+type testCounters struct {
+	initializing  atomic.Int64
+	initialized   atomic.Int64
+	restarted     atomic.Int64
+	poolEvents    atomic.Int64
+	serviceEvents atomic.Int64
 }
