@@ -640,6 +640,18 @@
             "integer"
           ]
         },
+        "policyMapPressureMetricsThreshold": {
+          "type": [
+            "null",
+            "number"
+          ]
+        },
+        "policyStatsMapMax": {
+          "type": [
+            "null",
+            "integer"
+          ]
+        },
         "preallocateMaps": {
           "type": "boolean"
         },

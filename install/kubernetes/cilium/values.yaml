@@ -564,6 +564,12 @@ bpf:
   # type: [null, integer]
   # @schema
   policyMapMax: 16384
+  # -- (float64) Configure minimal rate for triggering policy map pressure metrics.
+  # @schema
+  # type: [null, number]
+  # @schema
+  # @default -- `0.1`
+  policyMapPressureMetricsThreshold: ~
   # @schema
   # type: [null, number, string]
   # @schema

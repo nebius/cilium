@@ -1152,6 +1152,9 @@ const (
 	// EnableEndpointLockdownOnPolicyOverflow enables endpoint lockdown when an endpoint's
 	// policy map overflows.
 	EnableEndpointLockdownOnPolicyOverflow = "enable-endpoint-lockdown-on-policy-overflow"
+
+	// BPFPolicyMapPressureMetricsThreshold is the name of the option to specify the policy map pressure threshold
+	BPFPolicyMapPressureMetricsThreshold = "bpf-policy-map-pressure-metrics-threshold"
 )
 
 // Default string arguments
@@ -2258,6 +2261,9 @@ type DaemonConfig struct {
 	// EnableEndpointLockdownOnPolicyOverflow enables endpoint lockdown when an endpoint's
 	// policy map overflows.
 	EnableEndpointLockdownOnPolicyOverflow bool
+
+	// BPFPolicyMapPressureMetricsThreshold is the threshold for triggering policy map pressure metrics
+	BPFPolicyMapPressureMetricsThreshold float64
 }
 
 var (
@@ -3010,6 +3016,7 @@ func (c *DaemonConfig) Populate(vp *viper.Viper) {
 	c.EnableIPSecEncryptedOverlay = vp.GetBool(EnableIPSecEncryptedOverlay)
 	c.LBSourceRangeAllTypes = vp.GetBool(LBSourceRangeAllTypes)
 	c.BootIDFile = vp.GetString(BootIDFilename)
+	c.BPFPolicyMapPressureMetricsThreshold = vp.GetFloat64(BPFPolicyMapPressureMetricsThreshold)
 
 	c.ServiceNoBackendResponse = vp.GetString(ServiceNoBackendResponse)
 	switch c.ServiceNoBackendResponse {

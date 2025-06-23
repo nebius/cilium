@@ -39,13 +39,13 @@ func (p *policyMapPressure) Remove(id uint16) {
 
 var policyMapPressureMinInterval = 10 * time.Second
 
-func newPolicyMapPressure() *policyMapPressure {
+func newPolicyMapPressure(threshold float64) *policyMapPressure {
 	if !metrics.BPFMapPressure {
 		return nil
 	}
 
 	p := new(policyMapPressure)
-	p.gauge = metrics.NewBPFMapPressureGauge(policymap.MapName+"*", policymap.PressureMetricThreshold)
+	p.gauge = metrics.NewBPFMapPressureGauge(policymap.MapName+"*", threshold)
 	p.current = make(map[uint16]float64)
 
 	var err error
