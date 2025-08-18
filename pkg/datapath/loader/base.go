@@ -437,9 +437,12 @@ func (l *loader) Reinitialize(ctx context.Context, lnc *datapath.LocalNodeConfig
 
 	devices := lnc.DeviceNames()
 
-	if err := cleanIngressQdisc(l.logger, devices); err != nil {
-		l.logger.Warn("Unable to clean up ingress qdiscs", logfields.Error, err)
-		return err
+	// Only cleanup qdisc if legacy TC API is used
+	if !option.Config.EnableTCX {
+		if err := cleanIngressQdisc(l.logger, devices); err != nil {
+			l.logger.Warn("Unable to clean up ingress qdiscs", logfields.Error, err)
+			return err
+		}
 	}
 
 	if err := l.writeNodeConfigHeader(lnc); err != nil {
