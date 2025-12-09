@@ -78,6 +78,13 @@ func getAnnotationServiceForwardingMode(svc *slim_corev1.Service) (loadbalancer.
 	return loadbalancer.ToSVCForwardingMode(option.Config.NodePortMode), nil
 }
 
+func getAnnotationServiceScope(svc *slim_corev1.Service) loadbalancer.SVCScope {
+	if value, ok := annotation.Get(svc, annotation.ServiceScopeExposure); ok {
+		return loadbalancer.ToSVCScope(strings.ToLower(value))
+	}
+	return loadbalancer.SVCScopeNone
+}
+
 func getTopologyAware(svc *slim_corev1.Service) bool {
 	return getAnnotationTopologyAwareHints(svc) ||
 		(svc.Spec.TrafficDistribution != nil &&
@@ -272,6 +279,7 @@ func ParseService(svc *slim_corev1.Service, nodePortAddrs []netip.Addr) (Service
 				annotation.ServiceForwardingMode, svcInfo.ForwardingMode)
 		}
 	}
+	svcInfo.SVCScope = getAnnotationServiceScope(svc)
 
 	if option.Config.LoadBalancerAlgorithmAnnotation {
 		if value, ok := annotation.Get(svc, annotation.ServiceLoadBalancingAlgorithm); ok {
@@ -451,6 +459,10 @@ type Service struct {
 	// ForwardingMode controls whether DSR or SNAT should be used for the dispatch
 	// to the backend.
 	ForwardingMode loadbalancer.SVCForwardingMode
+
+	// SVCScope controls whether DSR or SNAT should be used for the dispatch
+	// to the backend.
+	SVCScope loadbalancer.SVCScope
 
 	// SourceRangesPolicy controls whether the specified loadBalancerSourceRanges
 	// CIDR set defines an allow- or deny-list.
