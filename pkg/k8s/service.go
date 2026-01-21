@@ -465,8 +465,7 @@ type Service struct {
 	// to the backend.
 	ForwardingMode loadbalancer.SVCForwardingMode
 
-	// SVCScope controls whether DSR or SNAT should be used for the dispatch
-	// to the backend.
+	// SVCScope controls which frontend scopes are programmed into LB BPF maps.
 	SVCScope loadbalancer.SVCScope
 
 	// SourceRangesPolicy controls whether the specified loadBalancerSourceRanges
