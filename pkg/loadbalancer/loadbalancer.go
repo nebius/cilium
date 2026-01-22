@@ -35,6 +35,21 @@ const (
 	SVCTypeLocalRedirect = SVCType("LocalRedirect")
 )
 
+// SVCScope controls which frontend scopes are programmed into LB BPF maps.
+type SVCScope string
+
+const (
+	SVCScopeNone         = SVCScope("none")
+	SVCScopeExternalOnly = SVCScope("external-only")
+)
+
+func ToSVCScope(s string) SVCScope {
+	if SVCScope(s) == SVCScopeExternalOnly {
+		return SVCScopeExternalOnly
+	}
+	return SVCScopeNone
+}
+
 // SVCTrafficPolicy defines which backends are chosen
 type SVCTrafficPolicy string
 

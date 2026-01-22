@@ -78,6 +78,13 @@ func getAnnotationServiceForwardingMode(svc *slim_corev1.Service) (loadbalancer.
 	return loadbalancer.ToSVCForwardingMode(option.Config.NodePortMode), nil
 }
 
+func getAnnotationServiceScope(svc *slim_corev1.Service) loadbalancer.SVCScope {
+	if value, ok := annotation.Get(svc, annotation.ServiceScopeExposure); ok {
+		return loadbalancer.ToSVCScope(strings.ToLower(value))
+	}
+	return loadbalancer.SVCScopeNone
+}
+
 func getAnnotationServiceLoadBalancingAlgorithm(svc *slim_corev1.Service) (loadbalancer.SVCLoadBalancingAlgorithm, error) {
 	if value, ok := annotation.Get(svc, annotation.ServiceLoadBalancingAlgorithm); ok {
 		val := loadbalancer.ToSVCLoadBalancingAlgorithm(strings.ToLower(value))
@@ -283,6 +290,7 @@ func ParseService(svc *slim_corev1.Service, nodePortAddrs []netip.Addr) (Service
 				annotation.ServiceForwardingMode, svcInfo.ForwardingMode)
 		}
 	}
+	svcInfo.SVCScope = getAnnotationServiceScope(svc)
 
 	svcInfo.LoadBalancerAlgorithm = loadbalancer.ToSVCLoadBalancingAlgorithm(option.Config.NodePortAlg)
 	if option.Config.LoadBalancerAlgorithmAnnotation {
@@ -456,6 +464,9 @@ type Service struct {
 	// ForwardingMode controls whether DSR or SNAT should be used for the dispatch
 	// to the backend.
 	ForwardingMode loadbalancer.SVCForwardingMode
+
+	// SVCScope controls which frontend scopes are programmed into LB BPF maps.
+	SVCScope loadbalancer.SVCScope
 
 	// SourceRangesPolicy controls whether the specified loadBalancerSourceRanges
 	// CIDR set defines an allow- or deny-list.
