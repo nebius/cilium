@@ -4,19 +4,30 @@
 package lbipam
 
 import (
-	"context"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/annotation"
+	"github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/cilium/pkg/k8s"
+
 	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	slim_core_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 // TestConflictResolution tests that, upon initialization, LB IPAM will detect conflicts between pools,
@@ -479,7 +490,7 @@ func TestSharingKey(t *testing.T) {
 
 	svcIP2 := svcC.Status.LoadBalancer.Ingress[0].IP
 
-	err := fixture.svcClient.Services("default").Delete(context.Background(), "service-a", meta_v1.DeleteOptions{})
+	err := fixture.svcClient.Services("default").Delete(t.Context(), "service-a", meta_v1.DeleteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1766,8 +1777,8 @@ func TestDisablePool(t *testing.T) {
 // TestPoolDelete tests that when a pool is deleted, all of the IPs from that pool are released and that any effected
 // services get a new IP from another pool.
 func TestPoolDelete(t *testing.T) {
-	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24"})
-	poolB := mkPool(poolBUID, "pool-b", []string{"10.0.20.0/24"})
+	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24", "10.1.10.0/24"})
+	poolB := mkPool(poolBUID, "pool-b", []string{"10.0.20.0/24", "10.1.20.0/24"})
 
 	fixture := mkTestFixture(t, true, true)
 	fixture.UpsertPool(t, poolA)
@@ -1790,8 +1801,10 @@ func TestPoolDelete(t *testing.T) {
 		t.Error("Expected service to receive exactly one ingress IP")
 	}
 
+	svcAddr := svcA.Status.LoadBalancer.Ingress[0].IP
+
 	var allocPool string
-	if strings.HasPrefix(svcA.Status.LoadBalancer.Ingress[0].IP, "10.0.10") {
+	if strings.HasPrefix(svcAddr, "10.0.10") || strings.HasPrefix(svcAddr, "10.1.10") {
 		allocPool = "pool-a"
 	} else {
 		allocPool = "pool-b"
@@ -1881,6 +1894,175 @@ func TestRangeDelete(t *testing.T) {
 
 	if !strings.HasPrefix(svcA.Status.LoadBalancer.Ingress[0].IP, "10.0.20") {
 		t.Error("Expected new ingress to be in the 10.0.20.0/24 range")
+	}
+}
+
+// TestPoolUpdate tests that updating a pool with widened CIDRs and selector will not reallocate
+// existing services, but will allow new services to be allocated from the new CIDRs.
+func TestPoolUpdate(t *testing.T) {
+	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24"})
+	fixture := mkTestFixture(t, true, true)
+	poolA.Spec.ServiceSelector = &slim_meta_v1.LabelSelector{
+		MatchLabels: map[string]string{
+			"color": "blue",
+		},
+	}
+	fixture.UpsertPool(t, poolA)
+
+	svcBlue := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-a",
+			Namespace: "default",
+			UID:       serviceAUID,
+			Labels: map[string]string{
+				"color": "blue",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+		},
+	}
+	svcRed := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-b",
+			Namespace: "default",
+			UID:       serviceBUID,
+			Labels: map[string]string{
+				"color": "red",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+		},
+	}
+	fixture.UpsertSvc(t, svcBlue)
+	fixture.UpsertSvc(t, svcRed)
+	svcBlue = fixture.GetSvc("default", "service-a")
+	svcRed = fixture.GetSvc("default", "service-b")
+
+	if len(svcBlue.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatal("Expected service to receive exactly one ingress IP")
+	}
+	assignedBlueIP := svcBlue.Status.LoadBalancer.Ingress[0].IP
+
+	if len(svcRed.Status.LoadBalancer.Ingress) != 0 {
+		t.Error("Expected service to not receive ingress IP")
+	}
+
+	poolA = fixture.GetPool("pool-a")
+	// Extend the CIDR, this should not have any effect on the existing service.
+	if len(poolA.Spec.Blocks) == 0 {
+		t.Error("Expected pool to have at least one block")
+	}
+	poolA.Spec.Blocks[0].Cidr = "10.0.10.0/23"
+	fixture.UpsertPool(t, poolA)
+
+	svcBlue = fixture.GetSvc("default", "service-a")
+	svcRed = fixture.GetSvc("default", "service-b")
+
+	if len(svcBlue.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatal("Expected service to receive exactly one ingress IP")
+	}
+	if svcBlue.Status.LoadBalancer.Ingress[0].IP != assignedBlueIP {
+		t.Error("Expected service to keep the same IP")
+	}
+	if len(svcRed.Status.LoadBalancer.Ingress) != 0 {
+		t.Error("Expected service to not receive ingress IP")
+	}
+
+	poolA = fixture.GetPool("pool-a")
+	// Move back poolA to have previous CIDR, but extend the Selector
+	// to match both blue and red services.
+	poolA.Spec.Blocks[0].Cidr = "10.0.10.0/24"
+	poolA.Spec.ServiceSelector = &slim_meta_v1.LabelSelector{
+		MatchExpressions: []slim_meta_v1.LabelSelectorRequirement{
+			{
+				Key:      "color",
+				Operator: slim_meta_v1.LabelSelectorOpIn,
+				Values:   []string{"red", "blue"},
+			},
+		},
+	}
+	fixture.UpsertPool(t, poolA)
+	svcBlue = fixture.GetSvc("default", "service-a")
+	svcRed = fixture.GetSvc("default", "service-b")
+
+	if len(svcBlue.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatal("Expected service to receive exactly one ingress IP")
+	}
+	if svcBlue.Status.LoadBalancer.Ingress[0].IP != assignedBlueIP {
+		t.Error("Expected service to keep the same IP")
+	}
+	if len(svcRed.Status.LoadBalancer.Ingress) != 1 {
+		t.Error("Expected service to receive exactly one ingress IP")
+	}
+}
+
+// TestPoolExtendWithPendingServices tests that extending a pool by lowering the low end or range.
+// with pending services will not cause existing service to be reallocated, but will allow
+// new services to be allocated from the new range.
+func TestPoolExtendWithPendingServices(t *testing.T) {
+	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/31"})
+	fixture := mkTestFixture(t, true, true)
+	fixture.UpsertPool(t, poolA)
+	// This CIDR should allow for 2 IPs, so let's create 3 services and extend it.
+	createAndValidateService := func(name string, uid types.UID, validateAssigned bool) *slim_core_v1.Service {
+		svc := &slim_core_v1.Service{
+			ObjectMeta: slim_meta_v1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				UID:       uid,
+			},
+			Spec: slim_core_v1.ServiceSpec{
+				Type: slim_core_v1.ServiceTypeLoadBalancer,
+			},
+		}
+		fixture.UpsertSvc(t, svc)
+		svc = fixture.GetSvc("default", name)
+		if validateAssigned {
+			if len(svc.Status.LoadBalancer.Ingress) != 1 {
+				t.Fatalf("Expected service %s to receive exactly one ingress IP", name)
+			}
+		} else {
+			if len(svc.Status.LoadBalancer.Ingress) != 0 {
+				t.Fatalf("Expected service %s to not receive ingress IP", name)
+			}
+		}
+		return svc
+	}
+	svcAAssignedIP := createAndValidateService("service-a", serviceAUID, true).Status.LoadBalancer.Ingress[0].IP
+	svcBAssignedIP := createAndValidateService("service-b", serviceBUID, true).Status.LoadBalancer.Ingress[0].IP
+	createAndValidateService("service-c", serviceCUID, false)
+	createAndValidateService("service-d", serviceDUID, false)
+
+	poolA = fixture.GetPool("pool-a")
+	// Extend the CIDR, this should allow for 2 more IPs,
+	if len(poolA.Spec.Blocks) == 0 {
+		t.Error("Expected pool to have at least one block")
+	}
+	poolA.Spec.Blocks[0].Cidr = "10.0.10.0/29"
+	fixture.UpsertPool(t, poolA)
+	svcAUpdated := fixture.GetSvc("default", "service-a")
+	svcBUpdated := fixture.GetSvc("default", "service-b")
+	svcCUpdated := fixture.GetSvc("default", "service-c")
+	svcDUpdated := fixture.GetSvc("default", "service-d")
+	if len(svcAUpdated.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatal("Expected service A to still have one ingress IP")
+	}
+	if svcAUpdated.Status.LoadBalancer.Ingress[0].IP != svcAAssignedIP {
+		t.Error("Expected service A to keep the same IP")
+	}
+	if len(svcBUpdated.Status.LoadBalancer.Ingress) != 1 {
+		t.Fatal("Expected service B to still have one ingress IP")
+	}
+	if svcBUpdated.Status.LoadBalancer.Ingress[0].IP != svcBAssignedIP {
+		t.Error("Expected service B to keep the same IP")
+	}
+	if len(svcCUpdated.Status.LoadBalancer.Ingress) != 1 {
+		t.Error("Expected service C to receive exactly one ingress IP")
+	}
+	if len(svcDUpdated.Status.LoadBalancer.Ingress) != 1 {
+		t.Error("Expected service D to receive exactly one ingress IP")
 	}
 }
 
@@ -2351,7 +2533,7 @@ func TestRangeFromPrefix(t *testing.T) {
 				tt.Fatal(err)
 			}
 
-			from, to := rangeFromPrefix(prefix)
+			from, to := RangeFromPrefix(prefix)
 			if to.Compare(expectedTo) != 0 {
 				tt.Fatalf("expected '%s', got '%s'", expectedTo, to)
 			}
@@ -2359,5 +2541,313 @@ func TestRangeFromPrefix(t *testing.T) {
 				tt.Fatalf("expected '%s', got '%s'", expectedFrom, from)
 			}
 		})
+	}
+}
+
+// This test starts LBIPAM as part of a minimal hive to exercise the lifecycle logic.
+// LBIPAM starts in a "dormant" state, and only wakes up when at least one pool exists.
+// It can go back to sleep when that pool goes away and re-awaken.
+// We want to test that this works correctly, and that we properly shutdown in any
+// state.
+func TestLBIPAMStartupRestartShutdown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
+	var (
+		fakeClientset *k8sClient.FakeClientset
+		counters      *testCounters
+	)
+	testHive := hive.New(
+		// Cell under test
+		Cell,
+
+		// Dependencies
+		k8sClient.FakeClientCell,
+		cell.Provide(func() *option.DaemonConfig {
+			return &option.DaemonConfig{
+				EnableBGPControlPlane: true,
+			}
+		}),
+		cell.Config(k8s.DefaultConfig),
+		cell.Provide(
+			k8s.ServiceResource,
+			k8s.LBIPPoolsResource,
+		),
+
+		// Expose cells for testing
+		cell.Provide(func() *testCounters {
+			return &testCounters{}
+		}),
+		cell.Invoke(func(
+			tc *testCounters,
+			cf *k8sClient.FakeClientset,
+		) {
+			counters = tc
+			fakeClientset = cf
+		}),
+	)
+
+	tlog := hivetest.Logger(t)
+	err := testHive.Start(tlog, t.Context())
+	require.NoError(t, err)
+
+	// Create a service which shouldn't be processed
+	fakeK8s := fakeClientset.SlimFakeClientset.CoreV1()
+	fakePools := fakeClientset.CiliumFakeClientset.CiliumV2alpha1().CiliumLoadBalancerIPPools()
+	_, err = fakeK8s.Services("default").Create(t.Context(), &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name: "service-a",
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+		},
+	}, meta_v1.CreateOptions{})
+	require.NoError(t, err)
+
+	// We should be initializing
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		assert.Equal(collect, int64(1), counters.initializing.Load())
+	}, 5*time.Second, 100*time.Millisecond)
+	// But never finish initializing or processing any service events
+	require.Never(t, func() bool {
+		return counters.initialized.Load() != 0 || counters.serviceEvents.Load() != 0
+	}, 3*time.Second, 100*time.Millisecond)
+
+	// Create a pool, this should wake up LBIPAM
+	_, err = fakePools.Create(t.Context(), &cilium_api_v2alpha1.CiliumLoadBalancerIPPool{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name: "pool-a",
+		},
+		Spec: cilium_api_v2alpha1.CiliumLoadBalancerIPPoolSpec{
+			Blocks: []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
+				{
+					Cidr: "10.0.0.0/24",
+				},
+			},
+		},
+	}, meta_v1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		// We should now finish initializing
+		assert.Equal(collect, int64(1), counters.initialized.Load())
+		// Processed the pool event
+		assert.GreaterOrEqual(collect, counters.poolEvents.Load(), int64(1))
+		// And the service event
+		assert.GreaterOrEqual(collect, counters.serviceEvents.Load(), int64(1))
+	}, 5*time.Second, 100*time.Millisecond)
+
+	svc1, err := fakeK8s.Services("default").Get(t.Context(), "service-a", meta_v1.GetOptions{})
+	require.NoError(t, err)
+
+	require.Len(t, svc1.Status.LoadBalancer.Ingress, 1)
+
+	require.Equal(t, int64(0), counters.restarted.Load())
+
+	// Now delete the pool, this should cause LBIPAM to go dormant
+	err = fakePools.Delete(t.Context(), "pool-a", meta_v1.DeleteOptions{})
+	require.NoError(t, err)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		// Assert the IP has been removed from service-a
+		svc1, err := fakeK8s.Services("default").Get(t.Context(), "service-a", meta_v1.GetOptions{})
+		assert.NoError(collect, err)
+		assert.Empty(collect, svc1.Status.LoadBalancer.Ingress)
+		// Assert we restarted
+		assert.Equal(collect, int64(1), counters.restarted.Load())
+		// And are initialing again
+		assert.Equal(collect, int64(2), counters.initializing.Load())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// But we do not initialize for a second time
+	require.Never(t, func() bool {
+		return counters.initialized.Load() > 1
+	}, 3*time.Second, 100*time.Millisecond)
+
+	curServiceEvents := counters.serviceEvents.Load()
+
+	// Create a second service
+	_, err = fakeK8s.Services("default").Create(t.Context(), &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name: "service-b",
+		},
+	}, meta_v1.CreateOptions{})
+	require.NoError(t, err)
+
+	// We should not process the new service
+	require.Never(t, func() bool {
+		return counters.serviceEvents.Load() > curServiceEvents
+	}, 3*time.Second, 100*time.Millisecond)
+
+	err = testHive.Stop(tlog, t.Context())
+	require.NoError(t, err)
+
+	// Assert we did not process any services during shutdown
+	require.Never(t, func() bool {
+		return counters.serviceEvents.Load() > curServiceEvents
+	}, 3*time.Second, 100*time.Millisecond)
+}
+
+func TestLBIPAMRestartOnFullPool(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
+	var (
+		fakeClientset *k8sClient.FakeClientset
+		counters      *testCounters
+	)
+	testHive := hive.New(
+		// Cell under test
+		Cell,
+
+		// Dependencies
+		k8sClient.FakeClientCell,
+		cell.Provide(func() *option.DaemonConfig {
+			return &option.DaemonConfig{}
+		}),
+		cell.Config(k8s.DefaultConfig),
+		cell.Provide(
+			k8s.ServiceResource,
+			k8s.LBIPPoolsResource,
+		),
+
+		// Expose cells for testing
+		cell.Provide(func() *testCounters {
+			return &testCounters{}
+		}),
+		cell.Invoke(func(
+			tc *testCounters,
+			cf *k8sClient.FakeClientset,
+			lb *LBIPAM,
+		) {
+			counters = tc
+			fakeClientset = cf
+		}),
+	)
+
+	tlog := hivetest.Logger(t)
+	err := testHive.Start(tlog, t.Context())
+	require.NoError(t, err)
+
+	fakeK8s := fakeClientset.SlimFakeClientset.CoreV1()
+	fakePools := fakeClientset.CiliumFakeClientset.CiliumV2alpha1().CiliumLoadBalancerIPPools()
+	_, err = fakePools.Create(t.Context(), &cilium_api_v2alpha1.CiliumLoadBalancerIPPool{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name: "pool-a",
+		},
+		Spec: cilium_api_v2alpha1.CiliumLoadBalancerIPPoolSpec{
+			Blocks: []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
+				{
+					Cidr: "10.0.0.0/29",
+				},
+			},
+		},
+	}, meta_v1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		// We should now finish initializing
+		assert.Equal(collect, int64(1), counters.initialized.Load())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// Create N services
+	N := 16
+	for i := 0; i < N; i++ {
+		_, err = fakeK8s.Services("default").Create(t.Context(), &slim_core_v1.Service{
+			ObjectMeta: slim_meta_v1.ObjectMeta{
+				Name: "service" + strconv.Itoa(i),
+			},
+			Spec: slim_core_v1.ServiceSpec{
+				Type: slim_core_v1.ServiceTypeLoadBalancer,
+			},
+		}, meta_v1.CreateOptions{})
+		require.NoError(t, err)
+	}
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		// We should now finish initializing
+		assert.Equal(collect, int64(1), counters.initialized.Load())
+		// Processed the pool event
+		assert.LessOrEqual(collect, int64(1), counters.poolEvents.Load())
+		// And the service events (each service is process twice)
+		assert.Equal(collect, int64(N*2), counters.serviceEvents.Load())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	previousIPs := []string{}
+	for i := 0; i < N; i++ {
+		svc, err := fakeK8s.Services("default").Get(t.Context(), "service"+strconv.Itoa(i), meta_v1.GetOptions{})
+		require.NoError(t, err)
+		t.Log("service", i, "ingress", svc.Status.LoadBalancer.Ingress)
+		if i < N/2 {
+			// First N/2 services should get an IP
+			require.Len(t, svc.Status.LoadBalancer.Ingress, 1)
+			previousIPs = append(previousIPs, svc.Status.LoadBalancer.Ingress[0].IP)
+		} else {
+			// Last N/2 services should not get an IP, as the pool is full
+			require.Empty(t, svc.Status.LoadBalancer.Ingress)
+		}
+	}
+	require.Equal(t, int64(0), counters.restarted.Load())
+
+	err = testHive.Stop(tlog, t.Context())
+	require.NoError(t, err)
+	// We only reuse the same clientset to retain state.
+	testRestartedHive := hive.New(
+		Cell,
+
+		// Dependencies
+		cell.Provide(func() k8sClient.Clientset {
+			// We are reusing previous clientset!
+			return fakeClientset
+		}),
+		cell.Provide(func() *option.DaemonConfig {
+			return &option.DaemonConfig{}
+		}),
+		cell.Config(k8s.DefaultConfig),
+		cell.Provide(
+			k8s.ServiceResource,
+			k8s.LBIPPoolsResource,
+		),
+
+		// Expose cells for testing
+		cell.Provide(func() *testCounters {
+			return &testCounters{}
+		}),
+		cell.Invoke(func(
+			tc *testCounters,
+		) {
+			counters = tc
+		}),
+	)
+	err = testRestartedHive.Start(tlog, t.Context())
+	require.NoError(t, err)
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		// We should now finish initializing
+		assert.Equal(collect, int64(1), counters.initialized.Load())
+		// And the service events
+		assert.Equal(collect, int64(N), counters.serviceEvents.Load())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	for i := 0; i < N; i++ {
+		svc, err := fakeK8s.Services("default").Get(t.Context(), "service"+strconv.Itoa(i), meta_v1.GetOptions{})
+		require.NoError(t, err)
+		t.Log("service", i, "ingress", svc.Status.LoadBalancer.Ingress)
+	}
+
+	// The same services should still have IPs
+	for i := 0; i < N; i++ {
+		svc, err := fakeK8s.Services("default").Get(t.Context(), "service"+strconv.Itoa(i), meta_v1.GetOptions{})
+		require.NoError(t, err)
+		if i < N/2 {
+			// First N/2 services should get an IP
+			require.Len(t, svc.Status.LoadBalancer.Ingress, 1)
+			require.Equal(t, previousIPs[i], svc.Status.LoadBalancer.Ingress[0].IP)
+		} else {
+			// Last N/2 services should not get an IP, as the pool is full
+			require.Empty(t, svc.Status.LoadBalancer.Ingress)
+		}
 	}
 }

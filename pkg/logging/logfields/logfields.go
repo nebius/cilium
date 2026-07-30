@@ -832,4 +832,18 @@ const (
 
 	// L7Parser is the L7 parser used for L7 network traffic
 	L7Parser = "l7parser"
+
+	PoolOldSpec = "poolOldSpec"
+
+	PoolNewSpec = "poolNewSpec"
+
+	PoolName = "poolName"
+
+	PoolName1 = "poolName1"
+
+	PoolName2 = "poolName2"
+
+	PoolRange1 = "poolRange1"
+
+	PoolRange2 = "poolRange2"
 )
