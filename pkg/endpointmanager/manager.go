@@ -103,7 +103,7 @@ type endpointManager struct {
 type endpointDeleteFunc func(*endpoint.Endpoint, endpoint.DeleteConfig) []error
 
 // New creates a new endpointManager.
-func New(epSynchronizer EndpointResourceSynchronizer, lns *node.LocalNodeStore, health cell.Health) *endpointManager {
+func New(epSynchronizer EndpointResourceSynchronizer, lns *node.LocalNodeStore, health cell.Health, config EndpointManagerConfig) *endpointManager {
 	mgr := endpointManager{
 		health:                       health,
 		endpoints:                    make(map[uint16]*endpoint.Endpoint),
@@ -116,7 +116,7 @@ func New(epSynchronizer EndpointResourceSynchronizer, lns *node.LocalNodeStore, 
 		epIDAllocator:                newEPIDAllocator(),
 	}
 	mgr.deleteEndpoint = mgr.removeEndpoint
-	mgr.policyMapPressure = newPolicyMapPressure()
+	mgr.policyMapPressure = newPolicyMapPressure(config.BPFPolicyMapPressureMetricsThreshold)
 	return &mgr
 }
 

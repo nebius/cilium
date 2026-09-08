@@ -844,4 +844,10 @@ const (
 	L7Parser = "l7parser"
 
 	ParentResource = "parentResource"
+
+	PoolOldSpec = "poolOldSpec"
+
+	PoolNewSpec = "poolNewSpec"
+
+	PoolName = "poolName"
 )

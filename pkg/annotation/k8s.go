@@ -154,6 +154,15 @@ const (
 	//		use SNAT so that reply traffic comes back
 	ServiceForwardingMode = ServicePrefix + "/forwarding-mode"
 
+	// ServiceScopeExposure restricts which frontend scopes are installed.
+	// Only matters if externalTrafficPolicy != internalTrafficPolicy (service is two-scoped)
+	// Allowed values are of type loadbalancer.SVCScope:
+	//  - none
+	//      default behaviour, install both external and internal scopes (if applicable)
+	//  - external-only
+	//      install only external-scope frontends
+	ServiceScopeExposure = ServicePrefix + "/scope"
+
 	// NoTrack / NoTrackAlias is the annotation name used to store the port and
 	// protocol that we should bypass kernel conntrack for a given pod. This
 	// applies for both TCP and UDP connection. Current use case is NodeLocalDNS.
