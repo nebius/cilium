@@ -73,6 +73,8 @@ func SetupVethWithNames(lxcIfName, peerIfName string, mtu, groIPv6MaxSize, gsoIP
 			Name:         lxcIfName,
 			HardwareAddr: net.HardwareAddr(epHostMAC),
 			TxQLen:       1000,
+			NumTxQueues:  1,
+			NumRxQueues:  1,
 		},
 		PeerName:         peerIfName,
 		PeerHardwareAddr: net.HardwareAddr(epLXCMAC),
