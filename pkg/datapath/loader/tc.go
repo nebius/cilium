@@ -196,7 +196,7 @@ func removeStaleTCFilters(logger *slog.Logger, device netlink.Link, parent uint3
 	return nil
 }
 
-// removeTCFilters removes all tc filters from the given interface.
+// removeTCFilters removes all bpfFilter from the given interface.
 // Direction is passed as netlink.HANDLE_MIN_{INGRESS,EGRESS} via parent.
 func removeTCFilters(device netlink.Link, parent uint32) error {
 	filters, err := safenetlink.FilterList(device, parent)
@@ -205,8 +205,10 @@ func removeTCFilters(device netlink.Link, parent uint32) error {
 	}
 
 	for _, f := range filters {
-		if err := netlink.FilterDel(f); err != nil {
-			return err
+		if _, ok := f.(*netlink.BpfFilter); ok {
+			if err := netlink.FilterDel(f); err != nil {
+				return err
+			}
 		}
 	}
 

@@ -569,6 +569,10 @@ ct_extract_ports6(struct __ctx_buff *ctx, struct ipv6hdr *ip6, fraginfo_t fragin
 		/* load sport + dport into tuple */
 		return ipv6_load_l4_ports(ctx, ip6, fraginfo, off,
 					  dir, &tuple->dport);
+	case IPPROTO_IPIP:
+		if (l4_load_ports(ctx, off + sizeof(struct iphdr), &tuple->dport) < 0)
+			return DROP_CT_INVALID_HDR;
+		break;
 	default:
 		tuple->sport = 0;
 		tuple->dport = 0;

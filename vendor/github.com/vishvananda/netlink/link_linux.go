@@ -2522,8 +2522,10 @@ func (h *Handle) LinkList() ([]Link, error) {
 
 	msg := nl.NewIfInfomsg(unix.AF_UNSPEC)
 	req.AddData(msg)
-	attr := nl.NewRtAttr(unix.IFLA_EXT_MASK, nl.Uint32Attr(nl.RTEXT_FILTER_VF))
-	req.AddData(attr)
+	if h.options.collectVFInfo {
+		attr := nl.NewRtAttr(unix.IFLA_EXT_MASK, nl.Uint32Attr(nl.RTEXT_FILTER_VF))
+		req.AddData(attr)
+	}
 
 	msgs, executeErr := req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWLINK)
 	if executeErr != nil && !errors.Is(executeErr, ErrDumpInterrupted) {
