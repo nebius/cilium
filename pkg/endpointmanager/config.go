@@ -4,6 +4,9 @@
 package endpointmanager
 
 import (
+	"fmt"
+	"log/slog"
+
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/option"
@@ -18,8 +21,24 @@ type EndpointManagerConfig struct {
 	// EndpointRegenInterval is interval between periodic endpoint regenerations.
 	EndpointRegenInterval time.Duration
 
+	// BPFPolicyMapPressureMetricsThreshold is minimum rate for triggering policy map pressure metrics.
+	BPFPolicyMapPressureMetricsThreshold float64
+
 	// EndpointPolicyUpdateTimeout is the timeout duration for Endpoint policy updates.
 	EndpointPolicyUpdateTimeout time.Duration
+}
+
+// Validate validates the EndpointManagerConfig and applies defaults for invalid values.
+func (c *EndpointManagerConfig) Validate(logger *slog.Logger) {
+	if c.BPFPolicyMapPressureMetricsThreshold < 0 {
+		c.BPFPolicyMapPressureMetricsThreshold = defaultEndpointManagerConfig.BPFPolicyMapPressureMetricsThreshold
+		logger.Warn(
+			fmt.Sprintf(
+				"BPF policy map pressure metrics threshold must be >= 0, using default value of %f",
+				c.BPFPolicyMapPressureMetricsThreshold,
+			),
+		)
+	}
 }
 
 func (def EndpointManagerConfig) Flags(flags *pflag.FlagSet) {
@@ -30,12 +49,16 @@ func (def EndpointManagerConfig) Flags(flags *pflag.FlagSet) {
 	flags.Duration(option.EndpointRegenInterval, def.EndpointRegenInterval,
 		"Periodically recalculate and re-apply endpoint configuration. Set to 0 to disable")
 
+	flags.Float64("bpf-policy-map-pressure-metrics-threshold", def.BPFPolicyMapPressureMetricsThreshold,
+		"Sets threshold for emitting pressure metrics of policy maps")
+
 	flags.Duration(option.EndpointPolicyUpdateTimeout, def.EndpointPolicyUpdateTimeout,
 		"Timeout duration for Endpoint policy updates")
 }
 
 var defaultEndpointManagerConfig = EndpointManagerConfig{
-	EndpointGCInterval:          5 * time.Minute,
-	EndpointRegenInterval:       2 * time.Minute,
-	EndpointPolicyUpdateTimeout: 10 * time.Second,
+	EndpointGCInterval:                   5 * time.Minute,
+	EndpointRegenInterval:                2 * time.Minute,
+	BPFPolicyMapPressureMetricsThreshold: 0.1,
+	EndpointPolicyUpdateTimeout:          10 * time.Second,
 }

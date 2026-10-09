@@ -128,7 +128,7 @@ func New(logger *slog.Logger, registry *metrics.Registry, epSynchronizer Endpoin
 		policyUpdateCallbackDetails:  newPolicyUpdateCallbackDetails(),
 	}
 	mgr.deleteEndpoint = mgr.removeEndpoint
-	mgr.policyMapPressure = newPolicyMapPressure(logger, registry)
+	mgr.policyMapPressure = newPolicyMapPressure(logger, registry, config.BPFPolicyMapPressureMetricsThreshold)
 	return &mgr
 }
 
