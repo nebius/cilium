@@ -444,7 +444,7 @@ func (mgr *endpointManager) unexpose(ep *endpoint.Endpoint) {
 		}
 	}
 
-	mgr.removeReferencesLocked(identifiers)
+	mgr.removeReferencesLocked(ep, identifiers)
 }
 
 // removeEndpoint stops the active handling of events by the specified endpoint,
@@ -563,11 +563,13 @@ func (mgr *endpointManager) UpdateReferences(ep *endpoint.Endpoint) error {
 	return nil
 }
 
-// removeReferencesLocked removes the mappings from the endpointmanager.
-func (mgr *endpointManager) removeReferencesLocked(identifiers endpointid.Identifiers) {
+// removeReferencesLocked removes the mappings that still refer to ep.
+func (mgr *endpointManager) removeReferencesLocked(ep *endpoint.Endpoint, identifiers endpointid.Identifiers) {
 	for prefix := range identifiers {
 		id := endpointid.NewID(prefix, identifiers[prefix])
-		delete(mgr.endpointsAux, id)
+		if mgr.endpointsAux[id] == ep {
+			delete(mgr.endpointsAux, id)
+		}
 	}
 }
 
@@ -643,7 +645,7 @@ func (mgr *endpointManager) expose(ep *endpoint.Endpoint) error {
 	mgr.mutex.Unlock()
 
 	ep.InitEndpointHealth(mgr.health)
-	mgr.RunK8sCiliumEndpointSync(ep, ep.GetReporter("cep-k8s-sync"))
+	mgr.EndpointResourceSynchronizer.RunK8sCiliumEndpointSync(ep, mgr, ep.GetReporter("cep-k8s-sync"))
 
 	return nil
 }
