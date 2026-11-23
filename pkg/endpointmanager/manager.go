@@ -83,11 +83,13 @@ type endpointManager struct {
 	// endpointManager and clean it up. Always set to RemoveEndpoint.
 	deleteEndpoint endpointDeleteFunc
 
-	// A mark-and-sweep garbage collector may operate on the endpoint list.
+	// A local cache of endpoints that are marked for garbage collection.
+	// Only used by EndpointManager GC controller.
+	//
 	// This is configured via WithPeriodicEndpointGC() and will mark
 	// endpoints for removal on one run of the controller, then in the
 	// subsequent controller run will remove the endpoints.
-	markedEndpoints []uint16
+	markedEndpoints map[uint16]struct{}
 
 	// controllers associated with the endpoint manager.
 	controllers *controller.Manager
@@ -425,6 +427,7 @@ func (mgr *endpointManager) unexpose(ep *endpoint.Endpoint) {
 
 	// This must be done before the ID is released for the endpoint!
 	delete(mgr.endpoints, ep.ID)
+	delete(mgr.markedEndpoints, ep.ID)
 	mgr.mcastManager.RemoveAddress(ep.IPv6)
 
 	// We haven't yet allocated the ID for a restoring endpoint, so no
@@ -441,7 +444,7 @@ func (mgr *endpointManager) unexpose(ep *endpoint.Endpoint) {
 		}
 	}
 
-	mgr.removeReferencesLocked(identifiers)
+	mgr.removeReferencesLocked(ep, identifiers)
 }
 
 // removeEndpoint stops the active handling of events by the specified endpoint,
@@ -560,11 +563,13 @@ func (mgr *endpointManager) UpdateReferences(ep *endpoint.Endpoint) error {
 	return nil
 }
 
-// removeReferencesLocked removes the mappings from the endpointmanager.
-func (mgr *endpointManager) removeReferencesLocked(identifiers endpointid.Identifiers) {
+// removeReferencesLocked removes the mappings that still refer to ep.
+func (mgr *endpointManager) removeReferencesLocked(ep *endpoint.Endpoint, identifiers endpointid.Identifiers) {
 	for prefix := range identifiers {
 		id := endpointid.NewID(prefix, identifiers[prefix])
-		delete(mgr.endpointsAux, id)
+		if mgr.endpointsAux[id] == ep {
+			delete(mgr.endpointsAux, id)
+		}
 	}
 }
 
@@ -640,7 +645,7 @@ func (mgr *endpointManager) expose(ep *endpoint.Endpoint) error {
 	mgr.mutex.Unlock()
 
 	ep.InitEndpointHealth(mgr.health)
-	mgr.RunK8sCiliumEndpointSync(ep, ep.GetReporter("cep-k8s-sync"))
+	mgr.EndpointResourceSynchronizer.RunK8sCiliumEndpointSync(ep, mgr, ep.GetReporter("cep-k8s-sync"))
 
 	return nil
 }
